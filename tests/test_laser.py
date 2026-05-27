@@ -33,7 +33,7 @@ PREVIEW_LASER_PARAMS = {
     "omega": 1.0,
     "E0": 1.0,
     "phase": 0.0,
-    "ellipticity": 1.0,
+    "ellipticity": 0.0,
     "fwhm": 20.0,
     "envelope": "gaussian",
     "t0": 0.0,

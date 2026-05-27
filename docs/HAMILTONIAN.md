@@ -18,7 +18,9 @@ It does not know anything about lasers, external fields, time grids, solvers, or
 ## File Location
 
 - Implementation: `qxti/physics/hamiltonian.py`
+- Generic external loader: `qxti/physics/custom_hamiltonian.py`
 - Contract tests: `tests/test_hamiltonian.py`
+- Concrete model catalog: `docs/modelos/README.md`
 
 ## Current Design
 
