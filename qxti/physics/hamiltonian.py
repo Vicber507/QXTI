@@ -2,21 +2,24 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 
 
 ComplexArray = NDArray[np.complex128]
+RealArray = NDArray[np.float64]
 
 
 @dataclass(slots=True)
 class Hamiltonian(ABC):
-    """Abstract tight-binding Hamiltonian interface.
+    """Abstract base class for tight-binding Hamiltonians in atomic units.
 
-    The Hamiltonian layer depends only on reciprocal-space coordinates. It does
-    not know anything about laser pulses or external fields.
+    The class is intentionally restricted to k-space matrix mechanics. It
+    stores model metadata, validates matrix structure, provides numerical
+    derivatives with respect to reciprocal-space coordinates, and exposes
+    derived operators used by downstream response calculations.
     """
 
     model_name: str
@@ -25,43 +28,113 @@ class Hamiltonian(ABC):
     dimension: int = 3
     basis_type: str = "orbital"
     is_periodic: bool = True
+    dk_derivative: float = 1.0e-5
 
-    _FINITE_DIFFERENCE_STEP = 1.0e-5
     _VALID_DIRECTIONS = {"x": 0, "y": 1, "z": 2}
 
     def __post_init__(self) -> None:
+        """Validate constructor inputs and merge default model parameters."""
+
+        if not isinstance(self.model_name, str) or not self.model_name.strip():
+            raise ValueError("model_name must be a non-empty string.")
         if self.basis_size <= 0:
             raise ValueError("basis_size must be strictly positive.")
-        if not 1 <= self.dimension <= 3:
-            raise ValueError("dimension must be between 1 and 3.")
-        if not self.model_name:
-            raise ValueError("model_name must be a non-empty string.")
-        if not self.basis_type:
+        if self.dimension not in {1, 2, 3}:
+            raise ValueError("dimension must be one of 1, 2, or 3.")
+        if not isinstance(self.basis_type, str) or not self.basis_type.strip():
             raise ValueError("basis_type must be a non-empty string.")
+        if self.dk_derivative <= 0.0:
+            raise ValueError("dk_derivative must be strictly positive.")
 
-        defaults = self.default_params()
-        defaults.update(self.params)
-        self.set_params(defaults)
+        initial_params = dict(self.params)
+        self.params = {}
+        self.set_params(initial_params)
 
     def default_params(self) -> dict[str, Any]:
-        """Return model parameters used when no explicit values are provided."""
+        """Return default model parameters for the concrete Hamiltonian."""
 
         return {}
 
     def set_params(self, params: dict[str, Any]) -> None:
-        """Update the model parameter dictionary."""
+        """Update model parameters without discarding default values.
 
-        self.params = dict(params)
+        The update order is:
+        1. concrete-model defaults from :meth:`default_params`
+        2. currently stored parameters
+        3. the user-provided ``params`` mapping
+        """
+
+        updated = dict(self.default_params())
+        updated.update(self.params)
+        updated.update(dict(params))
+        self.params = updated
 
     @abstractmethod
-    def H(self, kx: float, ky: float, kz: float) -> ComplexArray:
-        """Return the Hamiltonian matrix H(k)."""
+    def H(self, kx: float, ky: float, kz: float) -> np.ndarray:
+        """Return the Hamiltonian matrix :math:`H(\\mathbf{k})`."""
 
-    def dH_dk(self, kx: float, ky: float, kz: float, dir: str) -> ComplexArray:
-        """Return the first k-derivative of H(k) along one direction."""
+    def validate_matrix(self, matrix: ArrayLike) -> ComplexArray:
+        """Return one validated complex Hamiltonian matrix.
 
-        k_plus, k_minus = self._shifted_k_points(kx, ky, kz, dir)
-        step = self._FINITE_DIFFERENCE_STEP
+        The matrix is converted to ``complex`` and must be two-dimensional,
+        square, and of shape ``(basis_size, basis_size)``.
+        """
+
+        values = np.asarray(matrix, dtype=complex)
+        if values.ndim != 2:
+            raise ValueError("Hamiltonian matrix must be a 2D array.")
+        if values.shape[0] != values.shape[1]:
+            raise ValueError("Hamiltonian matrix must be square.")
+
+        expected_shape = (self.basis_size, self.basis_size)
+        if values.shape != expected_shape:
+            raise ValueError(
+                f"Hamiltonian matrix must have shape {expected_shape}, "
+                f"got {values.shape}."
+            )
+        return np.asarray(values, dtype=np.complex128)
+
+    def validate_hermiticity(
+        self,
+        kx: float,
+        ky: float,
+        kz: float,
+        atol: float = 1.0e-10,
+    ) -> bool:
+        """Return whether :math:`H(\\mathbf{k})` is Hermitian within tolerance."""
+
+        matrix = self._matrix_at(kx, ky, kz)
+        return bool(np.allclose(matrix, matrix.conj().T, atol=atol))
+
+    def require_hermitian(
+        self,
+        kx: float,
+        ky: float,
+        kz: float,
+        atol: float = 1.0e-10,
+    ) -> None:
+        """Raise ``ValueError`` when :math:`H(\\mathbf{k})` is not Hermitian."""
+
+        if not self.validate_hermiticity(kx, ky, kz, atol=atol):
+            raise ValueError(
+                f"Hamiltonian '{self.model_name}' is not Hermitian at "
+                f"(kx, ky, kz)=({kx}, {ky}, {kz})."
+            )
+
+    def dH_dk(
+        self,
+        kx: float,
+        ky: float,
+        kz: float,
+        direction: str,
+    ) -> ComplexArray:
+        """Return the first finite-difference derivative of :math:`H`.
+
+        A centered finite difference is used with step ``dk_derivative``.
+        """
+
+        k_plus, k_minus = self._shifted_k_points(kx, ky, kz, direction)
+        step = self.dk_derivative
         return (self._matrix_at(*k_plus) - self._matrix_at(*k_minus)) / (2.0 * step)
 
     def d2H_dk2(
@@ -69,37 +142,54 @@ class Hamiltonian(ABC):
         kx: float,
         ky: float,
         kz: float,
-        dir1: str,
-        dir2: str,
+        direction1: str,
+        direction2: str,
     ) -> ComplexArray:
-        """Return the second k-derivative of H(k)."""
+        """Return the second finite-difference derivative of :math:`H`.
 
-        step = self._FINITE_DIFFERENCE_STEP
-        k = np.array([kx, ky, kz], dtype=float)
-        axis1 = self._direction_axis(dir1)
-        axis2 = self._direction_axis(dir2)
+        The method supports both pure and mixed derivatives:
+
+        .. math::
+
+            \\partial_i^2 H \\approx \\frac{H(k+h\\hat{i}) - 2H(k) + H(k-h\\hat{i})}{h^2}
+
+        and
+
+        .. math::
+
+            \\partial_i\\partial_j H \\approx
+            \\frac{H_{++} - H_{+-} - H_{-+} + H_{--}}{4 h^2}.
+        """
+
+        step = self.dk_derivative
+        k_vector = np.array([kx, ky, kz], dtype=float)
+        axis1 = self._direction_axis(direction1)
+        axis2 = self._direction_axis(direction2)
 
         if axis1 == axis2:
-            k_plus = k.copy()
-            k_minus = k.copy()
+            k_plus = k_vector.copy()
+            k_minus = k_vector.copy()
             k_plus[axis1] += step
             k_minus[axis1] -= step
             return (
                 self._matrix_at(*k_plus)
-                - 2.0 * self._matrix_at(*k)
+                - 2.0 * self._matrix_at(*k_vector)
                 + self._matrix_at(*k_minus)
             ) / step**2
 
-        k_pp = k.copy()
-        k_pm = k.copy()
-        k_mp = k.copy()
-        k_mm = k.copy()
-        k_pp[[axis1, axis2]] += step
+        k_pp = k_vector.copy()
+        k_pm = k_vector.copy()
+        k_mp = k_vector.copy()
+        k_mm = k_vector.copy()
+
+        k_pp[axis1] += step
+        k_pp[axis2] += step
         k_pm[axis1] += step
         k_pm[axis2] -= step
         k_mp[axis1] -= step
         k_mp[axis2] += step
-        k_mm[[axis1, axis2]] -= step
+        k_mm[axis1] -= step
+        k_mm[axis2] -= step
 
         return (
             self._matrix_at(*k_pp)
@@ -113,101 +203,182 @@ class Hamiltonian(ABC):
         kx: float,
         ky: float,
         kz: float,
-        dir: str,
+        direction: str,
     ) -> ComplexArray:
         """Return the velocity operator in atomic units."""
 
-        return self.dH_dk(kx, ky, kz, dir)
+        return self.dH_dk(kx, ky, kz, direction)
 
     def inverse_mass_operator(
         self,
         kx: float,
         ky: float,
         kz: float,
-        dir1: str,
-        dir2: str,
+        direction1: str,
+        direction2: str,
     ) -> ComplexArray:
-        """Return the inverse mass operator in atomic units."""
+        """Return the inverse-mass tensor element in atomic units."""
 
-        return self.d2H_dk2(kx, ky, kz, dir1, dir2)
+        return self.d2H_dk2(kx, ky, kz, direction1, direction2)
 
     def diagonalize(
         self,
         kx: float,
         ky: float,
         kz: float,
-    ) -> tuple[NDArray[np.float64], ComplexArray]:
-        """Return eigenvalues and eigenvectors of H(k)."""
+    ) -> tuple[RealArray, ComplexArray]:
+        """Diagonalize :math:`H(\\mathbf{k})` using ``numpy.linalg.eigh``."""
 
-        return np.linalg.eigh(self._matrix_at(kx, ky, kz))
+        self.require_hermitian(kx, ky, kz)
+        eigenvalues, eigenvectors = np.linalg.eigh(self._matrix_at(kx, ky, kz))
+        return np.asarray(eigenvalues, dtype=float), np.asarray(eigenvectors, dtype=np.complex128)
 
-    def eigenvalues(self, kx: float, ky: float, kz: float) -> NDArray[np.float64]:
-        """Return the band energies of H(k)."""
+    def eigenvalues(self, kx: float, ky: float, kz: float) -> RealArray:
+        """Return the band energies of :math:`H(\\mathbf{k})`."""
 
         values, _ = self.diagonalize(kx, ky, kz)
         return values
 
     def eigenvectors(self, kx: float, ky: float, kz: float) -> ComplexArray:
-        """Return the eigenvectors of H(k)."""
+        """Return the eigenvectors of :math:`H(\\mathbf{k})`."""
 
         _, vectors = self.diagonalize(kx, ky, kz)
         return vectors
 
     def transform_to_band_basis(
         self,
-        op: NDArray[np.complexfloating[Any, Any]] | NDArray[np.floating[Any]],
+        operator: ArrayLike,
         kx: float,
         ky: float,
         kz: float,
     ) -> ComplexArray:
-        """Transform one operator from the original basis to the band basis."""
+        """Transform one operator from the working basis to the band basis."""
 
-        operator = self._validate_matrix(op)
+        validated_operator = self.validate_matrix(operator)
         vectors = self.eigenvectors(kx, ky, kz)
-        return vectors.conj().T @ operator @ vectors
+        return vectors.conj().T @ validated_operator @ vectors
 
-    def validate_hermiticity(self, kx: float, ky: float, kz: float) -> bool:
-        """Return True when H(k) is Hermitian within numerical tolerance."""
+    def gap(
+        self,
+        kx: float,
+        ky: float,
+        kz: float,
+        occupied_bands: int | Iterable[int] | None = None,
+    ) -> float:
+        """Return the direct band gap at one k-point.
 
-        matrix = self._matrix_at(kx, ky, kz)
-        return bool(np.allclose(matrix, matrix.conj().T))
+        When ``occupied_bands`` is ``None``, half filling is assumed through
+        ``basis_size // 2``.
+        """
+
+        values = self.eigenvalues(kx, ky, kz)
+        if values.size < 2:
+            return 0.0
+
+        occupied_count = self._occupied_band_count(values.size, occupied_bands)
+        return float(values[occupied_count] - values[occupied_count - 1])
+
+    def band_projector(
+        self,
+        kx: float,
+        ky: float,
+        kz: float,
+        band_index: int,
+    ) -> ComplexArray:
+        """Return the projector onto one band eigenstate."""
+
+        _, vectors = self.diagonalize(kx, ky, kz)
+        if not 0 <= band_index < self.basis_size:
+            raise ValueError(
+                f"band_index must be between 0 and {self.basis_size - 1}, got {band_index}."
+            )
+
+        state = vectors[:, band_index]
+        return self.validate_matrix(np.outer(state, state.conj()))
+
+    def occupied_projector(
+        self,
+        kx: float,
+        ky: float,
+        kz: float,
+        fermi_level: float,
+    ) -> ComplexArray:
+        """Return the projector onto the subspace below ``fermi_level``."""
+
+        values, vectors = self.diagonalize(kx, ky, kz)
+        projector = np.zeros((self.basis_size, self.basis_size), dtype=complex)
+        for band_index, energy in enumerate(values):
+            if energy <= fermi_level:
+                state = vectors[:, band_index]
+                projector += np.outer(state, state.conj())
+        return self.validate_matrix(projector)
+
+    def summary(self) -> dict[str, Any]:
+        """Return a serializable summary of the Hamiltonian configuration."""
+
+        return {
+            "model_name": self.model_name,
+            "params": dict(self.params),
+            "basis_size": self.basis_size,
+            "dimension": self.dimension,
+            "basis_type": self.basis_type,
+            "is_periodic": self.is_periodic,
+            "dk_derivative": self.dk_derivative,
+        }
 
     def _matrix_at(self, kx: float, ky: float, kz: float) -> ComplexArray:
-        return self._validate_matrix(self.H(float(kx), float(ky), float(kz)))
+        return self.validate_matrix(self.H(float(kx), float(ky), float(kz)))
 
     def _shifted_k_points(
         self,
         kx: float,
         ky: float,
         kz: float,
-        dir: str,
-    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-        axis = self._direction_axis(dir)
-        step = self._FINITE_DIFFERENCE_STEP
+        direction: str,
+    ) -> tuple[RealArray, RealArray]:
+        axis = self._direction_axis(direction)
+        step = self.dk_derivative
         k_plus = np.array([kx, ky, kz], dtype=float)
-        k_minus = k_plus.copy()
+        k_minus = np.array([kx, ky, kz], dtype=float)
         k_plus[axis] += step
         k_minus[axis] -= step
         return k_plus, k_minus
 
-    def _direction_axis(self, dir: str) -> int:
+    def _direction_axis(self, direction: str) -> int:
         try:
-            axis = self._VALID_DIRECTIONS[dir.lower()]
+            axis = self._VALID_DIRECTIONS[direction.lower()]
         except KeyError as exc:
-            raise ValueError("dir must be one of 'x', 'y', or 'z'.") from exc
+            raise ValueError("direction must be one of 'x', 'y', or 'z'.") from exc
+
         if axis >= self.dimension:
-            raise ValueError(f"Direction '{dir}' is outside dimension {self.dimension}.")
+            raise ValueError(
+                f"Direction '{direction}' is outside dimension {self.dimension}."
+            )
         return axis
 
-    def _validate_matrix(
+    def _occupied_band_count(
         self,
-        matrix: NDArray[np.complexfloating[Any, Any]] | NDArray[np.floating[Any]],
-    ) -> ComplexArray:
-        values = np.asarray(matrix, dtype=complex)
-        expected_shape = (self.basis_size, self.basis_size)
-        if values.shape != expected_shape:
+        num_bands: int,
+        occupied_bands: int | Iterable[int] | None,
+    ) -> int:
+        if occupied_bands is None:
+            count = num_bands // 2
+        elif isinstance(occupied_bands, int):
+            count = occupied_bands
+        else:
+            indices = sorted({int(index) for index in occupied_bands})
+            if not indices:
+                raise ValueError("occupied_bands cannot be empty.")
+            if indices[0] < 0 or indices[-1] >= num_bands:
+                raise ValueError("occupied_bands contains out-of-range band indices.")
+            count = indices[-1] + 1
+
+        if not 0 < count < num_bands:
             raise ValueError(
-                f"Hamiltonian matrix must have shape {expected_shape}, "
-                f"got {values.shape}."
+                "Gap requires at least one occupied band and one unoccupied band."
             )
-        return values
+        return count
+
+    # Backward-compatible alias for older code paths.
+    def _validate_matrix(self, matrix: ArrayLike) -> ComplexArray:
+        return self.validate_matrix(matrix)
