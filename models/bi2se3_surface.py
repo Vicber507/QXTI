@@ -1,0 +1,162 @@
+"""Hamiltoniano de superficie de Bi2Se3 en un modulo autocontenido."""
+
+from __future__ import annotations
+
+import numpy as np
+
+
+MODEL_NAME = "bi2se3-surface"
+BASIS_SIZE = 2
+DIMENSION = 2
+BASIS_TYPE = "spin"
+IS_PERIODIC = True
+
+
+sigma_x = np.array([[0, 1], [1, 0]], dtype=complex)
+sigma_y = np.array([[0, -1j], [1j, 0]], dtype=complex)
+sigma_z = np.array([[1, 0], [0, -1]], dtype=complex)
+sigma_0 = np.eye(2, dtype=complex)
+
+
+DEFAULT_PARAMS = {
+    "a0": 7.8234655927,
+    "A0": -0.000937,
+    "B0": 0.00060,
+    "A11": 0.00711836,
+    "A12": 0.00823187,
+    "A14": 0.00202489,
+    "B11": 0.00442095,
+    "B14": 0.0,
+    "E0": 0.002703,
+    "ratio": 2.0,
+    "wlaser": 0.04411764706,
+    "phi": 0.0,
+    "t": 0.0,
+    "driven": True,
+}
+
+
+theta_a = np.array([0.0, 2.0 * np.pi / 3.0, 4.0 * np.pi / 3.0], dtype=float)
+theta_b = np.array([np.pi / 2.0, 7.0 * np.pi / 6.0, -np.pi / 6.0], dtype=float)
+Omega = np.array([0.0, -2.0 * np.pi / 3.0, -4.0 * np.pi / 3.0], dtype=float)
+
+
+def default_params() -> dict[str, float | bool]:
+    return dict(DEFAULT_PARAMS)
+
+
+def _resolved_params(params: dict[str, object] | None) -> dict[str, object]:
+    resolved = default_params()
+    if params:
+        resolved.update(params)
+    return resolved
+
+
+def _validate_surface_params(params: dict[str, object]) -> None:
+    if float(params["a0"]) <= 0.0:
+        raise ValueError("a0 debe ser estrictamente positivo.")
+    if np.isclose(float(params["B11"]), 0.0):
+        raise ValueError("B11 no puede ser cero.")
+    if abs(float(params["B0"]) / float(params["B11"])) > 1.0:
+        raise ValueError("|B0 / B11| debe ser <= 1 para que gamma sea real.")
+    if float(params["wlaser"]) <= 0.0:
+        raise ValueError("wlaser debe ser estrictamente positivo.")
+
+
+def _surface_vectors(a0: float) -> tuple[np.ndarray, np.ndarray]:
+    sqrt3 = np.sqrt(3.0)
+    surface_avec = np.array(
+        [
+            [a0, 0.0],
+            [-a0 / 2.0, (a0 * sqrt3) / 2.0],
+            [-a0 / 2.0, -(a0 * sqrt3) / 2.0],
+        ],
+        dtype=float,
+    )
+    surface_bvec = np.array(
+        [
+            [0.0, (a0 * sqrt3) / 3.0],
+            [-a0 / 2.0, -(a0 * sqrt3) / 6.0],
+            [a0 / 2.0, -(a0 * sqrt3) / 6.0],
+        ],
+        dtype=float,
+    )
+    return surface_avec, surface_bvec
+
+
+def _effective_coefficients(params: dict[str, object]) -> tuple[float, float, float, float, float]:
+    B0 = float(params["B0"])
+    B11 = float(params["B11"])
+    A11 = float(params["A11"])
+    A12 = float(params["A12"])
+    A14 = float(params["A14"])
+    B14 = float(params["B14"])
+    A0 = float(params["A0"])
+
+    gamma = np.sqrt(1.0 - (B0 / B11) ** 2)
+    eps = 6.0 * B0 * (1.0 + (A11 / B11))
+    t0 = A0 - B0 * (A11 / B11)
+    lamb_a = A14 * gamma
+    lamb_b = B14 * gamma
+    lamb_z = A12 * gamma
+    return eps, t0, lamb_a, lamb_b, lamb_z
+
+
+def _bicircular_phases(params: dict[str, object]) -> tuple[np.ndarray, np.ndarray]:
+    a0 = float(params["a0"])
+    E0 = float(params["E0"])
+    ratio = float(params["ratio"])
+    wlaser = float(params["wlaser"])
+    phi = float(params["phi"])
+    t = float(params["t"])
+
+    A1 = E0 / wlaser
+    A2 = ratio * E0 / (2.0 * wlaser)
+    wt = wlaser * t
+
+    alpha = -a0 * A1 * np.sin(wt - theta_a) + a0 * A2 * np.sin(2.0 * wt + phi + theta_a)
+    beta_prefactor = a0 / np.sqrt(3.0)
+    beta = (
+        -beta_prefactor * A1 * np.sin(wt - theta_b)
+        + beta_prefactor * A2 * np.sin(2.0 * wt + phi + theta_b)
+    )
+    return alpha, beta
+
+
+def H(kx: float, ky: float, kz: float, params: dict[str, object] | None) -> np.ndarray:
+    """Hamiltoniano driven de superficie de Bi2Se3 con firma QXTI."""
+
+    del kz
+    resolved = _resolved_params(params)
+    _validate_surface_params(resolved)
+
+    a0 = float(resolved["a0"])
+    driven = bool(resolved["driven"])
+    surface_avec, surface_bvec = _surface_vectors(a0)
+    eps, t0, lamb_a, lamb_b, lamb_z = _effective_coefficients(resolved)
+
+    if driven:
+        alpha, beta = _bicircular_phases(resolved)
+    else:
+        alpha = np.zeros(3, dtype=float)
+        beta = np.zeros(3, dtype=float)
+
+    k = np.array([float(kx), float(ky)], dtype=float)
+    h0 = 0.0
+    h1 = 0.0
+    h2 = 0.0
+    h3 = 0.0
+
+    for i in range(3):
+        pa = np.dot(k, surface_avec[i]) - alpha[i]
+        pb = np.dot(k, surface_bvec[i]) - beta[i]
+
+        h0 += np.cos(pa)
+        h1 += -2.0 * lamb_a * np.sin(Omega[i]) * np.sin(pa)
+        h1 += 2.0 * lamb_b * np.cos(Omega[i]) * np.sin(pb)
+        h2 += -2.0 * lamb_a * np.cos(Omega[i]) * np.sin(pa)
+        h2 += -2.0 * lamb_b * np.sin(Omega[i]) * np.sin(pb)
+        h3 += 2.0 * lamb_z * np.sin(pa)
+
+    h0 = eps + 2.0 * t0 * h0
+    return h0 * sigma_0 + h1 * sigma_x + h2 * sigma_y + h3 * sigma_z
