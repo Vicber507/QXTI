@@ -60,7 +60,7 @@ from qxti.physics import CustomHamiltonian
 
 model = CustomHamiltonian(
     source_file="bi2se3_surface.py",
-    params={"driven": False},
+    params={"A14": 0.0030},
 )
 
 matrix = model.H(0.1, 0.0, 0.0)

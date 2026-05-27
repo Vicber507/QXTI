@@ -27,21 +27,13 @@ DEFAULT_PARAMS = {
     "A14": 0.00202489,
     "B11": 0.00442095,
     "B14": 0.0,
-    "E0": 0.002703,
-    "ratio": 2.0,
-    "wlaser": 0.04411764706,
-    "phi": 0.0,
-    "t": 0.0,
-    "driven": True,
 }
 
 
-theta_a = np.array([0.0, 2.0 * np.pi / 3.0, 4.0 * np.pi / 3.0], dtype=float)
-theta_b = np.array([np.pi / 2.0, 7.0 * np.pi / 6.0, -np.pi / 6.0], dtype=float)
 Omega = np.array([0.0, -2.0 * np.pi / 3.0, -4.0 * np.pi / 3.0], dtype=float)
 
 
-def default_params() -> dict[str, float | bool]:
+def default_params() -> dict[str, float]:
     return dict(DEFAULT_PARAMS)
 
 
@@ -59,8 +51,6 @@ def _validate_surface_params(params: dict[str, object]) -> None:
         raise ValueError("B11 no puede ser cero.")
     if abs(float(params["B0"]) / float(params["B11"])) > 1.0:
         raise ValueError("|B0 / B11| debe ser <= 1 para que gamma sea real.")
-    if float(params["wlaser"]) <= 0.0:
-        raise ValueError("wlaser debe ser estrictamente positivo.")
 
 
 def _surface_vectors(a0: float) -> tuple[np.ndarray, np.ndarray]:
@@ -102,44 +92,16 @@ def _effective_coefficients(params: dict[str, object]) -> tuple[float, float, fl
     return eps, t0, lamb_a, lamb_b, lamb_z
 
 
-def _bicircular_phases(params: dict[str, object]) -> tuple[np.ndarray, np.ndarray]:
-    a0 = float(params["a0"])
-    E0 = float(params["E0"])
-    ratio = float(params["ratio"])
-    wlaser = float(params["wlaser"])
-    phi = float(params["phi"])
-    t = float(params["t"])
-
-    A1 = E0 / wlaser
-    A2 = ratio * E0 / (2.0 * wlaser)
-    wt = wlaser * t
-
-    alpha = -a0 * A1 * np.sin(wt - theta_a) + a0 * A2 * np.sin(2.0 * wt + phi + theta_a)
-    beta_prefactor = a0 / np.sqrt(3.0)
-    beta = (
-        -beta_prefactor * A1 * np.sin(wt - theta_b)
-        + beta_prefactor * A2 * np.sin(2.0 * wt + phi + theta_b)
-    )
-    return alpha, beta
-
-
 def H(kx: float, ky: float, kz: float, params: dict[str, object] | None) -> np.ndarray:
-    """Hamiltoniano driven de superficie de Bi2Se3 con firma QXTI."""
+    """Hamiltoniano natural de superficie de Bi2Se3 con firma QXTI."""
 
     del kz
     resolved = _resolved_params(params)
     _validate_surface_params(resolved)
 
     a0 = float(resolved["a0"])
-    driven = bool(resolved["driven"])
     surface_avec, surface_bvec = _surface_vectors(a0)
     eps, t0, lamb_a, lamb_b, lamb_z = _effective_coefficients(resolved)
-
-    if driven:
-        alpha, beta = _bicircular_phases(resolved)
-    else:
-        alpha = np.zeros(3, dtype=float)
-        beta = np.zeros(3, dtype=float)
 
     k = np.array([float(kx), float(ky)], dtype=float)
     h0 = 0.0
@@ -148,8 +110,8 @@ def H(kx: float, ky: float, kz: float, params: dict[str, object] | None) -> np.n
     h3 = 0.0
 
     for i in range(3):
-        pa = np.dot(k, surface_avec[i]) - alpha[i]
-        pb = np.dot(k, surface_bvec[i]) - beta[i]
+        pa = np.dot(k, surface_avec[i])
+        pb = np.dot(k, surface_bvec[i])
 
         h0 += np.cos(pa)
         h1 += -2.0 * lamb_a * np.sin(Omega[i]) * np.sin(pa)

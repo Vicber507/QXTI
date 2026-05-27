@@ -38,7 +38,7 @@ def default_params() -> dict: ...
 def H(kx, ky, kz, params) -> np.ndarray: ...
 ```
 
-`default_params()` returns the built-in constants and drive controls.
+`default_params()` returns the built-in equilibrium constants.
 
 `H(...)` is the entry point used by `CustomHamiltonian`.
 
@@ -56,19 +56,6 @@ The model includes the original surface parameters:
     "A14": 0.00202489,
     "B11": 0.00442095,
     "B14": 0.0,
-}
-```
-
-and also keeps the bicircular driving controls inside `params`:
-
-```python
-{
-    "E0": 0.002703,
-    "ratio": 2.0,
-    "wlaser": 0.04411764706,
-    "phi": 0.0,
-    "t": 0.0,
-    "driven": True,
 }
 ```
 
@@ -90,9 +77,8 @@ You can override any model parameter from the constructor:
 model = CustomHamiltonian(
     source_file="bi2se3_surface.py",
     params={
-        "driven": True,
-        "t": 1.75,
-        "phi": 0.31,
+        "A14": 0.0030,
+        "A0": -0.0011,
     },
 )
 ```
@@ -107,3 +93,11 @@ H(k) = h0 sigma0 + h1 sigmax + h2 sigmay + h3 sigmaz
 
 with bond-dependent phases evaluated over the three surface vectors of the
 hexagonal Bi2Se3 surface lattice.
+
+## Scope
+
+This file contains only the natural equilibrium Hamiltonian.
+
+- there is no built-in laser drive
+- there is no explicit time dependence
+- `kz` is accepted only to match the shared QXTI Hamiltonian interface
