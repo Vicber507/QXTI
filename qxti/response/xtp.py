@@ -14,9 +14,9 @@ Atributos de la clase XTP
 """
 
 from qxti.physics import Hamiltonian
-from qxti.physics import KGrid
-from qxti.physics import TimeGrid
-from qxti.physics import FrequencyGrid
+from qxti.grids import KGrid
+from qxti.grids import TimeGrid
+from qxti.grids import FrequencyGrid
 from qxti.physics import OperatorFactory
 
 
