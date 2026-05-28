@@ -3,9 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Any, Callable
+from qxti.grids import KGrid
+from qxti.core import QXTISimulation
 
 import numpy as np
-
 
 ObservableDict = dict[str, float]
 SimulationRunner = Callable[[KGrid], Any]
