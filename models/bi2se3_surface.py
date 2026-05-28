@@ -29,6 +29,20 @@ DEFAULT_PARAMS = {
     "B14": 0.0,
 }
 
+DEFAULT_LATTICE = {
+    "lattice_type": "2D hexagonal surface",
+    "lattice_constants": {
+        "a0": 7.8234655927,
+        "a1_length": 7.8234655927,
+        "a2_length": 7.8234655927,
+        "gamma_deg": 120.0,
+    },
+    "real_space_vectors": {
+        "a1": [7.8234655927, 0.0],
+        "a2": [-3.91173279635, 6.775091094748115],
+    },
+}
+
 
 Omega = np.array([0.0, -2.0 * np.pi / 3.0, -4.0 * np.pi / 3.0], dtype=float)
 
