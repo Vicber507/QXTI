@@ -18,7 +18,7 @@ from qxti.physics import Solver
 
 class CMD:
 
-     """
+    """
     Responsibility:
     First class combining Hamiltonian and LaserSystem.
     Output: rho = {0: rho0, 1: rho1, 2: rho2, 3: rho3}.
