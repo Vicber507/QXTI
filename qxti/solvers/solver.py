@@ -155,6 +155,7 @@ class RKF45Solver(Solver):
     ) -> Tuple[List[float], List[ComplexArray]]:
 
         t = t0
+        reached_final_time = False
 
         y = y0.astype(np.complex128)
 
@@ -246,6 +247,10 @@ class RKF45Solver(Solver):
 
                 y_l.append(y.copy())
 
+                if t >= tf:
+                    reached_final_time = True
+                    break
+
             # =================================================
             # Adaptive timestep update
             # =================================================
@@ -275,6 +280,14 @@ class RKF45Solver(Solver):
             if self.iterations >= self.max_iterations:
 
                 break
+
+        if not reached_final_time and t < tf:
+            raise RuntimeError(
+                "RKF45Solver stopped before reaching the final time. "
+                f"Reached t={t:.16e} while tf={tf:.16e}. "
+                "Increase solver_max_iterations, increase solver_h_max, "
+                "or relax the tolerance."
+            )
 
         self.check_convergence()
 
@@ -407,6 +420,12 @@ class AdamsBashforth2Solver(Solver):
 
         y_list.append(y1.copy())
 
+        # ====================================================
+        # Adams-Bashforth propagation
+        # ====================================================
+
+        reached_final_time = False
+
         for n in range(1, len(time_values) - 1):
 
             t_n = time_values[n]
@@ -459,9 +478,20 @@ class AdamsBashforth2Solver(Solver):
 
             self.iterations += 1
 
+            if n == len(time_values) - 2:
+                reached_final_time = True
+
             if self.iterations >= self.max_iterations:
 
                 break
+
+        if not reached_final_time:
+            last_time = float(t_list[len(y_list) - 1])
+            raise RuntimeError(
+                "AdamsBashforth2Solver stopped before reaching the final time. "
+                f"Reached t={last_time:.16e} while tf={tf:.16e}. "
+                "Increase solver_max_iterations or reduce the requested time window."
+            )
 
         self.check_convergence()
 

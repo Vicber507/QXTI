@@ -19,7 +19,7 @@ DEFAULT_RESPONSE_PLOT_CONFIG = {
     "orders": "all",
     "population": {
         "video": {
-            "enabled": True,
+            "enabled": False,
             "output_file": "population_kx_ky_per_band.mp4",
             "fps": 10,
             "frame_stride": 2,
@@ -37,7 +37,7 @@ DEFAULT_RESPONSE_PLOT_CONFIG = {
     "coherence": {
         "component": "magnitude",
         "video": {
-            "enabled": True,
+            "enabled": False,
             "output_file": "coherence_kx_ky_per_pair.mp4",
             "fps": 10,
             "frame_stride": 2,

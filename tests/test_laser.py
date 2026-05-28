@@ -29,16 +29,21 @@ else:
 
 # Edit these values when you want to preview a different pulse by running
 # `python tests/test_laser.py`.
+def cycles_for_fwhm(omega: float, fwhm: float) -> float:
+    return fwhm * omega / (2.0 * np.pi)
+
+
 PREVIEW_LASER_PARAMS = {
-    "omega": 1.0,
-    "E0": 1.0,
-    "phase": 0.0,
-    "ellipticity": 0.0,
-    "fwhm": 20.0,
-    "envelope": "gaussian",
+    "omega": 0.03,
+    "E0": 0.004,
+    "cep": 0.0,
+    "ellip": 0.0,
+    "ncycles": 3,
+    "envname": "gauss",
     "t0": 0.0,
-    "theta": 0.5 * np.pi,
-    "phi": 0.25 * np.pi,
+    "thetaz": 0.0,
+    "phiz": 0.0,
+    "phix": 0.5 * np.pi,
 }
 
 PREVIEW_TIME_PARAMS = {
@@ -51,10 +56,10 @@ def build_reference_laser() -> Laser:
     return Laser(
         omega=0.85,
         E0=0.06,
-        phase=0.2,
-        ellipticity=1.0,
-        fwhm=24.0,
-        envelope="gaussian",
+        cep=0.2,
+        ellip=1.0,
+        ncycles=cycles_for_fwhm(0.85, 24.0),
+        envname="gauss",
         t0=0.0,
         theta=0.0,
         phi=0.75,
@@ -183,9 +188,11 @@ def test_laser_shapes_and_summary() -> None:
     assert electric_field.shape == (600, 3)
     assert vector_potential.shape == (600, 3)
     assert np.isclose(np.linalg.norm(laser.polarization_vector()), 1.0)
-    assert summary["envelope"] == "gaussian"
+    assert summary["envelope"] == "gauss"
     assert np.isclose(summary["theta"], 0.0)
     assert np.isclose(summary["phi"], 0.75)
+    assert np.isclose(summary["fwhm"], laser.fwhm)
+    assert np.isclose(summary["period"], 2.0 * np.pi / laser.omega)
     assert summary["intensity"] > 0.0
 
 
@@ -194,35 +201,37 @@ def test_laser_temporal_bounds_are_inferred_in_atomic_units() -> None:
 
     t_min, t_max = laser.temporal_bounds()
 
-    assert np.isclose(t_min, laser.t0 - 4.0 * laser.fwhm)
-    assert np.isclose(t_max, laser.t0 + 4.0 * laser.fwhm)
+    assert np.isclose(t_min, laser.t0 - 2.0 * laser.fwhm)
+    assert np.isclose(t_max, laser.t0 + 2.0 * laser.fwhm)
 
 
 def test_linear_polarization_orientation_from_angles() -> None:
     linear_x = Laser(
         omega=1.0,
         E0=1.0,
-        ellipticity=0.0,
-        fwhm=10.0,
-        envelope="constant",
-        theta=0.5 * np.pi,
-        phi=0.0,
+        ellip=0.0,
+        ncycles=cycles_for_fwhm(1.0, 10.0),
+        envname="constant",
+        thetaz=0.0,
+        phiz=0.0,
+        phix=0.0,
     )
     linear_y = Laser(
         omega=1.0,
         E0=1.0,
-        ellipticity=0.0,
-        fwhm=10.0,
-        envelope="constant",
-        theta=0.5 * np.pi,
-        phi=0.5 * np.pi,
+        ellip=0.0,
+        ncycles=cycles_for_fwhm(1.0, 10.0),
+        envname="constant",
+        thetaz=0.0,
+        phiz=0.0,
+        phix=0.5 * np.pi,
     )
     linear_z = Laser(
         omega=1.0,
         E0=1.0,
-        ellipticity=0.0,
-        fwhm=10.0,
-        envelope="constant",
+        ellip=0.0,
+        ncycles=cycles_for_fwhm(1.0, 10.0),
+        envname="constant",
         theta=0.0,
         phi=0.0,
     )
@@ -236,28 +245,30 @@ def test_ellipticity_sign_sets_rotation_sense() -> None:
     right_circular = Laser(
         omega=1.0,
         E0=1.0,
-        ellipticity=1.0,
-        fwhm=10.0,
-        envelope="constant",
-        theta=0.5 * np.pi,
-        phi=0.0,
+        ellip=1.0,
+        ncycles=cycles_for_fwhm(1.0, 10.0),
+        envname="constant",
+        thetaz=0.0,
+        phiz=0.0,
+        phix=0.0,
     )
     left_circular = Laser(
         omega=1.0,
         E0=1.0,
-        ellipticity=-1.0,
-        fwhm=10.0,
-        envelope="constant",
-        theta=0.5 * np.pi,
-        phi=0.0,
+        ellip=-1.0,
+        ncycles=cycles_for_fwhm(1.0, 10.0),
+        envname="constant",
+        thetaz=0.0,
+        phiz=0.0,
+        phix=0.0,
     )
 
     quarter_cycle = 0.5 * np.pi
     right_field = right_circular.electric_field(quarter_cycle)
     left_field = left_circular.electric_field(quarter_cycle)
 
-    assert np.allclose(right_field, np.array([0.0, 1.0, 0.0]), atol=1e-12)
-    assert np.allclose(left_field, np.array([0.0, -1.0, 0.0]), atol=1e-12)
+    assert np.allclose(right_field, np.array([0.0, right_circular.E0y, 0.0]), atol=1e-12)
+    assert np.allclose(left_field, np.array([0.0, left_circular.E0y, 0.0]), atol=1e-12)
 
 
 def test_rotation_matrix_is_orthonormal() -> None:
@@ -268,15 +279,13 @@ def test_rotation_matrix_is_orthonormal() -> None:
     assert np.allclose(rotation[:, 0], laser.polarization_vector(), atol=1e-12)
 
 
-def test_field_norm_is_bounded_by_amplitude_envelope() -> None:
+def test_field_and_vector_potential_have_expected_center_values() -> None:
     laser = build_preview_laser()
-    t = build_visualization_time(laser, **PREVIEW_TIME_PARAMS)
+    field_center = laser.electric_field(laser.t0)
+    potential_center = laser.vector_potential(laser.t0)
 
-    electric_field = laser.electric_field(t)
-    field_norm = np.linalg.norm(electric_field, axis=1)
-    amplitude_bound = laser.E0 * np.asarray(laser.envelope_function(t), dtype=float)
-
-    assert np.all(field_norm <= amplitude_bound + 1e-12)
+    np.testing.assert_allclose(field_center, laser.E0x * laser.xdir, atol=1.0e-12)
+    np.testing.assert_allclose(potential_center, laser.A0y * laser.ydir, atol=1.0e-12)
 
 
 def test_laser_preview_generation(tmp_path: Path) -> None:
@@ -298,7 +307,7 @@ if __name__ == "__main__":
     test_linear_polarization_orientation_from_angles()
     test_ellipticity_sign_sets_rotation_sense()
     test_rotation_matrix_is_orthonormal()
-    test_field_norm_is_bounded_by_amplitude_envelope()
+    test_field_and_vector_potential_have_expected_center_values()
     print("Core Laser checks passed.")
 
     if HAS_MATPLOTLIB:

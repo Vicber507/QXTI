@@ -11,8 +11,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from qxti.grids import FrequencyGrid, KGrid, TimeGrid
-from qxti.data import ResponseData
-from qxti.graphics import ResponseGraphics
+from qxti.data import HarmonicData, ResponseData
+from qxti.graphics import HarmonicGraphics, ResponseGraphics
 from qxti.physics import Hamiltonian, Laser, LaserSystem, OperatorFactory
 from qxti.response import CMD, T1T2Relaxation, XTP, bose_einstein, fermi_dirac, maxwell_boltzmann, t1_t2_relaxation
 from qxti.solvers import RKF45Solver
@@ -21,6 +21,19 @@ from qxti.solvers import RKF45Solver
 class ToyTwoBandHamiltonian(Hamiltonian):
     def default_params(self) -> dict[str, float]:
         return {"mass": 0.4, "velocity": 1.2}
+
+    def default_lattice(self) -> dict[str, object]:
+        return {
+            "lattice_constants": {
+                "a0": 2.0,
+                "a": 2.0,
+                "b": 2.0,
+            },
+            "real_space_vectors": {
+                "a1": [2.0, 0.0],
+                "a2": [0.0, 2.0],
+            },
+        }
 
     def H(self, kx: float, ky: float, kz: float) -> np.ndarray:
         del kz
@@ -33,6 +46,10 @@ class ToyTwoBandHamiltonian(Hamiltonian):
             ],
             dtype=complex,
         )
+
+
+def cycles_for_fwhm(omega: float, fwhm: float) -> float:
+    return fwhm * omega / (2.0 * np.pi)
 
 
 def build_cmd_stack(
@@ -57,7 +74,7 @@ def build_cmd_stack(
                 omega=0.8,
                 E0=0.05,
                 ellipticity=0.0,
-                fwhm=20.0,
+                num_cycles=cycles_for_fwhm(0.8, 20.0),
                 envelope="constant",
                 theta=0.5 * np.pi,
                 phi=0.0,
@@ -331,6 +348,31 @@ def test_cmd_velocity_gauge_is_rejected_for_recursive_solver() -> None:
         raise AssertionError("CMD should reject velocity gauge for the recursive solver.")
 
 
+def test_cmd_raises_when_solver_does_not_reach_final_time() -> None:
+    cmd, _ = build_cmd_stack(max_order=1)
+    cmd.solver.max_iterations = 1
+
+    try:
+        cmd.solve_time_domain()
+    except RuntimeError as exc:
+        assert "final time" in str(exc)
+    else:
+        raise AssertionError("CMD should fail if the solver does not reach the final time.")
+
+
+def test_resample_density_trajectory_rejects_incomplete_time_coverage() -> None:
+    target_times = np.array([0.0, 0.5, 1.0], dtype=float)
+    source_times = np.array([0.0, 0.25], dtype=float)
+    states = np.zeros((2, 2, 2), dtype=np.complex128)
+
+    try:
+        CMD._resample_density_trajectory(source_times, states, target_times)
+    except RuntimeError as exc:
+        assert "does not cover" in str(exc)
+    else:
+        raise AssertionError("Resampling should fail when the solver trajectory is incomplete.")
+
+
 def test_xtp_basic_observables_run_with_cmd_output() -> None:
     cmd, operator_factory = build_cmd_stack(max_order=1)
     rho_orders = cmd.compute_all_orders()
@@ -354,3 +396,117 @@ def test_xtp_basic_observables_run_with_cmd_output() -> None:
     assert susceptibility.shape == (len(cmd.timegrid), 3)
     assert np.all(np.isfinite(polarization))
     assert np.all(np.isfinite(current))
+
+
+def test_xtp_first_order_polarization_matches_manual_bz_dipole_integral() -> None:
+    cmd, operator_factory = build_cmd_stack(
+        max_order=1,
+        kgrid=KGrid(
+            kx_values=np.linspace(-0.5 * np.pi, 0.5 * np.pi, 3),
+            ky_values=np.linspace(-0.5 * np.pi, 0.5 * np.pi, 2),
+            kz_values=np.array([0.0]),
+            dimension=2,
+        ),
+    )
+    rho_orders = cmd.compute_all_orders()
+    xtp = XTP(
+        hamiltonian=cmd.hamiltonian,
+        rho_orders=rho_orders,
+        kgrid=cmd.kgrid,
+        timegrid=cmd.timegrid,
+        frequencygrid=FrequencyGrid(0.0, 5.0, 32),
+        operator_factory=operator_factory,
+        directions=["x"],
+        orders=[1],
+    )
+
+    polarization = xtp.polarization(1)
+    nkx, nky, nkz = cmd.kgrid.shape
+    nt = len(cmd.timegrid)
+    point_values = np.zeros((cmd.kgrid.total_points, nt), dtype=np.complex128)
+
+    for ik, (kx, ky, kz) in enumerate(cmd.kgrid.points()):
+        dipole = operator_factory.dipole("x", float(kx), float(ky), float(kz))
+        point_values[ik] = np.einsum(
+            "mn,tnm->t",
+            dipole,
+            rho_orders[1][ik],
+            optimize=True,
+        )
+
+    grid_values = point_values.reshape(nkx, nky, nkz, nt)
+    manual = np.trapezoid(
+        np.trapezoid(grid_values[:, :, 0, :], x=np.asarray(cmd.kgrid.ky_values, dtype=float), axis=1),
+        x=np.asarray(cmd.kgrid.kx_values, dtype=float),
+        axis=0,
+    )
+
+    np.testing.assert_allclose(polarization[:, 0], np.real(manual), atol=1.0e-9)
+    np.testing.assert_allclose(polarization[:, 1:], 0.0, atol=1.0e-12)
+
+
+def test_xtp_current_frequency_domain_matches_manual_fft_and_plot(tmp_path: Path) -> None:
+    cmd, operator_factory = build_cmd_stack(max_order=1)
+    rho_orders = cmd.compute_all_orders()
+    xtp = XTP(
+        hamiltonian=cmd.hamiltonian,
+        rho_orders=rho_orders,
+        kgrid=cmd.kgrid,
+        timegrid=cmd.timegrid,
+        frequencygrid=FrequencyGrid(0.0, 5.0, 32),
+        operator_factory=operator_factory,
+        directions=["x", "y"],
+        orders=[0, 1],
+    )
+
+    omega_axis, current_spectrum = xtp.total_current_frequency_domain()
+    current_time = xtp.total_current()
+    window = np.asarray(
+        cmd.timegrid.apply_window(np.ones(len(cmd.timegrid), dtype=float)),
+        dtype=float,
+    )
+    weighted = current_time * window[:, np.newaxis]
+    nfft = len(cmd.timegrid) * cmd.timegrid.padding_factor
+    manual_spectrum = cmd.timegrid.dt * np.fft.fft(weighted, n=nfft, axis=0)
+    manual_omega = np.asarray(cmd.timegrid.frequency_axis(), dtype=float)
+
+    np.testing.assert_allclose(omega_axis, manual_omega)
+    np.testing.assert_allclose(current_spectrum, manual_spectrum, atol=1.0e-10)
+    assert current_spectrum.shape == (nfft, 3)
+    assert np.max(np.abs(current_spectrum[:, 0])) > 0.0
+
+    harmonic_data = HarmonicData(
+        xtp,
+        electric_field_time=cmd.laser_system.electric_field(cmd.timegrid.generate()),
+    ).current_spectrum_data()
+    assert harmonic_data["orders"] == (0, 1)
+    assert harmonic_data["omega_axis"].shape == (nfft,)
+    assert harmonic_data["current_spectrum"].shape == (nfft, 3)
+    assert harmonic_data["current_magnitude"].shape == (nfft, 3)
+    assert harmonic_data["current_time"].shape == (len(cmd.timegrid), 3)
+    assert harmonic_data["electric_field_time"].shape == (len(cmd.timegrid), 3)
+
+    if "matplotlib" not in sys.modules and importlib.util.find_spec("matplotlib") is None:
+        return
+
+    current_time_output = HarmonicGraphics.plot_field_current_time_comparison(
+        np.asarray(cmd.timegrid.generate(), dtype=float),
+        np.asarray(harmonic_data["electric_field_time"], dtype=float),
+        current_time,
+        tmp_path / "field_current_time.png",
+        directions=("x", "y"),
+        include_total=True,
+    )
+    assert current_time_output.exists()
+    assert current_time_output.stat().st_size > 0
+
+    output_path = HarmonicGraphics.plot_current_magnitude_spectrum(
+        omega_axis,
+        current_spectrum,
+        tmp_path / "current_spectrum.png",
+        orders=tuple(harmonic_data["orders"]),
+        directions=("x", "y"),
+        positive_only=True,
+    )
+    assert output_path.exists()
+    assert output_path.stat().st_size > 0
