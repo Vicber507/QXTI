@@ -11,8 +11,8 @@ ComplexArray = NDArray[np.complex128]     # Permite usar matrices con componente
 
 from qxti.physics import Hamiltonian
 from qxti.physics import LaserSystem 
-from qxti.physics import KGrid
-from qxti.physics import TimeGrid
+from qxti.grids import KGrid
+from qxti.grids import TimeGrid
 from qxti.physics import OperatorFactory
 from qxti.physics import Solver
 
