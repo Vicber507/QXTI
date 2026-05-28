@@ -109,6 +109,7 @@ def test_surface_model_file_is_configured_consistently_with_custom_hamiltonian()
     assert module.BASIS_TYPE == hamiltonian.basis_type
     assert module.IS_PERIODIC is hamiltonian.is_periodic
     assert module.default_params() == params
+    assert module.DEFAULT_LATTICE == hamiltonian.lattice
     np.testing.assert_allclose(direct_matrix, loaded_matrix, atol=1.0e-12)
 
 
@@ -123,12 +124,15 @@ def test_custom_hamiltonian_loads_model_metadata_defaults_and_summary() -> None:
     assert hamiltonian.basis_type == "spin"
     assert "a0" in hamiltonian.params
     assert "B11" in hamiltonian.params
+    assert "lattice_constants" in hamiltonian.lattice
+    assert "real_space_vectors" in hamiltonian.lattice
     assert matrix.shape == (2, 2)
     assert np.iscomplexobj(matrix)
     assert hamiltonian.validate_hermiticity(0.08, -0.11, 0.0)
     assert summary["source_file"] == "bi2se3_surface.py"
     assert summary["function_name"] == "H"
     assert summary["basis_size"] == 2
+    assert np.isclose(summary["lattice"]["lattice_constants"]["a0"], hamiltonian.params["a0"])
     assert "resolved_source_file" in summary
 
 
@@ -148,6 +152,15 @@ def test_custom_hamiltonian_default_params_match_external_model_defaults() -> No
     assert set(defaults) == {"a0", "A0", "B0", "A11", "A12", "A14", "B11", "B14"}
 
 
+def test_custom_hamiltonian_default_lattice_matches_external_model_defaults() -> None:
+    hamiltonian = build_surface_model()
+    defaults = hamiltonian.default_lattice()
+
+    assert defaults == hamiltonian.lattice
+    assert set(defaults) == {"lattice_type", "lattice_constants", "real_space_vectors"}
+    assert np.isclose(defaults["lattice_constants"]["a0"], hamiltonian.params["a0"])
+
+
 def test_custom_hamiltonian_accepts_source_file_without_py_suffix() -> None:
     hamiltonian = CustomHamiltonian(source_file="bi2se3_surface")
 
@@ -163,6 +176,15 @@ def test_custom_hamiltonian_set_params_preserves_external_defaults() -> None:
     assert np.isclose(hamiltonian.params["A14"], 0.003)
     assert np.isclose(hamiltonian.params["A0"], -0.0011)
     assert "B11" in hamiltonian.params
+
+
+def test_custom_hamiltonian_set_lattice_preserves_external_defaults() -> None:
+    hamiltonian = build_surface_model()
+
+    hamiltonian.set_lattice({"notes": "surface cell"})
+
+    assert np.isclose(hamiltonian.lattice["lattice_constants"]["a0"], hamiltonian.params["a0"])
+    assert hamiltonian.lattice["notes"] == "surface cell"
 
 
 def test_custom_hamiltonian_exercises_all_surface_model_methods() -> None:
@@ -307,6 +329,10 @@ def test_custom_hamiltonian_supports_user_written_external_file(tmp_path: Path) 
         BASIS_TYPE = "site"
         IS_PERIODIC = False
         DEFAULT_PARAMS = {"delta": 0.5}
+        DEFAULT_LATTICE = {
+            "lattice_constants": {"a": 1.0, "b": 1.0, "c": 1.0},
+            "real_space_vectors": {"a1": [1.0, 0.0, 0.0]},
+        }
 
         def H(kx, ky, kz, params):
             delta = params["delta"]
@@ -324,6 +350,7 @@ def test_custom_hamiltonian_supports_user_written_external_file(tmp_path: Path) 
     assert hamiltonian.dimension == 3
     assert hamiltonian.basis_type == "site"
     assert hamiltonian.is_periodic is False
+    assert hamiltonian.lattice["lattice_constants"]["a"] == 1.0
     assert matrix.shape == (2, 2)
     assert np.iscomplexobj(matrix)
 
@@ -377,8 +404,10 @@ if __name__ == "__main__":
     test_custom_hamiltonian_loads_model_metadata_defaults_and_summary()
     test_custom_hamiltonian_load_from_file_returns_callable()
     test_custom_hamiltonian_default_params_match_external_model_defaults()
+    test_custom_hamiltonian_default_lattice_matches_external_model_defaults()
     test_custom_hamiltonian_accepts_source_file_without_py_suffix()
     test_custom_hamiltonian_set_params_preserves_external_defaults()
+    test_custom_hamiltonian_set_lattice_preserves_external_defaults()
     test_custom_hamiltonian_exercises_all_surface_model_methods()
     test_custom_hamiltonian_surface_model_is_independent_of_kz()
     test_custom_hamiltonian_detects_invalid_direction_from_base_class()

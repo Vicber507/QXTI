@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any, ClassVar, Iterable
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -22,8 +23,11 @@ class Hamiltonian(ABC):
     derived operators used by downstream response calculations.
     """
 
+    DEFAULT_LATTICE: ClassVar[dict[str, Any]] = {}
+
     model_name: str
     params: dict[str, Any] = field(default_factory=dict)
+    lattice: dict[str, Any] = field(default_factory=dict)
     basis_size: int = 1
     dimension: int = 3
     basis_type: str = "orbital"
@@ -47,13 +51,24 @@ class Hamiltonian(ABC):
             raise ValueError("dk_derivative must be strictly positive.")
 
         initial_params = dict(self.params)
+        initial_lattice = dict(self.lattice)
         self.params = {}
+        self.lattice = {}
         self.set_params(initial_params)
+        self.set_lattice(initial_lattice)
 
     def default_params(self) -> dict[str, Any]:
         """Return default model parameters for the concrete Hamiltonian."""
 
         return {}
+
+    def default_lattice(self) -> dict[str, Any]:
+        """Return default lattice information for the concrete Hamiltonian."""
+
+        lattice = getattr(type(self), "DEFAULT_LATTICE", {})
+        if not isinstance(lattice, dict):
+            raise TypeError("DEFAULT_LATTICE must be a dict.")
+        return deepcopy(lattice)
 
     def set_params(self, params: dict[str, Any]) -> None:
         """Update model parameters without discarding default values.
@@ -68,6 +83,14 @@ class Hamiltonian(ABC):
         updated.update(self.params)
         updated.update(dict(params))
         self.params = updated
+
+    def set_lattice(self, lattice: dict[str, Any]) -> None:
+        """Update lattice information without discarding default values."""
+
+        updated = dict(self.default_lattice())
+        updated.update(self.lattice)
+        updated.update(dict(lattice))
+        self.lattice = updated
 
     @abstractmethod
     def H(self, kx: float, ky: float, kz: float) -> np.ndarray:
@@ -319,6 +342,7 @@ class Hamiltonian(ABC):
         return {
             "model_name": self.model_name,
             "params": dict(self.params),
+            "lattice": deepcopy(self.lattice),
             "basis_size": self.basis_size,
             "dimension": self.dimension,
             "basis_type": self.basis_type,

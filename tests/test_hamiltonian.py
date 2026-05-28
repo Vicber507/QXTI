@@ -14,6 +14,11 @@ from qxti.physics import Hamiltonian
 
 
 class TwoBandHamiltonian(Hamiltonian):
+    DEFAULT_LATTICE = {
+        "lattice_constants": {"ax": 1.0, "ay": 1.0},
+        "real_space_vectors": {"a1": [1.0, 0.0], "a2": [0.0, 1.0]},
+    }
+
     def default_params(self) -> dict[str, float]:
         return {"mass": 1.0, "coupling": 2.0}
 
@@ -88,8 +93,10 @@ def test_hamiltonian_construction_and_summary() -> None:
     summary = hamiltonian.summary()
 
     assert hamiltonian.params == {"mass": 1.0, "coupling": 2.0}
+    assert hamiltonian.lattice["lattice_constants"] == {"ax": 1.0, "ay": 1.0}
     assert hamiltonian.H(0.0, 0.0, 0.0).shape == (2, 2)
     assert summary["model_name"] == "two-band"
+    assert summary["lattice"]["lattice_constants"] == {"ax": 1.0, "ay": 1.0}
     assert summary["basis_size"] == 2
     assert summary["dimension"] == 2
     assert summary["basis_type"] == "orbital"
@@ -112,6 +119,15 @@ def test_set_params_preserves_defaults() -> None:
     hamiltonian.set_params({"mass": 3.5})
 
     assert hamiltonian.params == {"mass": 3.5, "coupling": 2.0}
+
+
+def test_set_lattice_preserves_defaults() -> None:
+    hamiltonian = build_two_band_hamiltonian()
+
+    hamiltonian.set_lattice({"notes": "square test lattice"})
+
+    assert hamiltonian.lattice["lattice_constants"] == {"ax": 1.0, "ay": 1.0}
+    assert hamiltonian.lattice["notes"] == "square test lattice"
 
 
 def test_validate_matrix_accepts_complex_square_shape() -> None:
@@ -246,6 +262,7 @@ if __name__ == "__main__":
     test_hamiltonian_construction_and_summary()
     test_hamiltonian_constructor_validates_core_inputs()
     test_set_params_preserves_defaults()
+    test_set_lattice_preserves_defaults()
     test_validate_matrix_accepts_complex_square_shape()
     test_validate_matrix_rejects_non_square_or_wrong_shape()
     test_validate_hermiticity_and_require_hermitian()

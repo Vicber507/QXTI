@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 import importlib.util
 import inspect
@@ -27,6 +28,7 @@ class CustomHamiltonian(Hamiltonian):
 
     model_name: str = "custom-hamiltonian"
     params: dict[str, Any] = field(default_factory=dict)
+    lattice: dict[str, Any] = field(default_factory=dict)
     basis_size: int = 1
     dimension: int = 3
     basis_type: str = "custom"
@@ -97,6 +99,24 @@ class CustomHamiltonian(Hamiltonian):
         if not isinstance(params, dict):
             raise TypeError("DEFAULT_PARAMS in the external model must be a dict.")
         return dict(params)
+
+    def default_lattice(self) -> dict[str, Any]:
+        """Return default lattice information declared by the external model file."""
+
+        lattice = getattr(self._module, "DEFAULT_LATTICE", None)
+        if lattice is not None:
+            if not isinstance(lattice, dict):
+                raise TypeError("DEFAULT_LATTICE in the external model must be a dict.")
+            return deepcopy(lattice)
+
+        provider = getattr(self._module, "default_lattice", None)
+        if callable(provider):
+            lattice = provider()
+            if not isinstance(lattice, dict):
+                raise TypeError("default_lattice() in the external model must return a dict.")
+            return deepcopy(lattice)
+
+        return {}
 
     def H(self, kx: float, ky: float, kz: float) -> np.ndarray:
         """Evaluate the external function and return a validated complex matrix."""
