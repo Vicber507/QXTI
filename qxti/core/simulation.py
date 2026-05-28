@@ -8,10 +8,10 @@ import numpy as np
 from numpy.typing import NDArray
 
 from qxti.core.config import QXTIConfig
-from qxti.data import HamiltonianData, ResponseData, save_dataset_npz
-from qxti.grids import KGrid, TimeGrid
+from qxti.data import HarmonicData, HamiltonianData, ResponseData, save_dataset_npz
+from qxti.grids import FrequencyGrid, KGrid, TimeGrid
 from qxti.physics import CustomHamiltonian, Hamiltonian, Laser, LaserSystem, OperatorFactory
-from qxti.response import CMD
+from qxti.response import CMD, XTP
 from qxti.solvers import AdamsBashforth2Solver, RKF45Solver, Solver
 
 
@@ -111,18 +111,25 @@ class QXTISimulation:
 
     def build_laser_system(self) -> LaserSystem:
         lcfg = self.config.laser
-        laser = Laser(
-            omega=lcfg.omega,
-            E0=lcfg.E0,
-            phase=lcfg.phase,
-            ellipticity=lcfg.ellipticity,
-            fwhm=lcfg.fwhm,
-            envelope=lcfg.envelope,
-            t0=lcfg.t0,
-            theta=lcfg.theta,
-            phi=lcfg.phi,
-        )
-        return LaserSystem([laser])
+        if lcfg.pulses:
+            lasers = [self._build_laser_from_mapping(spec) for spec in lcfg.pulses]
+        else:
+            lasers = [
+                Laser(
+                    omega=lcfg.omega,
+                    E0=lcfg.E0,
+                    cep=lcfg.cep,
+                    ellip=lcfg.ellip,
+                    ncycles=lcfg.ncycles,
+                    envname=lcfg.envname,
+                    t0=lcfg.t0,
+                    phix=lcfg.phix,
+                    thetaz=lcfg.thetaz,
+                    phiz=lcfg.phiz,
+                    ncycles_clipped=lcfg.ncycles_clipped,
+                )
+            ]
+        return LaserSystem(lasers, blaser=lcfg.blaser, alaser=lcfg.alaser)
 
     def build_cmd(self, hamiltonian: Hamiltonian) -> CMD:
         ccfg = self.config.cmd
@@ -309,6 +316,7 @@ class QXTISimulation:
                 )
 
         outputs.update(self.generate_cmd_datasets(cmd, rho_orders))
+        outputs.update(self.generate_xtp_datasets(cmd, rho_orders))
         return outputs
 
     def generate_cmd_datasets(
@@ -362,16 +370,58 @@ class QXTISimulation:
 
         return outputs
 
+    def generate_xtp_datasets(
+        self,
+        cmd: CMD,
+        rho_orders: dict[int, ComplexArray],
+    ) -> dict[str, Path]:
+        self._emit_progress("XTP data products enabled: generating reusable current-spectrum dataset.")
+        omega_axis = np.asarray(cmd.timegrid.frequency_axis(), dtype=float)
+        omega_max = float(np.max(np.abs(omega_axis))) if omega_axis.size else 1.0
+        frequencygrid = FrequencyGrid(
+            0.0,
+            omega_max if omega_max > 0.0 else 1.0,
+            len(omega_axis) if omega_axis.size else 1,
+        )
+
+        xtp = XTP(
+            hamiltonian=cmd.hamiltonian,
+            rho_orders=rho_orders,
+            kgrid=cmd.kgrid,
+            timegrid=cmd.timegrid,
+            frequencygrid=frequencygrid,
+            operator_factory=cmd.operator_factory,
+            directions=self._active_directions(cmd.hamiltonian.dimension),
+            orders=sorted(rho_orders),
+        )
+        electric_field_time = np.asarray(
+            cmd.laser_system.electric_field(cmd.timegrid.generate()),
+            dtype=float,
+        )
+        data_builder = HarmonicData(xtp, electric_field_time=electric_field_time)
+        output_dir = Path(self.config.cmd.output_dir) / "data"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        current_spectrum_path = save_dataset_npz(
+            output_dir / "current_spectrum.npz",
+            data_builder.current_spectrum_data(),
+        )
+        self._emit_progress(
+            f"XTP current-spectrum data saved as '{current_spectrum_path.name}'."
+        )
+        return {"xtp_current_spectrum_data": current_spectrum_path}
+
     def _build_solver(self, timegrid: TimeGrid) -> Solver:
         cmd_cfg = self.config.cmd
         solver_name = cmd_cfg.solver.strip().lower()
 
         if solver_name in {"rkf45", "rkf", "fehlberg", "runge_kutta_fehlberg"}:
+            window_duration = max(float(timegrid.t_max - timegrid.t_min), float(timegrid.dt))
             return RKF45Solver(
                 tolerance=cmd_cfg.solver_tolerance,
                 max_iterations=cmd_cfg.solver_max_iterations,
                 h_min=cmd_cfg.solver_h_min,
-                h_max=timegrid.dt if cmd_cfg.solver_h_max is None else cmd_cfg.solver_h_max,
+                h_max=window_duration if cmd_cfg.solver_h_max is None else cmd_cfg.solver_h_max,
                 enforce_hermiticity=True,
                 enforce_trace=False,
             )
@@ -383,6 +433,21 @@ class QXTISimulation:
                 enforce_trace=False,
             )
         raise ValueError(f"Unsupported CMD solver '{cmd_cfg.solver}'.")
+
+    @staticmethod
+    def _build_laser_from_mapping(spec: dict[str, Any]) -> Laser:
+        payload = dict(spec)
+        if "w0" in payload and "omega" not in payload:
+            payload["omega"] = payload.pop("w0")
+        if "phase" in payload and "cep" not in payload:
+            payload["cep"] = payload.pop("phase")
+        if "ellipticity" in payload and "ellip" not in payload:
+            payload["ellip"] = payload.pop("ellipticity")
+        if "num_cycles" in payload and "ncycles" not in payload:
+            payload["ncycles"] = payload.pop("num_cycles")
+        if "envelope" in payload and "envname" not in payload:
+            payload["envname"] = payload.pop("envelope")
+        return Laser(**payload)
 
     @staticmethod
     def _normalize_plot_name(plot_name: str) -> str:
@@ -405,6 +470,14 @@ class QXTISimulation:
             "modulo_de_velocidad": "velocity_magnitude",
         }
         return aliases.get(key, key)
+
+    @staticmethod
+    def _active_directions(dimension: int) -> list[str]:
+        if dimension == 1:
+            return ["x"]
+        if dimension == 2:
+            return ["x", "y"]
+        return ["x", "y", "z"]
 
     @staticmethod
     def _emit_progress(message: str) -> None:

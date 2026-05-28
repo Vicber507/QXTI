@@ -9,7 +9,7 @@ from qxti.grids import KGrid, TimeGrid
 from qxti.physics import Hamiltonian, LaserSystem, OperatorFactory
 from qxti.solvers import Solver
 
-from .distributions import T1T2Relaxation, bose_einstein, fermi_dirac, maxwell_boltzmann
+from .distributions import bose_einstein, fermi_dirac, maxwell_boltzmann
 
 
 ComplexArray = NDArray[np.complex128]
@@ -79,10 +79,8 @@ class CMD:
         if self.operator_factory.hamiltonian is not self.hamiltonian:
             raise ValueError("operator_factory must be built from the same Hamiltonian instance.")
 
-        self.relaxation_model = T1T2Relaxation.from_rates(
-            self.gamma_population,
-            self.gamma_coherence,
-        )
+        self._diag_indices = np.diag_indices(self.hamiltonian.basis_size)
+        self._offdiag_mask = ~np.eye(self.hamiltonian.basis_size, dtype=bool)
         self._time_domain_cache: dict[int, ComplexArray] | None = None
         self._frequency_domain_cache: dict[int, ComplexArray] | None = None
 
@@ -317,10 +315,7 @@ class CMD:
         derivative = -1.0j * omega_matrix * rho
 
         if self.include_dephasing:
-            derivative = derivative + self.relaxation_model.term(
-                rho,
-                np.zeros_like(rho, dtype=np.complex128),
-            )
+            derivative = derivative + self._dephasing_term(rho)
 
         field = self._field_vector(self.laser_system.electric_field(t))
         source_components = self._interpolate_complex_tensor(
@@ -432,6 +427,14 @@ class CMD:
         if source_states.shape[0] != source_times.shape[0]:
             raise ValueError("The solver returned inconsistent time/state lengths.")
 
+        time_tolerance = max(1.0e-12, 1.0e-10 * np.max(np.abs(target_times)))
+        if source_times[0] > target_times[0] + time_tolerance or source_times[-1] < target_times[-1] - time_tolerance:
+            raise RuntimeError(
+                "The solver trajectory does not cover the requested target-time window. "
+                f"Available range: [{source_times[0]:.16e}, {source_times[-1]:.16e}], "
+                f"requested range: [{target_times[0]:.16e}, {target_times[-1]:.16e}]."
+            )
+
         if source_states.shape[0] == target_times.shape[0] and np.allclose(source_times, target_times):
             return np.asarray(source_states, dtype=np.complex128)
 
@@ -461,13 +464,46 @@ class CMD:
         if values.shape[0] == 1:
             return np.asarray(values[0], dtype=np.complex128)
 
-        flat = values.reshape(values.shape[0], -1)
-        interpolated = np.empty(flat.shape[1], dtype=np.complex128)
-        for index in range(flat.shape[1]):
-            real_part = np.interp(t, times, np.real(flat[:, index]))
-            imag_part = np.interp(t, times, np.imag(flat[:, index]))
-            interpolated[index] = real_part + 1.0j * imag_part
-        return interpolated.reshape(values.shape[1:])
+        return np.asarray(
+            CMD._linear_interpolate_series(t, times, values),
+            dtype=np.complex128,
+        )
+
+    def _dephasing_term(self, rho: ComplexArray) -> ComplexArray:
+        derivative = np.zeros_like(rho, dtype=np.complex128)
+        if self.gamma_population > 0.0:
+            derivative[self._diag_indices] = -self.gamma_population * rho[self._diag_indices]
+        if self.gamma_coherence > 0.0:
+            derivative[self._offdiag_mask] = -self.gamma_coherence * rho[self._offdiag_mask]
+        return derivative
+
+    @staticmethod
+    def _linear_interpolate_series(
+        t: float,
+        source_times: FloatArray,
+        series: ComplexArray,
+    ) -> ComplexArray:
+        times = np.asarray(source_times, dtype=float)
+        values = np.asarray(series, dtype=np.complex128)
+        if values.shape[0] != times.shape[0]:
+            raise ValueError("series must have the same leading length as source_times.")
+        if values.shape[0] == 1 or t <= times[0]:
+            return np.asarray(values[0], dtype=np.complex128)
+        if t >= times[-1]:
+            return np.asarray(values[-1], dtype=np.complex128)
+
+        upper = int(np.searchsorted(times, t, side="right"))
+        lower = upper - 1
+        t_lower = float(times[lower])
+        t_upper = float(times[upper])
+        if t_upper <= t_lower:
+            return np.asarray(values[lower], dtype=np.complex128)
+
+        weight = (t - t_lower) / (t_upper - t_lower)
+        return np.asarray(
+            (1.0 - weight) * values[lower] + weight * values[upper],
+            dtype=np.complex128,
+        )
 
     @staticmethod
     def _normalize_basis(basis: str) -> str:
