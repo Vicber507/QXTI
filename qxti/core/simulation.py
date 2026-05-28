@@ -316,25 +316,14 @@ class QXTISimulation:
         cmd: CMD,
         rho_orders: dict[int, ComplexArray],
     ) -> dict[str, Path]:
-        self._emit_progress("CMD data products enabled: generating reusable population datasets.")
+        self._emit_progress("CMD data products enabled: generating reusable kx-ky datasets.")
         data_builder = ResponseData(cmd)
         output_dir = Path(self.config.cmd.output_dir) / "data"
         output_dir.mkdir(parents=True, exist_ok=True)
 
         all_orders = tuple(sorted(rho_orders))
-        heatmap_data = data_builder.population_heatmap_data(
-            orders=all_orders,
-            k_aggregation="mean",
-            rho_orders=rho_orders,
-        )
 
         outputs: dict[str, Path] = {}
-        heatmap_path = save_dataset_npz(
-            output_dir / "population_time_heatmap_all_orders.npz",
-            heatmap_data,
-        )
-        outputs["rho_population_heatmap_data"] = heatmap_path
-        self._emit_progress(f"CMD population heatmap data saved as '{heatmap_path.name}'.")
 
         try:
             kmap_data = data_builder.population_kxky_animation_data(
@@ -351,6 +340,24 @@ class QXTISimulation:
             outputs["rho_population_kxky_data"] = animation_data_path
             self._emit_progress(
                 f"CMD kx-ky population data saved as '{animation_data_path.name}'."
+            )
+
+        try:
+            coherence_kmap_data = data_builder.coherence_kxky_animation_data(
+                orders=all_orders,
+                component="magnitude",
+                rho_orders=rho_orders,
+            )
+        except ValueError as exc:
+            self._emit_progress(f"CMD kx-ky coherence data skipped: {exc}")
+        else:
+            coherence_animation_data_path = save_dataset_npz(
+                output_dir / "coherence_kx_ky_per_pair.npz",
+                coherence_kmap_data,
+            )
+            outputs["rho_coherence_kxky_data"] = coherence_animation_data_path
+            self._emit_progress(
+                f"CMD kx-ky coherence data saved as '{coherence_animation_data_path.name}'."
             )
 
         return outputs

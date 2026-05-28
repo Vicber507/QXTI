@@ -207,8 +207,8 @@ def test_simulation_generates_requested_outputs(tmp_path: Path) -> None:
         "rho_order_0_dat",
         "rho_order_1",
         "rho_order_1_dat",
-        "rho_population_heatmap_data",
         "rho_population_kxky_data",
+        "rho_coherence_kxky_data",
     }
     for path in outputs.values():
         assert path.exists()
@@ -234,7 +234,34 @@ def test_graphics_runners_generate_outputs_from_config(tmp_path: Path) -> None:
 
     assert "band_structure_2d" in hamiltonian_outputs
     assert "velocity_magnitude" in hamiltonian_outputs
-    assert "rho_population_heatmap" in response_outputs
+    assert "rho_population_snapshots" in response_outputs
+    assert "rho_coherence_snapshots" in response_outputs
     for path in (*hamiltonian_outputs.values(), *response_outputs.values()):
+        assert path.exists()
+        assert path.stat().st_size > 0
+
+
+def test_response_graphics_runner_falls_back_to_saved_dat_files(tmp_path: Path) -> None:
+    if importlib.util.find_spec("matplotlib") is None:
+        pytest.skip("matplotlib is not available in this environment.")
+
+    from qxti.graphics.graphics import plot_response_graphics_from_saved_data
+
+    model_path = write_model_file(tmp_path)
+    config_path = write_config_file(tmp_path, model_path)
+    simulation = QXTISimulation.from_file(config_path)
+    simulation.run()
+
+    data_dir = tmp_path / "cmd" / "data"
+    for path in data_dir.glob("*.npz"):
+        path.unlink()
+    for path in (tmp_path / "cmd").glob("rho_order_*.npy"):
+        path.unlink()
+
+    response_outputs = plot_response_graphics_from_saved_data(config_path)
+
+    assert "rho_population_snapshots" in response_outputs
+    assert "rho_coherence_snapshots" in response_outputs
+    for path in response_outputs.values():
         assert path.exists()
         assert path.stat().st_size > 0

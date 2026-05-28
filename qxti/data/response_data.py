@@ -78,6 +78,71 @@ class ResponseData:
             "population_frames": frames,
         }
 
+    def coherence_heatmap_data(
+        self,
+        *,
+        orders: tuple[int, ...] | list[int] | None = None,
+        k_aggregation: str = "mean",
+        component: str = "magnitude",
+        rho_orders: dict[int, ComplexArray] | None = None,
+    ) -> dict[str, Any]:
+        time_domain = self.cmd.solve_time_domain() if rho_orders is None else rho_orders
+        resolved_orders = self._resolve_orders(orders, time_domain)
+        total_rho = self._sum_orders(time_domain, resolved_orders)
+        coherence_values, pair_indices, pair_labels = self._coherence_series(total_rho, component=component)
+        aggregation_mode, aggregation_label = self._normalize_k_aggregation(k_aggregation)
+        aggregated = self._aggregate_populations(coherence_values, aggregation_mode)
+
+        return {
+            "orders": resolved_orders,
+            "time_axis": np.asarray(self.cmd.timegrid.generate(), dtype=float),
+            "pair_indices": np.asarray(pair_indices, dtype=int),
+            "pair_labels": list(pair_labels),
+            "coherence_map": aggregated.T,
+            "coherence_traces": aggregated,
+            "coherence_frames": np.transpose(coherence_values, (1, 2, 0)),
+            "k_points": np.asarray(self.cmd.kgrid.points(), dtype=float),
+            "k_point_indices": np.arange(coherence_values.shape[0], dtype=int),
+            "k_aggregation": aggregation_mode,
+            "aggregation_label": aggregation_label,
+            "component": component,
+        }
+
+    def coherence_kxky_animation_data(
+        self,
+        *,
+        orders: tuple[int, ...] | list[int] | None = None,
+        component: str = "magnitude",
+        rho_orders: dict[int, ComplexArray] | None = None,
+    ) -> dict[str, Any]:
+        time_domain = self.cmd.solve_time_domain() if rho_orders is None else rho_orders
+        resolved_orders = self._resolve_orders(orders, time_domain)
+        total_rho = self._sum_orders(time_domain, resolved_orders)
+        coherence_values, pair_indices, pair_labels = self._coherence_series(total_rho, component=component)
+
+        if self.cmd.kgrid.dimension < 2:
+            raise ValueError("A kx-ky coherence animation requires a 2D or 3D k-grid.")
+        if len(self.cmd.kgrid.kz_values) != 1:
+            raise ValueError(
+                "A kx-ky coherence animation currently requires a single kz slice."
+            )
+
+        nkx, nky, nkz = self.cmd.kgrid.shape
+        _, nt, npairs = coherence_values.shape
+        coherence_grid = coherence_values.reshape(nkx, nky, nkz, nt, npairs)
+        frames = np.transpose(coherence_grid[:, :, 0, :, :], (2, 3, 1, 0))
+
+        return {
+            "orders": resolved_orders,
+            "time_axis": np.asarray(self.cmd.timegrid.generate(), dtype=float),
+            "pair_indices": np.asarray(pair_indices, dtype=int),
+            "pair_labels": list(pair_labels),
+            "kx_values": np.asarray(self.cmd.kgrid.kx_values, dtype=float),
+            "ky_values": np.asarray(self.cmd.kgrid.ky_values, dtype=float),
+            "coherence_frames": frames,
+            "component": component,
+        }
+
     @staticmethod
     def _resolve_orders(
         requested: tuple[int, ...] | list[int] | None,
@@ -134,3 +199,172 @@ class ResponseData:
         if aggregation_mode == "first":
             return populations[0]
         raise ValueError(f"Unsupported aggregation mode '{aggregation_mode}'.")
+
+    @classmethod
+    def population_heatmap_data_from_saved_rho(
+        cls,
+        rho_orders: dict[int, ComplexArray],
+        *,
+        time_axis: FloatArray,
+        k_points: FloatArray,
+        orders: tuple[int, ...] | list[int] | None = None,
+        k_aggregation: str = "mean",
+    ) -> dict[str, Any]:
+        resolved_orders = cls._resolve_orders(orders, rho_orders)
+        total_rho = cls._sum_orders(rho_orders, resolved_orders)
+        populations = np.real(np.diagonal(total_rho, axis1=2, axis2=3))
+        aggregation_mode, aggregation_label = cls._normalize_k_aggregation(k_aggregation)
+        aggregated = cls._aggregate_populations(populations, aggregation_mode)
+        return {
+            "orders": resolved_orders,
+            "time_axis": np.asarray(time_axis, dtype=float),
+            "band_indices": np.arange(populations.shape[2], dtype=int),
+            "population_map": aggregated.T,
+            "population_traces": aggregated,
+            "population_frames": np.transpose(populations, (1, 2, 0)),
+            "k_points": np.asarray(k_points, dtype=float),
+            "k_point_indices": np.arange(populations.shape[0], dtype=int),
+            "k_aggregation": aggregation_mode,
+            "aggregation_label": aggregation_label,
+        }
+
+    @classmethod
+    def population_kxky_animation_data_from_saved_rho(
+        cls,
+        rho_orders: dict[int, ComplexArray],
+        *,
+        time_axis: FloatArray,
+        kx_values: FloatArray,
+        ky_values: FloatArray,
+        kz_values: FloatArray,
+        orders: tuple[int, ...] | list[int] | None = None,
+    ) -> dict[str, Any]:
+        resolved_orders = cls._resolve_orders(orders, rho_orders)
+        total_rho = cls._sum_orders(rho_orders, resolved_orders)
+        populations = np.real(np.diagonal(total_rho, axis1=2, axis2=3))
+
+        if len(ky_values) < 2:
+            raise ValueError("A kx-ky population animation requires at least two ky points.")
+        if len(kz_values) != 1:
+            raise ValueError("A kx-ky population animation currently requires a single kz slice.")
+
+        nkx = len(kx_values)
+        nky = len(ky_values)
+        nkz = len(kz_values)
+        _, nt, nb = populations.shape
+        population_grid = populations.reshape(nkx, nky, nkz, nt, nb)
+        frames = np.transpose(population_grid[:, :, 0, :, :], (2, 3, 1, 0))
+
+        return {
+            "orders": resolved_orders,
+            "time_axis": np.asarray(time_axis, dtype=float),
+            "band_indices": np.arange(nb, dtype=int),
+            "kx_values": np.asarray(kx_values, dtype=float),
+            "ky_values": np.asarray(ky_values, dtype=float),
+            "population_frames": frames,
+        }
+
+    @classmethod
+    def coherence_heatmap_data_from_saved_rho(
+        cls,
+        rho_orders: dict[int, ComplexArray],
+        *,
+        time_axis: FloatArray,
+        k_points: FloatArray,
+        orders: tuple[int, ...] | list[int] | None = None,
+        k_aggregation: str = "mean",
+        component: str = "magnitude",
+    ) -> dict[str, Any]:
+        resolved_orders = cls._resolve_orders(orders, rho_orders)
+        total_rho = cls._sum_orders(rho_orders, resolved_orders)
+        coherence_values, pair_indices, pair_labels = cls._coherence_series(total_rho, component=component)
+        aggregation_mode, aggregation_label = cls._normalize_k_aggregation(k_aggregation)
+        aggregated = cls._aggregate_populations(coherence_values, aggregation_mode)
+        return {
+            "orders": resolved_orders,
+            "time_axis": np.asarray(time_axis, dtype=float),
+            "pair_indices": np.asarray(pair_indices, dtype=int),
+            "pair_labels": list(pair_labels),
+            "coherence_map": aggregated.T,
+            "coherence_traces": aggregated,
+            "coherence_frames": np.transpose(coherence_values, (1, 2, 0)),
+            "k_points": np.asarray(k_points, dtype=float),
+            "k_point_indices": np.arange(coherence_values.shape[0], dtype=int),
+            "k_aggregation": aggregation_mode,
+            "aggregation_label": aggregation_label,
+            "component": component,
+        }
+
+    @classmethod
+    def coherence_kxky_animation_data_from_saved_rho(
+        cls,
+        rho_orders: dict[int, ComplexArray],
+        *,
+        time_axis: FloatArray,
+        kx_values: FloatArray,
+        ky_values: FloatArray,
+        kz_values: FloatArray,
+        orders: tuple[int, ...] | list[int] | None = None,
+        component: str = "magnitude",
+    ) -> dict[str, Any]:
+        resolved_orders = cls._resolve_orders(orders, rho_orders)
+        total_rho = cls._sum_orders(rho_orders, resolved_orders)
+        coherence_values, pair_indices, pair_labels = cls._coherence_series(total_rho, component=component)
+
+        if len(ky_values) < 2:
+            raise ValueError("A kx-ky coherence animation requires at least two ky points.")
+        if len(kz_values) != 1:
+            raise ValueError("A kx-ky coherence animation currently requires a single kz slice.")
+
+        nkx = len(kx_values)
+        nky = len(ky_values)
+        nkz = len(kz_values)
+        _, nt, npairs = coherence_values.shape
+        coherence_grid = coherence_values.reshape(nkx, nky, nkz, nt, npairs)
+        frames = np.transpose(coherence_grid[:, :, 0, :, :], (2, 3, 1, 0))
+
+        return {
+            "orders": resolved_orders,
+            "time_axis": np.asarray(time_axis, dtype=float),
+            "pair_indices": np.asarray(pair_indices, dtype=int),
+            "pair_labels": list(pair_labels),
+            "kx_values": np.asarray(kx_values, dtype=float),
+            "ky_values": np.asarray(ky_values, dtype=float),
+            "coherence_frames": frames,
+            "component": component,
+        }
+
+    @staticmethod
+    def _coherence_pairs(num_bands: int) -> list[tuple[int, int]]:
+        return [(row, col) for row in range(num_bands) for col in range(row + 1, num_bands)]
+
+    @classmethod
+    def _coherence_series(
+        cls,
+        rho_tensor: ComplexArray,
+        *,
+        component: str,
+    ) -> tuple[FloatArray, list[tuple[int, int]], list[str]]:
+        num_bands = rho_tensor.shape[2]
+        pair_indices = cls._coherence_pairs(num_bands)
+        if not pair_indices:
+            raise ValueError("At least two bands are required to build coherence plots.")
+
+        extracted = []
+        pair_labels: list[str] = []
+        for row, col in pair_indices:
+            pair_labels.append(f"{row}-{col}")
+            extracted.append(cls._coherence_component(rho_tensor[:, :, row, col], component=component))
+        coherence_values = np.stack(extracted, axis=2)
+        return coherence_values, pair_indices, pair_labels
+
+    @staticmethod
+    def _coherence_component(values: ComplexArray, *, component: str) -> FloatArray:
+        key = component.strip().lower()
+        if key == "magnitude":
+            return np.abs(values)
+        if key == "real":
+            return np.real(values)
+        if key == "imag":
+            return np.imag(values)
+        raise ValueError("component must be one of: magnitude, real, imag.")
