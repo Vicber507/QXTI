@@ -38,6 +38,24 @@ class TimeGrid:
             / (self.Nt - 1)
         )
 
+    @property
+    def t0(self) -> float:
+        """Backward-compatible alias for the initial time."""
+
+        return self.t_min
+
+    @property
+    def tf(self) -> float:
+        """Backward-compatible alias for the final time."""
+
+        return self.t_max
+
+    @property
+    def initial_h(self) -> float:
+        """Backward-compatible alias for the nominal time step."""
+
+        return self.dt
+
     # =====================================================
     # Generate Time Axis
     # =====================================================
@@ -63,6 +81,9 @@ class TimeGrid:
         """
 
         return self.dt
+
+    def __len__(self) -> int:
+        return self.Nt
 
     # =====================================================
     # Window Function

@@ -46,6 +46,16 @@ class LaserSystem:
 
         return self._sum_vectors("vector_potential", t)
 
+    def get_electric_field(self, t: ArrayLike) -> FloatArray:
+        """Backward-compatible alias for :meth:`electric_field`."""
+
+        return self.electric_field(t)
+
+    def get_vector_potential(self, t: ArrayLike) -> FloatArray:
+        """Backward-compatible alias for :meth:`vector_potential`."""
+
+        return self.vector_potential(t)
+
     def total_intensity(self) -> float:
         """Return the sum of the individual pulse intensities."""
 
