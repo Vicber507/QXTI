@@ -281,6 +281,19 @@ class Hamiltonian(ABC):
         vectors = self.eigenvectors(kx, ky, kz)
         return vectors.conj().T @ validated_operator @ vectors
 
+    def transform_from_band_basis(
+        self,
+        operator: ArrayLike,
+        kx: float,
+        ky: float,
+        kz: float,
+    ) -> ComplexArray:
+        """Transform one operator from the band basis back to the working basis."""
+
+        validated_operator = self.validate_matrix(operator)
+        vectors = self.eigenvectors(kx, ky, kz)
+        return vectors @ validated_operator @ vectors.conj().T
+
     def gap(
         self,
         kx: float,

@@ -106,6 +106,11 @@ class KGrid:
         )
         return np.asarray(stacked, dtype=np.float64)
 
+    def get_all_points(self) -> FloatArray:
+        """Backward-compatible alias for :meth:`points`."""
+
+        return self.points()
+
     def summary(self) -> dict[str, Any]:
         return {
             "dimension": self.dimension,
