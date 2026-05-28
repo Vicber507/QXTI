@@ -119,8 +119,8 @@ def write_config_file(tmp_path: Path, model_path: Path) -> Path:
             enabled = true
             output_dir = {tmp_path / "cmd"}
             max_order = 1
-            gamma_population = 0.02
-            gamma_coherence = 0.05
+            population_time = 50.0
+            coherence_time = 20.0
             temperature = 0.02
             fermi_level = 0.0
             distribution = fermi_dirac
@@ -139,6 +139,11 @@ def write_config_file(tmp_path: Path, model_path: Path) -> Path:
             orders = [0, 1]
             k_aggregation = mean
             save_animation = false
+
+            [xtp]
+            bz_mask_enabled = true
+            bz_mask_radius_percent = 80.0
+            bz_mask_sigma = 0.75
             """
         )
     )
@@ -178,9 +183,14 @@ def test_qxti_config_parses_hamiltonian_and_plot_sections(tmp_path: Path) -> Non
     assert config.cmd.max_order == 1
     assert config.cmd.solver == "rkf45"
     assert config.cmd.distribution == "fermi_dirac"
+    assert np.isclose(config.cmd.population_time, 50.0)
+    assert np.isclose(config.cmd.coherence_time, 20.0)
     assert config.cmd_plots.enabled is True
     assert config.cmd_plots.orders == (0, 1)
     assert config.cmd_plots.k_aggregation == "mean"
+    assert config.xtp.bz_mask_enabled is True
+    assert np.isclose(config.xtp.bz_mask_radius_percent, 80.0)
+    assert np.isclose(config.xtp.bz_mask_sigma, 0.75)
 
 
 def test_simulation_builds_custom_hamiltonian_from_config(tmp_path: Path) -> None:
@@ -230,9 +240,7 @@ def test_simulation_generates_requested_outputs(tmp_path: Path) -> None:
         "velocity_2d_data",
         "velocity_magnitude_data",
         "rho_order_0",
-        "rho_order_0_dat",
         "rho_order_1",
-        "rho_order_1_dat",
         "rho_population_kxky_data",
         "rho_coherence_kxky_data",
         "xtp_current_spectrum_data",
@@ -242,6 +250,9 @@ def test_simulation_generates_requested_outputs(tmp_path: Path) -> None:
         assert path.stat().st_size > 0
     harmonic_dataset = load_dataset_npz(outputs["xtp_current_spectrum_data"])
     assert np.asarray(harmonic_dataset["electric_field_time"], dtype=float).shape[1] == 3
+    assert harmonic_dataset["bz_mask"]["enabled"] is True
+    assert np.isclose(float(harmonic_dataset["bz_mask"]["radius_percent"]), 80.0)
+    assert np.isclose(float(harmonic_dataset["bz_mask"]["sigma"]), 0.75)
 
 
 def test_graphics_runners_generate_outputs_from_config(tmp_path: Path) -> None:
@@ -269,32 +280,7 @@ def test_graphics_runners_generate_outputs_from_config(tmp_path: Path) -> None:
     assert "rho_coherence_snapshots" in response_outputs
     assert "field_current_time" in harmonic_outputs
     assert "current_spectrum" in harmonic_outputs
+    assert "current_circular_spectrum" in harmonic_outputs
     for path in (*hamiltonian_outputs.values(), *response_outputs.values(), *harmonic_outputs.values()):
-        assert path.exists()
-        assert path.stat().st_size > 0
-
-
-def test_response_graphics_runner_falls_back_to_saved_dat_files(tmp_path: Path) -> None:
-    if importlib.util.find_spec("matplotlib") is None:
-        pytest.skip("matplotlib is not available in this environment.")
-
-    from qxti.graphics.graphics import plot_response_graphics_from_saved_data
-
-    model_path = write_model_file(tmp_path)
-    config_path = write_config_file(tmp_path, model_path)
-    simulation = QXTISimulation.from_file(config_path)
-    simulation.run()
-
-    data_dir = tmp_path / "cmd" / "data"
-    for path in data_dir.glob("*.npz"):
-        path.unlink()
-    for path in (tmp_path / "cmd").glob("rho_order_*.npy"):
-        path.unlink()
-
-    response_outputs = plot_response_graphics_from_saved_data(config_path)
-
-    assert "rho_population_snapshots" in response_outputs
-    assert "rho_coherence_snapshots" in response_outputs
-    for path in response_outputs.values():
         assert path.exists()
         assert path.stat().st_size > 0

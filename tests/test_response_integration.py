@@ -14,7 +14,7 @@ from qxti.grids import FrequencyGrid, KGrid, TimeGrid
 from qxti.data import HarmonicData, ResponseData
 from qxti.graphics import HarmonicGraphics, ResponseGraphics
 from qxti.physics import Hamiltonian, Laser, LaserSystem, OperatorFactory
-from qxti.response import CMD, T1T2Relaxation, XTP, bose_einstein, fermi_dirac, maxwell_boltzmann, t1_t2_relaxation
+from qxti.response import CMD, T1T2Relaxation, XTP, bose_einstein, fermi_dirac, full_occupation, maxwell_boltzmann, t1_t2_relaxation, valence_occupation
 from qxti.solvers import RKF45Solver
 
 
@@ -98,8 +98,8 @@ def build_cmd_stack(
         operator_factory=operator_factory,
         solver=solver,
         max_order=max_order,
-        gamma_population=0.02,
-        gamma_coherence=0.05,
+        population_time=50.0,
+        coherence_time=20.0,
         temperature=0.02,
         fermi_level=0.0,
         distribution=distribution,
@@ -134,6 +134,7 @@ def test_distributions_and_operator_factory_behave_consistently() -> None:
     occupations = np.asarray(fermi_dirac(np.array([-1.0, 1.0]), 0.0, 0.1), dtype=float)
     mb = np.asarray(maxwell_boltzmann(np.array([0.0, 1.0]), 0.0, 0.2), dtype=float)
     be = np.asarray(bose_einstein(np.array([1.0, 2.0]), 0.0, 0.2), dtype=float)
+    valence = np.asarray(valence_occupation(np.array([-5.0, -1.0, 0.0, 7.0]), 0.0, 0.2), dtype=float)
     velocity = factory.velocity("x", 0.05, 0.0, 0.0)
     current = factory.current("x", 0.05, 0.0, 0.0)
     dipole = factory.dipole("x", 0.05, 0.0, 0.0)
@@ -144,6 +145,7 @@ def test_distributions_and_operator_factory_behave_consistently() -> None:
     assert occupations[0] > occupations[1]
     assert np.all(mb >= 0.0)
     assert np.all(be >= 0.0)
+    np.testing.assert_allclose(valence, np.array([1.0, 1.0, 0.0, 0.0]))
     assert velocity.shape == (2, 2)
     assert np.allclose(current, -velocity)
     assert dipole.shape == (2, 2)
@@ -179,12 +181,47 @@ def test_t1_t2_relaxation_model_matches_cmd_convention() -> None:
     assert np.isclose(derivative[1, 0], -(0.1 + 0.2j) / 20.0)
 
 
+def test_cmd_dephasing_uses_inverse_population_and_coherence_times() -> None:
+    cmd, _ = build_cmd_stack()
+    rho = np.array(
+        [
+            [0.3 + 0.0j, 0.2 - 0.1j],
+            [0.2 + 0.1j, -0.4 + 0.0j],
+        ],
+        dtype=np.complex128,
+    )
+
+    derivative = cmd._dephasing_term(rho)
+
+    np.testing.assert_allclose(derivative[0, 0], -(1.0 / 50.0) * rho[0, 0])
+    np.testing.assert_allclose(derivative[1, 1], -(1.0 / 50.0) * rho[1, 1])
+    np.testing.assert_allclose(derivative[0, 1], -(1.0 / 20.0) * rho[0, 1])
+    np.testing.assert_allclose(derivative[1, 0], -(1.0 / 20.0) * rho[1, 0])
+
+
 def test_cmd_accepts_distribution_selection() -> None:
     cmd, _ = build_cmd_stack(distribution="maxwell_boltzmann")
     rho_eq = cmd.rho_equilibrium(np.array([0.05, 0.0, 0.0], dtype=float))
 
     assert rho_eq.shape == (2, 2)
     assert np.all(np.isfinite(rho_eq))
+    np.testing.assert_allclose(rho_eq, np.diag(np.diag(rho_eq)), atol=1.0e-12)
+
+
+def test_cmd_valence_occupation_distribution_builds_valence_filled_equilibrium_density() -> None:
+    cmd, _ = build_cmd_stack(distribution="valence_occupation")
+    rho_eq = cmd.rho_equilibrium(np.array([0.05, 0.0, 0.0], dtype=float))
+
+    np.testing.assert_allclose(rho_eq, np.diag([1.0, 0.0]), atol=1.0e-12)
+
+
+def test_cmd_full_occupation_alias_matches_valence_occupation() -> None:
+    cmd_full, _ = build_cmd_stack(distribution="full_occupation")
+    cmd_valence, _ = build_cmd_stack(distribution="valence_occupation")
+
+    rho_full = cmd_full.rho_equilibrium(np.array([0.05, 0.0, 0.0], dtype=float))
+    rho_valence = cmd_valence.rho_equilibrium(np.array([0.05, 0.0, 0.0], dtype=float))
+    np.testing.assert_allclose(rho_full, rho_valence, atol=1.0e-12)
 
 
 def test_cmd_time_and_frequency_domain_outputs_have_expected_shapes(tmp_path: Path) -> None:
@@ -197,6 +234,9 @@ def test_cmd_time_and_frequency_domain_outputs_have_expected_shapes(tmp_path: Pa
 
     assert rho_eq.shape == (2, 2)
     assert np.isclose(np.trace(rho_eq), 1.0, atol=1.0e-6)
+    np.testing.assert_allclose(rho_eq, np.diag(np.diag(rho_eq)), atol=1.0e-12)
+    assert np.all(np.real(np.diag(rho_eq)) >= 0.0)
+    assert np.all(np.real(np.diag(rho_eq)) <= 1.0)
     assert set(rho_orders) == {0, 1, 2}
     assert rho_orders[0].shape == (1, 11, 2, 2)
     assert rho_orders[1].shape == (1, 11, 2, 2)
@@ -209,13 +249,6 @@ def test_cmd_time_and_frequency_domain_outputs_have_expected_shapes(tmp_path: Pa
     assert (tmp_path / "rho_order_0.npy").exists()
     assert (tmp_path / "rho_order_1.npy").exists()
     assert (tmp_path / "rho_order_2.npy").exists()
-    assert (tmp_path / "rho_order_0.dat").exists()
-    assert (tmp_path / "rho_order_1.dat").exists()
-    assert (tmp_path / "rho_order_2.dat").exists()
-
-    dat_lines = (tmp_path / "rho_order_1.dat").read_text(encoding="ascii").splitlines()
-    assert dat_lines[0].startswith("# domain=time order=1")
-    assert "real imag" in dat_lines[2]
 
 
 def test_response_population_heatmap_data_and_plot(tmp_path: Path) -> None:
@@ -445,6 +478,57 @@ def test_xtp_first_order_polarization_matches_manual_bz_dipole_integral() -> Non
     np.testing.assert_allclose(polarization[:, 1:], 0.0, atol=1.0e-12)
 
 
+def test_xtp_bz_mask_reduces_edge_contributions_with_circular_gaussian_cutoff() -> None:
+    cmd, operator_factory = build_cmd_stack(
+        max_order=1,
+        kgrid=KGrid(
+            kx_values=np.linspace(-0.5 * np.pi, 0.5 * np.pi, 5),
+            ky_values=np.linspace(-0.5 * np.pi, 0.5 * np.pi, 5),
+            kz_values=np.array([0.0]),
+            dimension=2,
+        ),
+    )
+    rho_orders = cmd.compute_all_orders()
+    xtp_plain = XTP(
+        hamiltonian=cmd.hamiltonian,
+        rho_orders=rho_orders,
+        kgrid=cmd.kgrid,
+        timegrid=cmd.timegrid,
+        frequencygrid=FrequencyGrid(0.0, 5.0, 32),
+        operator_factory=operator_factory,
+        directions=["x"],
+        orders=[0],
+    )
+    xtp_masked = XTP(
+        hamiltonian=cmd.hamiltonian,
+        rho_orders=rho_orders,
+        kgrid=cmd.kgrid,
+        timegrid=cmd.timegrid,
+        frequencygrid=FrequencyGrid(0.0, 5.0, 32),
+        operator_factory=operator_factory,
+        directions=["x"],
+        orders=[0],
+        bz_mask_enabled=True,
+        bz_mask_radius_percent=60.0,
+        bz_mask_sigma=0.94,
+    )
+
+    point_values = np.ones((cmd.kgrid.total_points, len(cmd.timegrid)), dtype=np.complex128)
+    plain = xtp_plain._integrate_over_brillouin_zone(point_values)
+    masked = xtp_masked._integrate_over_brillouin_zone(point_values)
+    weights = xtp_masked._bz_mask_weights()
+    plot_data = xtp_masked.bz_mask_plot_data()
+
+    assert weights.shape == cmd.kgrid.shape
+    assert np.count_nonzero(weights == 0.0) > 0
+    assert np.max(weights) <= 1.0
+    assert np.min(weights) >= 0.0
+    assert np.all(np.abs(masked) < np.abs(plain))
+    assert xtp_masked.bz_mask_summary()["enabled"] is True
+    assert plot_data["integration_region"].shape == (5, 5)
+    assert plot_data["mask_weights"].shape == (5, 5)
+
+
 def test_xtp_current_frequency_domain_matches_manual_fft_and_plot(tmp_path: Path) -> None:
     cmd, operator_factory = build_cmd_stack(max_order=1)
     rho_orders = cmd.compute_all_orders()
@@ -485,6 +569,11 @@ def test_xtp_current_frequency_domain_matches_manual_fft_and_plot(tmp_path: Path
     assert harmonic_data["current_magnitude"].shape == (nfft, 3)
     assert harmonic_data["current_time"].shape == (len(cmd.timegrid), 3)
     assert harmonic_data["electric_field_time"].shape == (len(cmd.timegrid), 3)
+    assert harmonic_data["bz_mask"]["enabled"] is False
+    assert harmonic_data["kx_grid"].shape == harmonic_data["ky_grid"].shape
+    assert harmonic_data["integration_region"].shape == harmonic_data["mask_weights"].shape
+    np.testing.assert_allclose(harmonic_data["integration_region"], 1.0)
+    np.testing.assert_allclose(harmonic_data["mask_weights"], 1.0)
 
     if "matplotlib" not in sys.modules and importlib.util.find_spec("matplotlib") is None:
         return
@@ -510,3 +599,13 @@ def test_xtp_current_frequency_domain_matches_manual_fft_and_plot(tmp_path: Path
     )
     assert output_path.exists()
     assert output_path.stat().st_size > 0
+
+    circular_output_path = HarmonicGraphics.plot_circular_current_spectrum(
+        omega_axis,
+        current_spectrum,
+        tmp_path / "current_circular_spectrum.png",
+        orders=tuple(harmonic_data["orders"]),
+        positive_only=True,
+    )
+    assert circular_output_path.exists()
+    assert circular_output_path.stat().st_size > 0

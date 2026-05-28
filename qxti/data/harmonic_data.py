@@ -32,7 +32,10 @@ class HarmonicData:
             "time_axis": np.asarray(self.xtp.timegrid.generate(), dtype=float),
             "directions": tuple(self.xtp.directions),
             "orders": tuple(self.xtp.orders),
+            "bz_mask": self.xtp.bz_mask_summary(),
         }
+        if self.xtp.kgrid.dimension == 2:
+            data.update(self.xtp.bz_mask_plot_data())
         if self.electric_field_time is not None:
             data["electric_field_time"] = np.asarray(self.electric_field_time, dtype=float)
         return data

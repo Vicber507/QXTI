@@ -105,7 +105,8 @@ def plot_response_graphics_from_saved_data(
     )
     if not rho_orders:
         raise FileNotFoundError(
-            "Missing response datasets and no saved rho_order_*.npy/.dat files were found. "
+            "Missing response datasets and no saved rho_order_*.npy files were found. "
+            "Legacy rho_order_*.dat files are still supported if they already exist. "
             "Run `python main.py inputParams.cfg` first."
         )
     print("[graphics] plotting response graphics from saved rho_order tensors.")
@@ -122,6 +123,7 @@ def plot_response_graphics_from_saved_data(
             ky_values=ky_values,
             kz_values=kz_values,
             orders=requested_orders,
+            value_mode=str(population_cfg.get("value_mode", "delta")),
         )
     except ValueError as exc:
         population_kmap_data = None
@@ -141,30 +143,6 @@ def plot_response_graphics_from_saved_data(
         coherence_kmap_data = None
         print(f"[graphics] skipped coherence kx-ky data: {exc}")
 
-    if population_kmap_data is not None and bool(population_cfg["video"]["enabled"]):
-        try:
-            outputs["rho_population_kxky_video"] = ResponseGraphics.animate_population_kxky_maps(
-                population_kmap_data,
-                output_dir / str(population_cfg["video"]["output_file"]),
-                fps=int(population_cfg["video"]["fps"]),
-                frame_stride=int(population_cfg["video"]["frame_stride"]),
-                cmap=str(population_cfg["video"]["cmap"]),
-            )
-        except (RuntimeError, ValueError) as exc:
-            print(f"[graphics] skipped population video: {exc}")
-
-    if coherence_kmap_data is not None and bool(coherence_cfg["video"]["enabled"]):
-        try:
-            outputs["rho_coherence_kxky_video"] = ResponseGraphics.animate_coherence_kxky_maps(
-                coherence_kmap_data,
-                output_dir / str(coherence_cfg["video"]["output_file"]),
-                fps=int(coherence_cfg["video"]["fps"]),
-                frame_stride=int(coherence_cfg["video"]["frame_stride"]),
-                cmap=str(coherence_cfg["video"]["cmap"]),
-            )
-        except (RuntimeError, ValueError) as exc:
-            print(f"[graphics] skipped coherence video: {exc}")
-
     if population_kmap_data is not None and bool(population_cfg["snapshots"]["enabled"]):
         population_snapshot_indices = ResponseGraphics.resolve_snapshot_indices(
             np.asarray(population_kmap_data["time_axis"], dtype=float),
@@ -177,6 +155,8 @@ def plot_response_graphics_from_saved_data(
             output_dir / str(population_cfg["snapshots"]["output_file"]),
             snapshot_indices=population_snapshot_indices,
             cmap=str(population_cfg["snapshots"]["cmap"]),
+            center_zero=bool(population_cfg["snapshots"].get("center_zero", False)),
+            contrast_percentile=float(population_cfg["snapshots"].get("contrast_percentile", 100.0)),
         )
 
     if coherence_kmap_data is not None and bool(coherence_cfg["snapshots"]["enabled"]):
@@ -191,7 +171,39 @@ def plot_response_graphics_from_saved_data(
             output_dir / str(coherence_cfg["snapshots"]["output_file"]),
             snapshot_indices=coherence_snapshot_indices,
             cmap=str(coherence_cfg["snapshots"]["cmap"]),
+            center_zero=bool(coherence_cfg["snapshots"].get("center_zero", False)),
+            contrast_percentile=float(coherence_cfg["snapshots"].get("contrast_percentile", 100.0)),
         )
+
+    if population_kmap_data is not None and bool(population_cfg["video"]["enabled"]):
+        print("[graphics] static population plots completed; generating population video.")
+        try:
+            outputs["rho_population_kxky_video"] = ResponseGraphics.animate_population_kxky_maps(
+                population_kmap_data,
+                output_dir / str(population_cfg["video"]["output_file"]),
+                fps=int(population_cfg["video"]["fps"]),
+                frame_stride=int(population_cfg["video"]["frame_stride"]),
+                cmap=str(population_cfg["video"]["cmap"]),
+                center_zero=bool(population_cfg["video"].get("center_zero", False)),
+                contrast_percentile=float(population_cfg["video"].get("contrast_percentile", 100.0)),
+            )
+        except (RuntimeError, ValueError) as exc:
+            print(f"[graphics] skipped population video: {exc}")
+
+    if coherence_kmap_data is not None and bool(coherence_cfg["video"]["enabled"]):
+        print("[graphics] static coherence plots completed; generating coherence video.")
+        try:
+            outputs["rho_coherence_kxky_video"] = ResponseGraphics.animate_coherence_kxky_maps(
+                coherence_kmap_data,
+                output_dir / str(coherence_cfg["video"]["output_file"]),
+                fps=int(coherence_cfg["video"]["fps"]),
+                frame_stride=int(coherence_cfg["video"]["frame_stride"]),
+                cmap=str(coherence_cfg["video"]["cmap"]),
+                center_zero=bool(coherence_cfg["video"].get("center_zero", False)),
+                contrast_percentile=float(coherence_cfg["video"].get("contrast_percentile", 100.0)),
+            )
+        except (RuntimeError, ValueError) as exc:
+            print(f"[graphics] skipped coherence video: {exc}")
 
     return outputs
 
@@ -208,7 +220,7 @@ def plot_harmonic_graphics_from_saved_data(
     outputs: dict[str, Path] = {}
 
     dataset_name = None
-    for section_name in ("field_current_time", "current_spectrum"):
+    for section_name in ("field_current_time", "current_spectrum", "current_circular_spectrum"):
         section_cfg = resolved_plot_config[section_name]
         if bool(section_cfg["enabled"]):
             dataset_name = str(section_cfg["dataset_file"])
@@ -248,8 +260,28 @@ def plot_harmonic_graphics_from_saved_data(
             positive_only=bool(current_cfg["positive_only"]),
             omega_min=None if current_cfg["omega_min"] is None else float(current_cfg["omega_min"]),
             omega_max=None if current_cfg["omega_max"] is None else float(current_cfg["omega_max"]),
+            fundamental_omega=float(config.laser.omega),
+            use_harmonic_order=bool(current_cfg.get("use_harmonic_order", False)),
+            max_harmonic_order=None if current_cfg.get("max_harmonic_order") is None else float(current_cfg["max_harmonic_order"]),
             log_scale=bool(current_cfg["log_scale"]),
         )
+
+    circular_cfg = resolved_plot_config["current_circular_spectrum"]
+    if bool(circular_cfg["enabled"]):
+        outputs["current_circular_spectrum"] = HarmonicGraphics.plot_circular_current_spectrum(
+            np.asarray(data["omega_axis"], dtype=float),
+            np.asarray(data["current_spectrum"], dtype=np.complex128),
+            output_dir / str(circular_cfg["output_file"]),
+            orders=tuple(int(order) for order in data.get("orders", ())),
+            positive_only=bool(circular_cfg["positive_only"]),
+            omega_min=None if circular_cfg["omega_min"] is None else float(circular_cfg["omega_min"]),
+            omega_max=None if circular_cfg["omega_max"] is None else float(circular_cfg["omega_max"]),
+            fundamental_omega=float(config.laser.omega),
+            use_harmonic_order=bool(circular_cfg.get("use_harmonic_order", False)),
+            max_harmonic_order=None if circular_cfg.get("max_harmonic_order") is None else float(circular_cfg["max_harmonic_order"]),
+            log_scale=bool(circular_cfg["log_scale"]),
+        )
+
     return outputs
 
 
@@ -258,8 +290,8 @@ def plot_all_graphics_from_saved_data(
 ) -> dict[str, Path]:
     outputs: dict[str, Path] = {}
     outputs.update(plot_hamiltonian_graphics_from_saved_data(config_path))
-    outputs.update(plot_response_graphics_from_saved_data(config_path))
     outputs.update(plot_harmonic_graphics_from_saved_data(config_path))
+    outputs.update(plot_response_graphics_from_saved_data(config_path))
     return outputs
 
 

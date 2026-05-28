@@ -199,8 +199,8 @@ class CMDConfig:
     enabled: bool = False
     output_dir: str = "outputs/cmd"
     max_order: int = 1
-    gamma_population: float = 0.0
-    gamma_coherence: float = 0.0
+    population_time: float = math.inf
+    coherence_time: float = math.inf
     temperature: float = 0.0
     fermi_level: float = 0.0
     distribution: str = "fermi_dirac"
@@ -230,6 +230,14 @@ class CMDPlotsConfig:
 
 
 @dataclass(slots=True)
+class XTPConfig:
+    bz_mask_enabled: bool = False
+    bz_mask_radius_percent: float = 100.0
+    bz_mask_sigma: float | None = None
+    bz_mask_sigma_percent_legacy: float | None = None
+
+
+@dataclass(slots=True)
 class QXTIConfig:
     hamiltonian: HamiltonianConfig
     hamiltonian_plots: HamiltonianPlotsConfig = field(default_factory=HamiltonianPlotsConfig)
@@ -238,6 +246,7 @@ class QXTIConfig:
     laser: LaserConfig = field(default_factory=LaserConfig)
     cmd: CMDConfig = field(default_factory=CMDConfig)
     cmd_plots: CMDPlotsConfig = field(default_factory=CMDPlotsConfig)
+    xtp: XTPConfig = field(default_factory=XTPConfig)
     source_path: Path | None = None
 
     @classmethod
@@ -258,6 +267,7 @@ class QXTIConfig:
         laser = cls._parse_laser_section(parser["laser"]) if "laser" in parser else LaserConfig()
         cmd = cls._parse_cmd_section(parser["cmd"]) if "cmd" in parser else CMDConfig()
         cmd_plots = cls._parse_cmd_plots_section(parser["cmd_plots"]) if "cmd_plots" in parser else CMDPlotsConfig()
+        xtp = cls._parse_xtp_section(parser["xtp"]) if "xtp" in parser else XTPConfig()
         return cls(
             hamiltonian=hamiltonian,
             hamiltonian_plots=hamiltonian_plots,
@@ -266,6 +276,7 @@ class QXTIConfig:
             laser=laser,
             cmd=cmd,
             cmd_plots=cmd_plots,
+            xtp=xtp,
             source_path=path.resolve(),
         )
 
@@ -429,12 +440,33 @@ class QXTIConfig:
     @staticmethod
     def _parse_cmd_section(section: configparser.SectionProxy) -> CMDConfig:
         solver_h_max = section.get("solver_h_max", fallback="").strip()
+        population_time_raw = section.get("population_time", fallback=section.get("T1", fallback="")).strip()
+        coherence_time_raw = section.get("coherence_time", fallback=section.get("T2", fallback="")).strip()
+        gamma_population_raw = section.get("gamma_population", fallback="").strip()
+        gamma_coherence_raw = section.get("gamma_coherence", fallback="").strip()
+
+        if population_time_raw:
+            population_time = float(_parse_scalar(population_time_raw))
+        elif gamma_population_raw:
+            gamma_population = float(_parse_scalar(gamma_population_raw))
+            population_time = math.inf if gamma_population == 0.0 else 1.0 / gamma_population
+        else:
+            population_time = math.inf
+
+        if coherence_time_raw:
+            coherence_time = float(_parse_scalar(coherence_time_raw))
+        elif gamma_coherence_raw:
+            gamma_coherence = float(_parse_scalar(gamma_coherence_raw))
+            coherence_time = math.inf if gamma_coherence == 0.0 else 1.0 / gamma_coherence
+        else:
+            coherence_time = math.inf
+
         return CMDConfig(
             enabled=section.getboolean("enabled", fallback=False),
             output_dir=section.get("output_dir", fallback="outputs/cmd").strip() or "outputs/cmd",
             max_order=section.getint("max_order", fallback=1),
-            gamma_population=section.getfloat("gamma_population", fallback=0.0),
-            gamma_coherence=section.getfloat("gamma_coherence", fallback=0.0),
+            population_time=population_time,
+            coherence_time=coherence_time,
             temperature=section.getfloat("temperature", fallback=0.0),
             fermi_level=section.getfloat("fermi_level", fallback=0.0),
             distribution=section.get("distribution", fallback="fermi_dirac").strip() or "fermi_dirac",
@@ -464,4 +496,17 @@ class QXTIConfig:
             or "outputs/cmd/population_animation.gif",
             fps=section.getint("fps", fallback=10),
             frame_stride=section.getint("frame_stride", fallback=1),
+        )
+
+    @staticmethod
+    def _parse_xtp_section(section: configparser.SectionProxy) -> XTPConfig:
+        sigma_raw = section.get("bz_mask_sigma", fallback="").strip()
+        sigma_percent_legacy_raw = section.get("bz_mask_sigma_percent", fallback="").strip()
+        return XTPConfig(
+            bz_mask_enabled=section.getboolean("bz_mask_enabled", fallback=False),
+            bz_mask_radius_percent=section.getfloat("bz_mask_radius_percent", fallback=100.0),
+            bz_mask_sigma=None if not sigma_raw else float(_parse_scalar(sigma_raw)),
+            bz_mask_sigma_percent_legacy=None
+            if not sigma_percent_legacy_raw
+            else float(_parse_scalar(sigma_percent_legacy_raw)),
         )

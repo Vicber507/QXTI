@@ -37,7 +37,7 @@ PREVIEW_LASER_PARAMS = {
     "omega": 0.03,
     "E0": 0.004,
     "cep": 0.0,
-    "ellip": 0.0,
+    "ellip": 1.0,
     "ncycles": 3,
     "envname": "gauss",
     "t0": 0.0,

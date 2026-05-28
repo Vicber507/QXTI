@@ -43,6 +43,10 @@ class XTP:
         operator_factory: OperatorFactory,
         directions: list[str],
         orders: list[int],
+        bz_mask_enabled: bool = False,
+        bz_mask_radius_percent: float = 100.0,
+        bz_mask_sigma: float | None = None,
+        bz_mask_sigma_percent_legacy: float | None = None,
     ) -> None:
         self.hamiltonian = hamiltonian
         self.rho_orders = {int(order): np.asarray(tensor, dtype=np.complex128) for order, tensor in rho_orders.items()}
@@ -52,8 +56,20 @@ class XTP:
         self.operator_factory = operator_factory
         self.directions = [self._normalize_direction(direction) for direction in directions]
         self.orders = sorted({int(order) for order in orders})
+        self.bz_mask_enabled = bool(bz_mask_enabled)
+        self.bz_mask_radius_percent = float(bz_mask_radius_percent)
+        self.bz_mask_sigma = None if bz_mask_sigma is None else float(bz_mask_sigma)
+        self.bz_mask_sigma_percent_legacy = (
+            None if bz_mask_sigma_percent_legacy is None else float(bz_mask_sigma_percent_legacy)
+        )
         if not self.orders:
             raise ValueError("orders must contain at least one perturbative order.")
+        if self.bz_mask_radius_percent <= 0.0:
+            raise ValueError("bz_mask_radius_percent must be strictly positive.")
+        if self.bz_mask_sigma is not None and self.bz_mask_sigma <= 0.0:
+            raise ValueError("bz_mask_sigma must be strictly positive when provided.")
+        if self.bz_mask_sigma_percent_legacy is not None and self.bz_mask_sigma_percent_legacy <= 0.0:
+            raise ValueError("bz_mask_sigma_percent_legacy must be strictly positive when provided.")
         self._validate_rho_orders()
 
     def polarization(self, order: int) -> RealArray:
@@ -172,6 +188,40 @@ class XTP:
             "susceptibility": {order: self.susceptibility(order) for order in self.orders},
         }
 
+    def bz_mask_summary(self) -> dict[str, Any]:
+        """Return one serializable description of the Brillouin-zone mask."""
+
+        bounds = self.brillouin_zone_bounds()
+        reference_radius = self._mask_reference_radius(bounds)
+        radius = self._mask_radius(bounds)
+        sigma = self._mask_sigma(bounds)
+        return {
+            "enabled": self.bz_mask_enabled,
+            "shape": "radial" if self.kgrid.dimension == 1 else ("circular" if self.kgrid.dimension == 2 else "spherical"),
+            "radius_percent": self.bz_mask_radius_percent,
+            "sigma_input": self.bz_mask_sigma,
+            "reference_radius": reference_radius,
+            "radius": radius,
+            "sigma": sigma,
+        }
+
+    def bz_mask_plot_data(self) -> dict[str, Any]:
+        """Return serializable 2D data describing the integration region and mask."""
+
+        if self.kgrid.dimension != 2:
+            raise ValueError("bz_mask_plot_data currently supports only 2D k-grids.")
+
+        kx_mesh, ky_mesh, _ = self.kgrid.mesh(indexing="ij")
+        region = np.ones(self.kgrid.shape[:2], dtype=np.float64)
+        weights = self._bz_mask_weights()[:, :, 0]
+        return {
+            "kx_grid": np.asarray(kx_mesh[:, :, 0], dtype=np.float64),
+            "ky_grid": np.asarray(ky_mesh[:, :, 0], dtype=np.float64),
+            "integration_region": region,
+            "mask_weights": np.asarray(weights, dtype=np.float64),
+            "mask_metadata": self.bz_mask_summary(),
+        }
+
     def brillouin_zone_bounds(self) -> tuple[tuple[float, float], ...]:
         """Return the rectangular reciprocal box used for BZ integrations."""
 
@@ -199,6 +249,8 @@ class XTP:
             )
 
         grid = values.reshape(*self.kgrid.shape, *values.shape[1:])
+        if self.bz_mask_enabled:
+            grid = grid * self._bz_mask_weights().reshape(*self.kgrid.shape, *([1] * (grid.ndim - 3)))
         bounds = self.brillouin_zone_bounds()
         result = grid
 
@@ -224,6 +276,38 @@ class XTP:
             active=True,
         )
         return np.asarray(result, dtype=np.complex128)
+
+    def _bz_mask_weights(self) -> RealArray:
+        if not self.bz_mask_enabled:
+            return np.ones(self.kgrid.shape, dtype=np.float64)
+
+        mesh = self.kgrid.mesh(indexing="ij")
+        active_coordinates = [np.asarray(mesh[axis], dtype=float) for axis in range(self.kgrid.dimension)]
+        radial_distance = np.sqrt(np.sum([coordinate**2 for coordinate in active_coordinates], axis=0))
+
+        bounds = self.brillouin_zone_bounds()
+        radius = self._mask_radius(bounds)
+        sigma = self._mask_sigma(bounds)
+
+        weights = np.exp(-0.5 * (radial_distance / sigma) ** 2)
+        weights = np.where(radial_distance <= radius, weights, 0.0)
+        return np.asarray(weights, dtype=np.float64)
+
+    def _mask_reference_radius(self, bounds: tuple[tuple[float, float], ...]) -> float:
+        active_bounds = bounds[: self.kgrid.dimension]
+        return float(min(max(abs(lower), abs(upper)) for lower, upper in active_bounds))
+
+    def _mask_radius(self, bounds: tuple[tuple[float, float], ...]) -> float:
+        return 0.01 * self.bz_mask_radius_percent * self._mask_reference_radius(bounds)
+
+    def _mask_sigma(self, bounds: tuple[tuple[float, float], ...]) -> float:
+        if self.bz_mask_sigma is not None:
+            return float(max(self.bz_mask_sigma, 1.0e-15))
+
+        radius = self._mask_radius(bounds)
+        sigma_percent = 100.0 if self.bz_mask_sigma_percent_legacy is None else self.bz_mask_sigma_percent_legacy
+        sigma = 0.01 * sigma_percent * radius
+        return float(max(sigma, 1.0e-15))
 
     @staticmethod
     def _integrate_axis(
