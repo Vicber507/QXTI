@@ -1,4 +1,4 @@
-# fermi.py
+# Contain a distribution function for fermions, the Fermi-Dirac distribution.
 
 import numpy as np
 
