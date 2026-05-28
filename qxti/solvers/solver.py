@@ -201,13 +201,7 @@ class RKF45Solver(Solver):
             # Error estimation
             # =================================================
 
-            error_tensor = (
-                k1 / 360
-                - 128 * k3 / 4275
-                - 2197 * k4 / 75240
-                + k5 / 50
-                + 2* k6 / 55
-            )
+            error_tensor = (k1 / 360 - 128 * k3 / 4275 - 2197 * k4 / 75240 + k5 / 50 + 2* k6 / 55 )
 
             err = np.linalg.norm(error_tensor)
 
