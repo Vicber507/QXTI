@@ -1,7 +1,3 @@
-# ============================================================
-# solver.py
-# ============================================================
-
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -10,17 +6,7 @@ from typing import Callable, Tuple, List, Dict, Any
 import numpy as np
 from numpy.typing import NDArray
 
-
-# ============================================================
-# Internal Typing
-# ============================================================
-
 ComplexArray = NDArray[np.complex128]
-
-
-# ============================================================
-# Abstract Solver Base Class
-# ============================================================
 
 class Solver(ABC):
     """
@@ -45,9 +31,6 @@ class Solver(ABC):
         dtype: str = "complex128"
     ):
 
-        # ----------------------------------------------------
-        # Numerical control parameters
-        # ----------------------------------------------------
 
         self.tolerance: float = tolerance
 
@@ -55,19 +38,12 @@ class Solver(ABC):
 
         self.dtype: str = dtype
 
-        # ----------------------------------------------------
-        # Runtime diagnostics
-        # ----------------------------------------------------
 
         self.last_error: float = np.inf
 
         self.iterations: int = 0
 
         self.converged: bool = False
-
-    # ========================================================
-    # Abstract Main Solver
-    # ========================================================
 
     @abstractmethod
     def solve(
@@ -87,10 +63,6 @@ class Solver(ABC):
         """
         pass
 
-    # ========================================================
-    # Convergence Checker
-    # ========================================================
-
     def check_convergence(self) -> bool:
         """
         Checks whether the solver converged according
@@ -103,20 +75,12 @@ class Solver(ABC):
 
         return self.converged
 
-    # ========================================================
-    # Residual Estimator
-    # ========================================================
-
     def residual(self) -> float:
         """
         Returns the last numerical residual/error estimate.
         """
 
         return self.last_error
-
-    # ========================================================
-    # Solver Summary
-    # ========================================================
 
     def summary(self) -> Dict[str, Any]:
         """
@@ -139,11 +103,6 @@ class Solver(ABC):
 
             "converged": self.converged
         }
-
-
-# ============================================================
-# Adaptive Runge-Kutta-Fehlberg 4(5)
-# ============================================================
 
 class RKF45Solver(Solver):
     """
@@ -184,10 +143,6 @@ class RKF45Solver(Solver):
 
         self.enforce_trace = enforce_trace
 
-    # ========================================================
-    # Main RKF45 Integrator
-    # ========================================================
-
     def solve(
         self,
         derivative_function: Callable,
@@ -213,10 +168,6 @@ class RKF45Solver(Solver):
 
         while t < tf:
 
-            # ------------------------------------------------
-            # Prevent overshooting
-            # ------------------------------------------------
-
             if t + h > tf:
 
                 h = tf - t
@@ -225,46 +176,17 @@ class RKF45Solver(Solver):
 
             yi = y
 
-            # =================================================
-            # RKF45 stages
-            # =================================================
+            k1 = h * derivative_function(ti,yi,*args)
 
-            k1 = h * derivative_function(
-                ti,
-                yi,
-                *args
-            )
+            k2 = h * derivative_function(ti + h / 4,yi + k1 / 4,*args)
 
-            k2 = h * derivative_function(
-                ti + h / 4,
-                yi + k1 / 4,
-                *args
-            )
+            k2 = h * derivative_function(ti + h / 4, yi + k1 / 4, *args)
 
-            k3 = h * derivative_function(
-                ti + 3 * h / 8,
-                yi
-                + 3 * k1 / 32
-                + 9 * k2 / 32,
-                *args
-            )
+            k3 = h * derivative_function(ti + 3 * h / 8, yi+ 3 * k1 / 32 + 9 * k2 / 32, *args)
 
-            k4 = h * derivative_function(
-                ti + 12 * h / 13,
-                yi
-                + 1932 * k1 / 2197
-                - 7200 * k2 / 2197
-                + 7296 * k3 / 2197,
-                *args
-            )
+            k4 = h * derivative_function(ti + 12 * h / 13,yi+ 1932 * k1 / 2197 - 7200 * k2 / 2197 + 7296 * k3 / 2197,*args)
 
-            k5 = h * derivative_function(
-                ti + h,
-                yi
-                + 439 * k1 / 216
-                - 8 * k2
-                + 3680 * k3 / 513
-                - 845 * k4 / 4104,
+            k5 = h * derivative_function(ti + h,yi+ 439 * k1 / 216 - 8 * k2+ 3680 * k3 / 513 - 845 * k4 / 4104,
                 *args
             )
 
@@ -301,7 +223,7 @@ class RKF45Solver(Solver):
                 - 128 * k3 / 4275
                 - 2197 * k4 / 75240
                 + k5 / 50
-                + k6 / 55
+                + 2* k6 / 55
             )
 
             err = np.linalg.norm(error_tensor)
@@ -503,10 +425,6 @@ class AdamsBashforth2Solver(Solver):
 
         y_list.append(y1.copy())
 
-        # ====================================================
-        # Adams-Bashforth propagation
-        # ====================================================
-
         for n in range(1, len(time_values) - 1):
 
             t_n = time_values[n]
@@ -531,15 +449,9 @@ class AdamsBashforth2Solver(Solver):
             )
 
             # Adams-Bashforth update
-            y_next = (
-                y_n
-                + h / 2 * (
-                    3 * f_n
-                    - f_nm1
-                )
-            )
+            y_next = (y_n + h / 2 * (3 * f_n- f_nm1))
 
-            # Error estimate
+    
             self.last_error = np.linalg.norm(
                 y_next - y_n
             )
