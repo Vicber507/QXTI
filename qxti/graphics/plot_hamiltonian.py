@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import math
 from pathlib import Path
+import sys
 from typing import Any
 
 import numpy as np
@@ -204,3 +206,36 @@ class HamiltonianGraphics:
                 "Install it to generate Hamiltonian plots."
             )
         return plt
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Generate the standard QXTI Hamiltonian plots from an inputParams.cfg file."
+    )
+    parser.add_argument(
+        "config",
+        nargs="?",
+        default="inputParams.cfg",
+        help="Path to the configuration file. Defaults to inputParams.cfg.",
+    )
+    return parser
+
+
+def _main() -> int:
+    project_root = Path(__file__).resolve().parents[2]
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+
+    from qxti.graphics.graphics import plot_hamiltonian_graphics_from_saved_data
+
+    parser = _build_parser()
+    args = parser.parse_args()
+    outputs = plot_hamiltonian_graphics_from_saved_data(args.config)
+    print(f"Generated {len(outputs)} Hamiltonian plots from {args.config}:")
+    for name, path in outputs.items():
+        print(f"  {name}: {path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

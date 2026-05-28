@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 from pathlib import Path
 import sys
 
@@ -10,9 +11,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from qxti.grids import FrequencyGrid, KGrid, TimeGrid
+from qxti.data import ResponseData
+from qxti.graphics import ResponseGraphics
 from qxti.physics import Hamiltonian, Laser, LaserSystem, OperatorFactory
 from qxti.response import CMD, T1T2Relaxation, XTP, bose_einstein, fermi_dirac, maxwell_boltzmann, t1_t2_relaxation
-from qxti.solvers import AdamsBashforth2Solver
+from qxti.solvers import RKF45Solver
 
 
 class ToyTwoBandHamiltonian(Hamiltonian):
@@ -32,7 +35,15 @@ class ToyTwoBandHamiltonian(Hamiltonian):
         )
 
 
-def build_cmd_stack(*, max_order: int = 2) -> tuple[CMD, OperatorFactory]:
+def build_cmd_stack(
+    *,
+    max_order: int = 2,
+    gauge: str = "length",
+    distribution: str = "fermi_dirac",
+    include_intraband: bool = True,
+    include_interband: bool = True,
+    kgrid: KGrid | None = None,
+) -> tuple[CMD, OperatorFactory]:
     hamiltonian = ToyTwoBandHamiltonian(
         model_name="toy-response",
         basis_size=2,
@@ -53,9 +64,15 @@ def build_cmd_stack(*, max_order: int = 2) -> tuple[CMD, OperatorFactory]:
             )
         ]
     )
-    kgrid = KGrid(kx_values=np.array([0.05]), ky_values=np.array([0.0]), kz_values=np.array([0.0]), dimension=2)
+    if kgrid is None:
+        kgrid = KGrid(
+            kx_values=np.array([0.05]),
+            ky_values=np.array([0.0]),
+            kz_values=np.array([0.0]),
+            dimension=2,
+        )
     timegrid = TimeGrid(0.0, 0.4, 11, zero_padding=True, padding_factor=2)
-    solver = AdamsBashforth2Solver(tolerance=1.0e-8)
+    solver = RKF45Solver(tolerance=1.0e-6, h_max=timegrid.dt, max_iterations=10000)
     cmd = CMD(
         hamiltonian=hamiltonian,
         laser_system=laser_system,
@@ -68,10 +85,11 @@ def build_cmd_stack(*, max_order: int = 2) -> tuple[CMD, OperatorFactory]:
         gamma_coherence=0.05,
         temperature=0.02,
         fermi_level=0.0,
+        distribution=distribution,
         basis="band",
-        gauge="velocity",
-        include_intraband=True,
-        include_interband=True,
+        gauge=gauge,
+        include_intraband=include_intraband,
+        include_interband=include_interband,
         include_dephasing=True,
     )
     return cmd, operator_factory
@@ -144,6 +162,14 @@ def test_t1_t2_relaxation_model_matches_cmd_convention() -> None:
     assert np.isclose(derivative[1, 0], -(0.1 + 0.2j) / 20.0)
 
 
+def test_cmd_accepts_distribution_selection() -> None:
+    cmd, _ = build_cmd_stack(distribution="maxwell_boltzmann")
+    rho_eq = cmd.rho_equilibrium(np.array([0.05, 0.0, 0.0], dtype=float))
+
+    assert rho_eq.shape == (2, 2)
+    assert np.all(np.isfinite(rho_eq))
+
+
 def test_cmd_time_and_frequency_domain_outputs_have_expected_shapes(tmp_path: Path) -> None:
     cmd, _ = build_cmd_stack(max_order=2)
 
@@ -157,11 +183,117 @@ def test_cmd_time_and_frequency_domain_outputs_have_expected_shapes(tmp_path: Pa
     assert set(rho_orders) == {0, 1, 2}
     assert rho_orders[0].shape == (1, 11, 2, 2)
     assert rho_orders[1].shape == (1, 11, 2, 2)
-    assert np.allclose(rho_orders[2], 0.0)
+    assert rho_orders[2].shape == (1, 11, 2, 2)
+    assert np.max(np.abs(rho_orders[1])) > 0.0
+    assert np.max(np.abs(rho_orders[2])) > 0.0
     assert rho_freq[0].shape == (1, 22, 2, 2)
+    assert rho_freq[1].shape == (1, 22, 2, 2)
+    assert rho_freq[2].shape == (1, 22, 2, 2)
     assert (tmp_path / "rho_order_0.npy").exists()
     assert (tmp_path / "rho_order_1.npy").exists()
     assert (tmp_path / "rho_order_2.npy").exists()
+    assert (tmp_path / "rho_order_0.dat").exists()
+    assert (tmp_path / "rho_order_1.dat").exists()
+    assert (tmp_path / "rho_order_2.dat").exists()
+
+    dat_lines = (tmp_path / "rho_order_1.dat").read_text(encoding="ascii").splitlines()
+    assert dat_lines[0].startswith("# domain=time order=1")
+    assert "real imag" in dat_lines[2]
+
+
+def test_response_population_heatmap_data_and_plot(tmp_path: Path) -> None:
+    cmd, _ = build_cmd_stack(max_order=3)
+    rho_orders = cmd.solve_time_domain()
+    response_data = ResponseData(cmd)
+    data = response_data.population_heatmap_data(
+        orders=(0, 1, 2, 3),
+        k_aggregation="mean",
+        rho_orders=rho_orders,
+    )
+
+    assert data["population_map"].shape == (2, 11)
+    assert data["population_traces"].shape == (11, 2)
+    assert data["population_frames"].shape == (11, 2, 1)
+    assert data["orders"] == (0, 1, 2, 3)
+    assert np.all(np.isfinite(data["population_map"]))
+
+    if "matplotlib" not in sys.modules and importlib.util.find_spec("matplotlib") is None:
+        return
+
+    output_path = ResponseGraphics.plot_population_heatmap(
+        data,
+        tmp_path / "population_heatmap.png",
+    )
+    assert output_path.exists()
+    assert output_path.stat().st_size > 0
+
+
+def test_response_population_kxky_animation_data_and_plot(tmp_path: Path) -> None:
+    cmd, _ = build_cmd_stack(
+        max_order=1,
+        kgrid=KGrid(
+            kx_values=np.array([-0.10, 0.0, 0.10]),
+            ky_values=np.array([-0.10, 0.10]),
+            kz_values=np.array([0.0]),
+            dimension=2,
+        ),
+    )
+    rho_orders = cmd.solve_time_domain()
+    response_data = ResponseData(cmd)
+    data = response_data.population_kxky_animation_data(
+        orders=(0, 1),
+        rho_orders=rho_orders,
+    )
+
+    assert data["population_frames"].shape == (11, 2, 2, 3)
+    assert np.all(np.isfinite(data["population_frames"]))
+
+    if "matplotlib" not in sys.modules and importlib.util.find_spec("matplotlib") is None:
+        return
+
+    from matplotlib import animation
+
+    if not animation.writers.is_available("pillow"):
+        return
+
+    output_path = ResponseGraphics.animate_population_kxky_maps(
+        data,
+        tmp_path / "population_kx_ky.gif",
+        fps=8,
+        frame_stride=2,
+    )
+    assert output_path.exists()
+    assert output_path.stat().st_size > 0
+
+
+def test_cmd_intraband_gradient_source_is_connected() -> None:
+    cmd, _ = build_cmd_stack(
+        max_order=1,
+        include_intraband=True,
+        include_interband=False,
+        kgrid=KGrid(
+            kx_values=np.array([-0.10, 0.0, 0.10]),
+            ky_values=np.array([0.0]),
+            kz_values=np.array([0.0]),
+            dimension=2,
+        ),
+    )
+
+    rho_orders = cmd.solve_time_domain()
+
+    assert rho_orders[1].shape == (3, 11, 2, 2)
+    assert np.max(np.abs(rho_orders[1])) > 0.0
+
+
+def test_cmd_velocity_gauge_is_rejected_for_recursive_solver() -> None:
+    cmd, _ = build_cmd_stack(gauge="velocity")
+
+    try:
+        cmd.solve_time_domain()
+    except NotImplementedError as exc:
+        assert "length gauge" in str(exc)
+    else:
+        raise AssertionError("CMD should reject velocity gauge for the recursive solver.")
 
 
 def test_xtp_basic_observables_run_with_cmd_output() -> None:

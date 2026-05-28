@@ -104,6 +104,19 @@ def test_hamiltonian_construction_and_summary() -> None:
     assert np.isclose(summary["dk_derivative"], 1.0e-5)
 
 
+def test_hamiltonian_infers_real_space_lengths_and_reciprocal_box() -> None:
+    hamiltonian = build_two_band_hamiltonian()
+
+    lengths = hamiltonian.real_space_axis_lengths()
+    reciprocal_bounds = np.asarray(hamiltonian.reciprocal_box_bounds(), dtype=float)
+
+    assert lengths == (1.0, 1.0)
+    np.testing.assert_allclose(
+        reciprocal_bounds,
+        np.array([[-np.pi, np.pi], [-np.pi, np.pi]], dtype=float),
+    )
+
+
 def test_hamiltonian_constructor_validates_core_inputs() -> None:
     with pytest.raises(ValueError, match="basis_size"):
         build_two_band_hamiltonian(basis_size=0)

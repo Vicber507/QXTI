@@ -189,6 +189,15 @@ def test_laser_shapes_and_summary() -> None:
     assert summary["intensity"] > 0.0
 
 
+def test_laser_temporal_bounds_are_inferred_in_atomic_units() -> None:
+    laser = build_reference_laser()
+
+    t_min, t_max = laser.temporal_bounds()
+
+    assert np.isclose(t_min, laser.t0 - 4.0 * laser.fwhm)
+    assert np.isclose(t_max, laser.t0 + 4.0 * laser.fwhm)
+
+
 def test_linear_polarization_orientation_from_angles() -> None:
     linear_x = Laser(
         omega=1.0,

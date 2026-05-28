@@ -13,7 +13,7 @@ from qxti.core import QXTISimulation
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run QXTI intrinsic Hamiltonian plots from an inputParams.cfg file."
+        description="Run QXTI physics calculations from an inputParams.cfg file and save reusable data products only."
     )
     parser.add_argument(
         "config",
@@ -35,7 +35,7 @@ def main() -> int:
         print(f"No outputs were generated for {config_path}.")
         return 0
 
-    print(f"Generated outputs from {config_path}:")
+    print(f"Generated data outputs from {config_path}:")
     for name, path in outputs.items():
         print(f"  {name}: {path}")
     return 0

@@ -321,6 +321,20 @@ def test_total_intensity_is_sum_of_individual_intensities() -> None:
     assert np.isclose(system.total_intensity(), expected)
 
 
+def test_laser_system_temporal_bounds_cover_all_pulses() -> None:
+    system = LaserSystem(
+        [
+            Laser(omega=1.0, E0=1.0, ellipticity=0.0, fwhm=2.0, envelope="gaussian", t0=-1.0),
+            Laser(omega=1.0, E0=1.0, ellipticity=0.0, fwhm=3.0, envelope="gaussian", t0=4.0),
+        ]
+    )
+
+    t_min, t_max = system.temporal_bounds()
+
+    assert np.isclose(t_min, -9.0)
+    assert np.isclose(t_max, 16.0)
+
+
 def test_scalar_time_is_supported() -> None:
     laser_x = build_laser_x()
     laser_y = build_laser_y()

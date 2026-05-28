@@ -363,6 +363,37 @@ class Hamiltonian(ABC):
             "dk_derivative": self.dk_derivative,
         }
 
+    def real_space_axis_lengths(self) -> tuple[float, ...]:
+        """Return effective real-space lattice lengths in atomic units.
+
+        The result is ordered as ``(x,)``, ``(x, y)``, or ``(x, y, z)``
+        depending on ``dimension``. When explicit real-space vectors are
+        available they are preferred; otherwise common lattice-constant keys
+        are used as fallbacks.
+        """
+
+        lengths: list[float] = []
+        for axis in range(self.dimension):
+            vector_length = self._real_space_vector_length(axis)
+            if vector_length is not None:
+                lengths.append(vector_length)
+                continue
+            lengths.append(self._fallback_lattice_constant(axis))
+        return tuple(lengths)
+
+    def reciprocal_box_bounds(self) -> tuple[tuple[float, float], ...]:
+        """Return a square/cubic reciprocal box in atomic units.
+
+        Each active direction uses the interval ``[-pi / a_i, pi / a_i]``,
+        where ``a_i`` is the corresponding real-space lattice length.
+        """
+
+        bounds: list[tuple[float, float]] = []
+        for length in self.real_space_axis_lengths():
+            half_width = float(np.pi / length)
+            bounds.append((-half_width, half_width))
+        return tuple(bounds)
+
     def _matrix_at(self, kx: float, ky: float, kz: float) -> ComplexArray:
         return self.validate_matrix(self.H(float(kx), float(ky), float(kz)))
 
@@ -419,3 +450,44 @@ class Hamiltonian(ABC):
     # Backward-compatible alias for older code paths.
     def _validate_matrix(self, matrix: ArrayLike) -> ComplexArray:
         return self.validate_matrix(matrix)
+
+    def _real_space_vector_length(self, axis: int) -> float | None:
+        vectors = self.lattice.get("real_space_vectors", {})
+        if not isinstance(vectors, dict):
+            return None
+
+        key = f"a{axis + 1}"
+        raw_vector = vectors.get(key)
+        if raw_vector is None:
+            return None
+
+        vector = np.asarray(raw_vector, dtype=float)
+        if vector.ndim != 1 or vector.size == 0:
+            raise ValueError(f"real_space_vectors['{key}'] must be a non-empty 1D vector.")
+
+        length = float(np.linalg.norm(vector))
+        if length <= 0.0:
+            raise ValueError(f"real_space_vectors['{key}'] must have strictly positive norm.")
+        return length
+
+    def _fallback_lattice_constant(self, axis: int) -> float:
+        constants = self.lattice.get("lattice_constants", {})
+        if not isinstance(constants, dict):
+            constants = {}
+
+        per_axis_keys = {
+            0: ("ax", "a", "a1_length", "a_length", "a0"),
+            1: ("ay", "b", "a2_length", "b_length", "a0"),
+            2: ("az", "c", "a3_length", "c_length", "a0"),
+        }
+        for key in per_axis_keys[axis]:
+            if key in constants:
+                length = float(constants[key])
+                if length <= 0.0:
+                    raise ValueError(f"lattice_constants['{key}'] must be strictly positive.")
+                return length
+
+        raise ValueError(
+            "Could not infer the lattice constant for one active direction. "
+            "Define lattice_constants or real_space_vectors in atomic units."
+        )
