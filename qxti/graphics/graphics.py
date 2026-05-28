@@ -22,6 +22,7 @@ from qxti.data import (
     load_rho_orders_from_dat,
     load_rho_orders_from_npy,
 )
+from qxti.graphics.plot_harmonics import HarmonicGraphics, resolve_harmonic_plot_config
 from qxti.graphics.plot_hamiltonian import HamiltonianGraphics
 from qxti.graphics.plot_response import ResponseGraphics, resolve_response_plot_config
 
@@ -195,12 +196,70 @@ def plot_response_graphics_from_saved_data(
     return outputs
 
 
+def plot_harmonic_graphics_from_saved_data(
+    config_path: str | Path,
+    *,
+    plot_config: dict[str, object] | None = None,
+) -> dict[str, Path]:
+    config = QXTIConfig.from_file(config_path)
+    output_dir = Path(config.cmd.output_dir)
+    data_dir = output_dir / "data"
+    resolved_plot_config = resolve_harmonic_plot_config(plot_config)
+    outputs: dict[str, Path] = {}
+
+    dataset_name = None
+    for section_name in ("field_current_time", "current_spectrum"):
+        section_cfg = resolved_plot_config[section_name]
+        if bool(section_cfg["enabled"]):
+            dataset_name = str(section_cfg["dataset_file"])
+            break
+    if dataset_name is None:
+        return outputs
+
+    dataset_path = data_dir / dataset_name
+    if not dataset_path.exists():
+        raise FileNotFoundError(
+            f"Missing harmonic dataset '{dataset_path}'. "
+            "Run `python main.py inputParams.cfg` first."
+        )
+
+    data = load_dataset_npz(dataset_path)
+    print(f"[graphics] plotting harmonic dataset '{dataset_path.name}'.")
+
+    field_current_cfg = resolved_plot_config["field_current_time"]
+    if bool(field_current_cfg["enabled"]):
+        outputs["field_current_time"] = HarmonicGraphics.plot_field_current_time_comparison(
+            np.asarray(data["time_axis"], dtype=float),
+            np.asarray(data["electric_field_time"], dtype=float),
+            np.asarray(data["current_time"], dtype=float),
+            output_dir / str(field_current_cfg["output_file"]),
+            directions=tuple(str(direction) for direction in field_current_cfg["directions"]),
+            include_total=bool(field_current_cfg["include_total"]),
+        )
+
+    current_cfg = resolved_plot_config["current_spectrum"]
+    if bool(current_cfg["enabled"]):
+        outputs["current_spectrum"] = HarmonicGraphics.plot_current_magnitude_spectrum(
+            np.asarray(data["omega_axis"], dtype=float),
+            np.asarray(data["current_spectrum"], dtype=np.complex128),
+            output_dir / str(current_cfg["output_file"]),
+            orders=tuple(int(order) for order in data.get("orders", ())),
+            directions=tuple(str(direction) for direction in current_cfg["directions"]),
+            positive_only=bool(current_cfg["positive_only"]),
+            omega_min=None if current_cfg["omega_min"] is None else float(current_cfg["omega_min"]),
+            omega_max=None if current_cfg["omega_max"] is None else float(current_cfg["omega_max"]),
+            log_scale=bool(current_cfg["log_scale"]),
+        )
+    return outputs
+
+
 def plot_all_graphics_from_saved_data(
     config_path: str | Path,
 ) -> dict[str, Path]:
     outputs: dict[str, Path] = {}
     outputs.update(plot_hamiltonian_graphics_from_saved_data(config_path))
     outputs.update(plot_response_graphics_from_saved_data(config_path))
+    outputs.update(plot_harmonic_graphics_from_saved_data(config_path))
     return outputs
 
 
@@ -216,7 +275,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--family",
-        choices=("all", "hamiltonian", "response"),
+        choices=("all", "hamiltonian", "response", "harmonics"),
         default="all",
         help="Choose which graphics family to generate from saved data.",
     )
@@ -231,6 +290,8 @@ def main() -> int:
         outputs = plot_all_graphics_from_saved_data(args.config)
     elif args.family == "hamiltonian":
         outputs = plot_hamiltonian_graphics_from_saved_data(args.config)
+    elif args.family == "harmonics":
+        outputs = plot_harmonic_graphics_from_saved_data(args.config)
     else:
         outputs = plot_response_graphics_from_saved_data(args.config)
 

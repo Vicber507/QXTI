@@ -1,343 +1,334 @@
-# Librerías estándar
-
 from __future__ import annotations
-from typing import Dict, List, Any
+
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
 
+from qxti.grids import FrequencyGrid, KGrid, TimeGrid
+from qxti.physics import Hamiltonian, OperatorFactory
+
+
 ComplexArray = NDArray[np.complex128]
 RealArray = NDArray[np.float64]
 
-"""
-Atributos de la clase XTP
-"""
-
-from qxti.physics import Hamiltonian
-from qxti.grids import KGrid
-from qxti.grids import TimeGrid
-from qxti.grids import FrequencyGrid
-from qxti.physics import OperatorFactory
-
 
 class XTP:
-    """
-    Responsibility:
-    Computes macroscopic optical response quantities
-    from perturbative density matrix orders.
+    r"""Compute macroscopic response observables from perturbative density matrices.
 
-    Outputs:
-        - Polarization P(t)
-        - Current density J(t)
-        - Optical susceptibility chi(w)
-        - Harmonic spectra
+    The time-domain polarization of order ``s`` is evaluated as
+
+    .. math::
+
+        P_i^{(s)}(t) =
+        \int_{\mathrm{BZ}} d\mathbf{k}\,
+        \sum_{nm} d^i_{mn}(\mathbf{k})\,\rho^{(s)}_{nm}(\mathbf{k}, t),
+
+    where the Brillouin-zone integral is approximated on the rectangular
+    reciprocal-space box associated with the Hamiltonian lattice. When the
+    :class:`~qxti.grids.KGrid` is generated from
+    :meth:`Hamiltonian.reciprocal_box_bounds`, this corresponds to square/cubic
+    boxes ``[-pi / a_i, pi / a_i]`` in atomic units.
     """
+
+    _DIRECTION_TO_AXIS = {"x": 0, "y": 1, "z": 2}
 
     def __init__(
         self,
         hamiltonian: Hamiltonian,
-        rho_orders: Dict[int, ComplexArray],
+        rho_orders: dict[int, ComplexArray],
         kgrid: KGrid,
         timegrid: TimeGrid,
         frequencygrid: FrequencyGrid,
         operator_factory: OperatorFactory,
-        directions: List[str],
-        orders: List[int]
-    ):
+        directions: list[str],
+        orders: list[int],
+    ) -> None:
+        self.hamiltonian = hamiltonian
+        self.rho_orders = {int(order): np.asarray(tensor, dtype=np.complex128) for order, tensor in rho_orders.items()}
+        self.kgrid = kgrid
+        self.timegrid = timegrid
+        self.frequencygrid = frequencygrid
+        self.operator_factory = operator_factory
+        self.directions = [self._normalize_direction(direction) for direction in directions]
+        self.orders = sorted({int(order) for order in orders})
+        if not self.orders:
+            raise ValueError("orders must contain at least one perturbative order.")
+        self._validate_rho_orders()
 
-        # --- Attributes ---
+    def polarization(self, order: int) -> RealArray:
+        """Return the macroscopic polarization :math:`P^{(s)}(t)` for one order."""
 
-        self.hamiltonian: Hamiltonian = hamiltonian
+        rho_tensor = self._rho_tensor(order)
+        nk = self.kgrid.total_points
+        nt = rho_tensor.shape[1]
+        polarization = np.zeros((nt, 3), dtype=np.complex128)
+        k_points = self.kgrid.points()
 
-        self.rho_orders: Dict[int, ComplexArray] = rho_orders
+        for direction in self.directions:
+            axis = self._direction_axis(direction)
+            expectation = np.zeros((nk, nt), dtype=np.complex128)
 
-        self.kgrid: KGrid = kgrid
-
-        self.timegrid: TimeGrid = timegrid
-
-        self.frequencygrid: FrequencyGrid = frequencygrid
-
-        self.operator_factory: OperatorFactory = operator_factory
-
-        self.directions: List[str] = directions
-
-        self.orders: List[int] = orders
-
-    # =========================================================
-    # Polarization
-    # =========================================================
-
-    def polarization(
-        self,
-        order: int
-    ) -> RealArray:
-        """
-        Computes the macroscopic polarization.
-
-        Input:
-            order: int
-
-        Output:
-            ndarray[Nt, 3]
-
-        Polarization is computed from:
-
-            P(t) = Tr[rho * r]
-        """
-
-        rho_tensor = self.rho_orders[order]
-
-        Nk = rho_tensor.shape[0]
-        Nt = rho_tensor.shape[1]
-
-        polarization = np.zeros(
-            (Nt, 3),
-            dtype=np.float64
-        )
-
-        k_points = self.kgrid.get_all_points()
-
-        # Loop over reciprocal-space points
-        for ik, k in enumerate(k_points):
-
-            kx, ky, kz = k
-
-            # Loop over Cartesian directions
-            for idir, direction in enumerate(
-                self.directions
-            ):
-
-                # Position operator
-                r_op = (
-                    self.operator_factory.position_operator(
-                        kx,
-                        ky,
-                        kz,
-                        direction
-                    )
+            for ik, (kx, ky, kz) in enumerate(k_points):
+                dipole = self.operator_factory.dipole(direction, float(kx), float(ky), float(kz))
+                expectation[ik] = np.einsum(
+                    "mn,tnm->t",
+                    dipole,
+                    rho_tensor[ik],
+                    optimize=True,
                 )
 
-                # Loop over time
-                for it in range(Nt):
+            polarization[:, axis] = self._integrate_over_brillouin_zone(expectation)
 
-                    rho_t = rho_tensor[ik, it]
+        return self._coerce_real_matrix(polarization, name=f"polarization(order={order})")
 
-                    # Expectation value:
-                    # Tr[rho * r]
-                    valor = np.trace(
-                        rho_t @ r_op
-                    )
+    def current(self, order: int, direction: str) -> RealArray:
+        """Return the macroscopic current component for one order and direction."""
 
-                    polarization[it, idir] += (
-                        np.real(valor)
-                    )
+        rho_tensor = self._rho_tensor(order)
+        direction = self._normalize_direction(direction)
+        nk = self.kgrid.total_points
+        nt = rho_tensor.shape[1]
+        expectation = np.zeros((nk, nt), dtype=np.complex128)
+        k_points = self.kgrid.points()
 
-        # Normalize by number of k-points
-        polarization /= Nk
-
-        return polarization
-
-    # =========================================================
-    # Current Density
-    # =========================================================
-
-    def current(
-        self,
-        order: int,
-        direction: str
-    ) -> RealArray:
-        """
-        Computes the macroscopic current density.
-
-        Input:
-            order: int
-            direction: str
-
-        Output:
-            ndarray[Nt]
-
-        Current is computed from:
-
-            J(t) = Tr[rho * v]
-        """
-
-        rho_tensor = self.rho_orders[order]
-
-        Nk = rho_tensor.shape[0]
-        Nt = rho_tensor.shape[1]
-
-        current = np.zeros(
-            Nt,
-            dtype=np.float64
-        )
-
-        k_points = self.kgrid.get_all_points()
-
-        for ik, k in enumerate(k_points):
-
-            kx, ky, kz = k
-
-            # Velocity operator
-            v_op = (
-                self.operator_factory.velocity_operator(
-                    kx,
-                    ky,
-                    kz,
-                    direction
-                )
+        for ik, (kx, ky, kz) in enumerate(k_points):
+            current_operator = self.operator_factory.current(direction, float(kx), float(ky), float(kz))
+            expectation[ik] = np.einsum(
+                "mn,tnm->t",
+                current_operator,
+                rho_tensor[ik],
+                optimize=True,
             )
 
-            for it in range(Nt):
+        integrated = self._integrate_over_brillouin_zone(expectation)
+        return self._coerce_real_vector(
+            integrated,
+            name=f"current(order={order}, direction={direction})",
+        )
 
-                rho_t = rho_tensor[ik, it]
-
-                valor = np.trace(
-                    rho_t @ v_op
-                )
-
-                current[it] += np.real(valor)
-
-        current /= Nk
-
-        return current
-
-    # =========================================================
-    # Susceptibility
-    # =========================================================
-
-    def susceptibility(
-        self,
-        order: int
-    ) -> ComplexArray:
-        """
-        Computes the optical susceptibility.
-
-        Input:
-            order: int
-
-        Output:
-            ndarray
-
-        Applies FFT to the polarization signal.
-        """
+    def susceptibility(self, order: int) -> ComplexArray:
+        """Return the FFT of the order-resolved polarization signal."""
 
         polarization = self.polarization(order)
+        return np.asarray(np.fft.fft(polarization, axis=0), dtype=np.complex128)
 
-        chi = np.fft.fft(
-            polarization,
-            axis=0
-        )
+    def polarization_frequency_domain(self, order: int) -> tuple[RealArray, ComplexArray]:
+        """Return ``(omega_axis, P(omega))`` for one perturbative order."""
 
-        return chi
+        polarization = self.polarization(order)
+        return self._fft_time_signal(polarization)
 
-    # =========================================================
-    # Harmonic Spectrum
-    # =========================================================
-
-    def harmonic_spectrum(
+    def current_frequency_domain(
         self,
-        signal: RealArray
-    ) -> ComplexArray:
-        """
-        Computes harmonic spectrum from a
-        time-domain signal.
+        order: int,
+        direction: str,
+    ) -> tuple[RealArray, ComplexArray]:
+        """Return ``(omega_axis, J(omega))`` for one order and one direction."""
 
-        Input:
-            signal: ndarray
+        current = self.current(order, direction)
+        omega_axis, spectrum = self._fft_time_signal(current)
+        return omega_axis, np.asarray(spectrum, dtype=np.complex128)
 
-        Output:
-            ndarray
-        """
+    def harmonic_spectrum(self, signal: RealArray | ComplexArray) -> ComplexArray:
+        """Return the FFT of one time-domain signal."""
 
-        spectrum = np.fft.fft(signal)
-
-        return spectrum
-
-    # =========================================================
-    # Total Polarization
-    # =========================================================
+        return np.asarray(np.fft.fft(np.asarray(signal), axis=0), dtype=np.complex128)
 
     def total_polarization(self) -> RealArray:
-        """
-        Computes total polarization from all
-        perturbative orders.
+        """Return the sum of the polarization over the configured orders."""
 
-        Output:
-            ndarray[Nt, 3]
-        """
-
-        Nt = len(self.timegrid)
-
-        total_P = np.zeros(
-            (Nt, 3),
-            dtype=np.float64
-        )
-
+        nt = len(self.timegrid)
+        total = np.zeros((nt, 3), dtype=np.float64)
         for order in self.orders:
-
-            total_P += self.polarization(order)
-
-        return total_P
-
-    # =========================================================
-    # Total Current
-    # =========================================================
+            total += self.polarization(order)
+        return total
 
     def total_current(self) -> RealArray:
-        """
-        Computes total current density.
+        """Return the sum of current contributions over orders and directions."""
 
-        Output:
-            ndarray[Nt, 3]
-        """
-
-        Nt = len(self.timegrid)
-
-        total_J = np.zeros(
-            (Nt, 3),
-            dtype=np.float64
-        )
-
-        for idir, direction in enumerate(
-            self.directions
-        ):
-
+        nt = len(self.timegrid)
+        total = np.zeros((nt, 3), dtype=np.float64)
+        for direction in self.directions:
+            axis = self._direction_axis(direction)
             for order in self.orders:
+                total[:, axis] += self.current(order, direction)
+        return total
 
-                total_J[:, idir] += self.current(
-                    order,
-                    direction
-                )
+    def total_current_frequency_domain(self) -> tuple[RealArray, ComplexArray]:
+        """Return ``(omega_axis, J_total(omega))`` for all configured directions."""
 
-        return total_J
+        return self._fft_time_signal(self.total_current())
 
-    # =========================================================
-    # Compute All Observables
-    # =========================================================
+    def compute_all(self) -> dict[str, Any]:
+        """Return all observables currently implemented by XTP."""
 
-    def compute_all(self) -> Dict[str, Any]:
-        """
-        Computes all optical response quantities.
-
-        Output:
-            dict[str, object]
-        """
-
-        resultados = {
-
-            "polarization":
-                self.total_polarization(),
-
-            "current":
-                self.total_current(),
-
-            "susceptibility": {
-
-                orden: self.susceptibility(orden)
-
-                for orden in self.orders
-            }
-
+        omega_axis, current_spectrum = self.total_current_frequency_domain()
+        return {
+            "polarization": self.total_polarization(),
+            "current": self.total_current(),
+            "omega_axis": omega_axis,
+            "current_spectrum": current_spectrum,
+            "susceptibility": {order: self.susceptibility(order) for order in self.orders},
         }
 
-        return resultados
+    def brillouin_zone_bounds(self) -> tuple[tuple[float, float], ...]:
+        """Return the rectangular reciprocal box used for BZ integrations."""
+
+        try:
+            return tuple(self.hamiltonian.reciprocal_box_bounds())
+        except ValueError:
+            arrays = (
+                np.asarray(self.kgrid.kx_values, dtype=float),
+                np.asarray(self.kgrid.ky_values, dtype=float),
+                np.asarray(self.kgrid.kz_values, dtype=float),
+            )
+            bounds: list[tuple[float, float]] = []
+            for axis in range(self.kgrid.dimension):
+                values = arrays[axis]
+                bounds.append((float(values[0]), float(values[-1])))
+            return tuple(bounds)
+
+    def _integrate_over_brillouin_zone(self, point_values: ComplexArray) -> ComplexArray:
+        values = np.asarray(point_values, dtype=np.complex128)
+        if values.ndim < 1:
+            raise ValueError("point_values must have at least one dimension.")
+        if values.shape[0] != self.kgrid.total_points:
+            raise ValueError(
+                "point_values first dimension must match the number of k-points in the grid."
+            )
+
+        grid = values.reshape(*self.kgrid.shape, *values.shape[1:])
+        bounds = self.brillouin_zone_bounds()
+        result = grid
+
+        result = self._integrate_axis(
+            result,
+            axis=2,
+            coordinates=np.asarray(self.kgrid.kz_values, dtype=float),
+            bounds=bounds[2] if self.kgrid.dimension >= 3 else (0.0, 0.0),
+            active=self.kgrid.dimension >= 3,
+        )
+        result = self._integrate_axis(
+            result,
+            axis=1,
+            coordinates=np.asarray(self.kgrid.ky_values, dtype=float),
+            bounds=bounds[1] if self.kgrid.dimension >= 2 else (0.0, 0.0),
+            active=self.kgrid.dimension >= 2,
+        )
+        result = self._integrate_axis(
+            result,
+            axis=0,
+            coordinates=np.asarray(self.kgrid.kx_values, dtype=float),
+            bounds=bounds[0],
+            active=True,
+        )
+        return np.asarray(result, dtype=np.complex128)
+
+    @staticmethod
+    def _integrate_axis(
+        values: ComplexArray,
+        *,
+        axis: int,
+        coordinates: NDArray[np.float64],
+        bounds: tuple[float, float],
+        active: bool,
+    ) -> ComplexArray:
+        if not active:
+            return np.asarray(np.take(values, indices=0, axis=axis), dtype=np.complex128)
+
+        if coordinates.size > 1:
+            return np.asarray(np.trapezoid(values, x=coordinates, axis=axis), dtype=np.complex128)
+
+        width = float(bounds[1] - bounds[0])
+        collapsed = np.asarray(np.take(values, indices=0, axis=axis), dtype=np.complex128)
+        return width * collapsed
+
+    def _rho_tensor(self, order: int) -> ComplexArray:
+        try:
+            return self.rho_orders[int(order)]
+        except KeyError as exc:
+            raise ValueError(f"rho_orders does not contain order {order}.") from exc
+
+    def _fft_time_signal(
+        self,
+        signal: RealArray | ComplexArray,
+    ) -> tuple[RealArray, ComplexArray]:
+        values = np.asarray(signal, dtype=np.complex128)
+        if values.ndim not in {1, 2}:
+            raise ValueError("signal must be a 1D or 2D time-domain array.")
+        if values.shape[0] != len(self.timegrid):
+            raise ValueError(
+                f"signal first dimension must match Nt={len(self.timegrid)}."
+            )
+
+        window = np.asarray(
+            self.timegrid.apply_window(np.ones(len(self.timegrid), dtype=float)),
+            dtype=np.float64,
+        )
+        reshape = (len(window),) + (1,) * (values.ndim - 1)
+        weighted = values * window.reshape(reshape)
+
+        nfft = len(self.timegrid)
+        if self.timegrid.zero_padding:
+            nfft *= self.timegrid.padding_factor
+
+        spectrum = self.timegrid.dt * np.fft.fft(weighted, n=nfft, axis=0)
+        omega_axis = np.asarray(self.timegrid.frequency_axis(), dtype=np.float64)
+        return omega_axis, np.asarray(spectrum, dtype=np.complex128)
+
+    def _validate_rho_orders(self) -> None:
+        reference_shape = None
+        expected_matrix_shape = (self.hamiltonian.basis_size, self.hamiltonian.basis_size)
+
+        for order, tensor in self.rho_orders.items():
+            if tensor.ndim != 4:
+                raise ValueError(
+                    f"rho_orders[{order}] must have shape (Nk, Nt, Nb, Nb); got {tensor.shape}."
+                )
+            if tensor.shape[0] != self.kgrid.total_points:
+                raise ValueError(
+                    f"rho_orders[{order}] has Nk={tensor.shape[0]}, expected {self.kgrid.total_points}."
+                )
+            if tensor.shape[1] != len(self.timegrid):
+                raise ValueError(
+                    f"rho_orders[{order}] has Nt={tensor.shape[1]}, expected {len(self.timegrid)}."
+                )
+            if tensor.shape[2:] != expected_matrix_shape:
+                raise ValueError(
+                    f"rho_orders[{order}] has matrix shape {tensor.shape[2:]}, "
+                    f"expected {expected_matrix_shape}."
+                )
+            if reference_shape is None:
+                reference_shape = tensor.shape
+            elif tensor.shape != reference_shape:
+                raise ValueError("All rho_orders tensors must share the same shape.")
+
+    def _direction_axis(self, direction: str) -> int:
+        axis = self._DIRECTION_TO_AXIS[self._normalize_direction(direction)]
+        if axis >= self.hamiltonian.dimension:
+            raise ValueError(
+                f"Direction '{direction}' is outside Hamiltonian dimension {self.hamiltonian.dimension}."
+            )
+        return axis
+
+    @classmethod
+    def _normalize_direction(cls, direction: str) -> str:
+        key = direction.strip().lower()
+        if key not in cls._DIRECTION_TO_AXIS:
+            raise ValueError("direction must be one of 'x', 'y', or 'z'.")
+        return key
+
+    @staticmethod
+    def _coerce_real_vector(values: ComplexArray, *, name: str, atol: float = 1.0e-9) -> RealArray:
+        imag_max = float(np.max(np.abs(np.imag(values))))
+        if imag_max > atol:
+            raise ValueError(f"{name} contains a non-negligible imaginary part ({imag_max:.3e}).")
+        return np.asarray(np.real(values), dtype=np.float64)
+
+    @classmethod
+    def _coerce_real_matrix(cls, values: ComplexArray, *, name: str, atol: float = 1.0e-9) -> RealArray:
+        imag_max = float(np.max(np.abs(np.imag(values))))
+        if imag_max > atol:
+            raise ValueError(f"{name} contains a non-negligible imaginary part ({imag_max:.3e}).")
+        return np.asarray(np.real(values), dtype=np.float64)

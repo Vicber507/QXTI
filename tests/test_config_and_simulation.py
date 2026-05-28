@@ -13,6 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from qxti.core import QXTIConfig, QXTISimulation
+from qxti.data import load_dataset_npz
 
 
 def write_model_file(tmp_path: Path) -> Path:
@@ -63,6 +64,7 @@ def write_model_file(tmp_path: Path) -> Path:
 
 
 def write_config_file(tmp_path: Path, model_path: Path) -> Path:
+    num_cycles = 2.0 * 0.8 / (2.0 * np.pi)
     config_path = tmp_path / "inputParams.cfg"
     config_path.write_text(
         dedent(
@@ -102,12 +104,16 @@ def write_config_file(tmp_path: Path, model_path: Path) -> Path:
             [laser]
             omega = 0.8
             E0 = 0.05
-            ellipticity = 0.0
-            fwhm = 2.0
-            envelope = gaussian
+            ellip = 0.0
+            ncycles = {num_cycles}
+            envname = gauss
+            cep = 0.0
             t0 = 2.0
-            theta = 1.5707963267948966
-            phi = 0.0
+            phix = 0.0
+            thetaz = 0.0
+            phiz = 0.0
+            blaser = 0.5
+            alaser = 0.5
 
             [cmd]
             enabled = true
@@ -124,8 +130,8 @@ def write_config_file(tmp_path: Path, model_path: Path) -> Path:
             include_interband = true
             include_dephasing = true
             solver = rkf45
-            solver_tolerance = 1.0e-6
-            solver_max_iterations = 10000
+            solver_tolerance = 1.0e-4
+            solver_max_iterations = 100000
 
             [cmd_plots]
             enabled = true
@@ -162,6 +168,12 @@ def test_qxti_config_parses_hamiltonian_and_plot_sections(tmp_path: Path) -> Non
     assert np.isclose(config.timegrid.dt, 0.2)
     assert config.timegrid.Nt is None
     assert np.isclose(config.laser.omega, 0.8)
+    assert np.isclose(config.laser.ncycles, 2.0 * 0.8 / (2.0 * np.pi))
+    assert np.isclose(config.laser.phix, 0.0)
+    assert np.isclose(config.laser.thetaz, 0.0)
+    assert np.isclose(config.laser.phiz, 0.0)
+    assert np.isclose(config.laser.blaser, 0.5)
+    assert np.isclose(config.laser.alaser, 0.5)
     assert config.cmd.enabled is True
     assert config.cmd.max_order == 1
     assert config.cmd.solver == "rkf45"
@@ -191,6 +203,20 @@ def test_simulation_builds_custom_hamiltonian_from_config(tmp_path: Path) -> Non
     )
 
 
+def test_simulation_builds_rkf45_with_full_window_default_hmax(tmp_path: Path) -> None:
+    model_path = write_model_file(tmp_path)
+    config_path = write_config_file(tmp_path, model_path)
+
+    simulation = QXTISimulation.from_file(config_path)
+    hamiltonian = simulation.build_hamiltonian()
+    cmd = simulation.build_cmd(hamiltonian)
+
+    assert np.isclose(
+        cmd.solver.h_max,  # type: ignore[attr-defined]
+        cmd.timegrid.t_max - cmd.timegrid.t_min,
+    )
+
+
 def test_simulation_generates_requested_outputs(tmp_path: Path) -> None:
     model_path = write_model_file(tmp_path)
     config_path = write_config_file(tmp_path, model_path)
@@ -209,10 +235,13 @@ def test_simulation_generates_requested_outputs(tmp_path: Path) -> None:
         "rho_order_1_dat",
         "rho_population_kxky_data",
         "rho_coherence_kxky_data",
+        "xtp_current_spectrum_data",
     }
     for path in outputs.values():
         assert path.exists()
         assert path.stat().st_size > 0
+    harmonic_dataset = load_dataset_npz(outputs["xtp_current_spectrum_data"])
+    assert np.asarray(harmonic_dataset["electric_field_time"], dtype=float).shape[1] == 3
 
 
 def test_graphics_runners_generate_outputs_from_config(tmp_path: Path) -> None:
@@ -220,6 +249,7 @@ def test_graphics_runners_generate_outputs_from_config(tmp_path: Path) -> None:
         pytest.skip("matplotlib is not available in this environment.")
 
     from qxti.graphics.graphics import (
+        plot_harmonic_graphics_from_saved_data,
         plot_hamiltonian_graphics_from_saved_data,
         plot_response_graphics_from_saved_data,
     )
@@ -231,12 +261,15 @@ def test_graphics_runners_generate_outputs_from_config(tmp_path: Path) -> None:
 
     hamiltonian_outputs = plot_hamiltonian_graphics_from_saved_data(config_path)
     response_outputs = plot_response_graphics_from_saved_data(config_path)
+    harmonic_outputs = plot_harmonic_graphics_from_saved_data(config_path)
 
     assert "band_structure_2d" in hamiltonian_outputs
     assert "velocity_magnitude" in hamiltonian_outputs
     assert "rho_population_snapshots" in response_outputs
     assert "rho_coherence_snapshots" in response_outputs
-    for path in (*hamiltonian_outputs.values(), *response_outputs.values()):
+    assert "field_current_time" in harmonic_outputs
+    assert "current_spectrum" in harmonic_outputs
+    for path in (*hamiltonian_outputs.values(), *response_outputs.values(), *harmonic_outputs.values()):
         assert path.exists()
         assert path.stat().st_size > 0
 
