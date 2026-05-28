@@ -65,12 +65,6 @@ class CMD:
 
     # --- Methods / Inputs -> Outputs ---
 
-    # Definición para las distintas distribuciones.
-
-    def 
-
-
-
     def rho_equilibrium(self, k: NDArray[np.float64]) -> ComplexArray:
         """
         Calcula la matriz de densidad en equilibrio térmico usando la estadística 

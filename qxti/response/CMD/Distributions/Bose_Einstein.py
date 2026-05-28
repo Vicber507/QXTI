@@ -1,4 +1,4 @@
-# Bose.py
+# Contain a distribution function for bosons, the Bose-Einstein distribution.
 
 import numpy as np
 
