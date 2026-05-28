@@ -91,7 +91,9 @@ class TimeGrid:
         else:
 
             window = np.ones(len(signal))
-
+        """Estos métodos son para evitar errores debido 
+        al intervalo finito en el que se trabaja
+        lo que puede hacer que no se cumpla f(0) = f(T)"""
         return signal * window
 
     # =====================================================
