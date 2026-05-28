@@ -161,60 +161,6 @@ class CMD:
             
         return d_rho_coherente + d_rho_disipativo
 
-    def _RKF45_core(self, t0: float, tf: float, rho0: ComplexArray, h_inicial: float, k_punto: NDArray[np.float64]) -> Tuple[List[float], List[ComplexArray]]:
-        """
-        Algoritmo Runge-Kutta-Fehlberg acoplado y optimizado para tensores complejos matriciales.
-        Controla dinámicamente el paso del tiempo h evaluando el error de truncamiento local.
-        """
-        t = t0 
-        rho = rho0.astype(np.complex128)
-        
-        t_l = [t]  
-        rho_l = [rho.copy()] 
-        
-        h = h_inicial
-        tol = 1e-6  # Tolerancia cuántica estándar para conservación de fase
-     
-        while t < tf:
-            if t + h > tf:  
-                h = tf - t 
-     
-            ti, rho_i = t, rho
-            
-            # Las 6 evaluaciones obligatorias del método embebido RKF45
-            k1 = h * self._evaluar_derivada(ti, rho_i, k_punto)
-            k2 = h * self._evaluar_derivada(ti + h/4, rho_i + k1/4, k_punto)
-            k3 = h * self._evaluar_derivada(ti + 3*h/8, rho_i + 3*k1/32 + 9*k2/32, k_punto)
-            k4 = h * self._evaluar_derivada(ti + 12*h/13, rho_i + 1932*k1/2197 - 7200*k2/2197 + 7296*k3/2197, k_punto)
-            k5 = h * self._evaluar_derivada(ti + h, rho_i + 439*k1/216 - 8*k2 + 3680*k3/513 - 845*k4/4104, k_punto)
-            k6 = h * self._evaluar_derivada(ti + h/2, rho_i - 8*k1/27 + 2*k2 + 3544*k3/2565 - 1859*k4/4140 - 11*k5/40, k_punto)
-            
-            # Solución aproximada de Orden 5
-            rho5 = rho_i + 16*k1/135 + 6656*k3/12825 + 28561*k4/56430 - 9*k5/50 + 2*k6/55
-     
-            # Estimación del error local absoluto usando Norma de Frobenius
-            matriz_error = k1/360 - 128*k3/4275 - 2197*k4/75240 + k5/50 + k6/55
-            err = np.linalg.norm(matriz_error) 
-     
-            if err == 0: 
-                err = 1e-16 
-     
-            # Si el error está en los rangos permitidos, avanzamos el paso temporal
-            if err < tol:
-                t = t + h
-                # Corrección de estabilidad cuántica: Garantizar la propiedad adjunta (Hermiticidad)
-                rho = (rho5 + rho5.conj().T) / 2.0 
-     
-                t_l.append(t) 
-                rho_l.append(rho.copy()) 
-     
-            # Cálculo adaptativo del siguiente paso h (Algoritmo Fehlberg estándar de orden 4)
-            factor = 0.84 * (tol / err) ** (1 / 4)  
-            factor = min(2.0, max(0.1, factor))  # Evita saltos desproporcionados
-            h = h * factor 
-     
-        return t_l, rho_l
-
     def solve_time_domain(self) -> Dict[int, NDArray[Any]]:
         """
         Propaga de forma global la matriz de densidad sobre toda la grilla espacial KGrid.
@@ -236,7 +182,7 @@ class CMD:
             rho_0 = self.rho_equilibrium(k_actual)
             
             # 2. Correr el integrador RKF45 adaptativo temporal
-            tiempos, matrices_calculadas = self._RKF45_core(t0, tf, rho_0, h_inicial, k_actual)
+            tiempos, matrices_calculadas = self.solver.solve(derivative_function=self._evaluar_derivada, t0=t0,  tf=tf, y0=rho_0,h_initial=h_inicial,k_actual=k_actual)
             
             # Convertimos la evolución de este punto K en un arreglo de numpy
             lista_de_soluciones_completas.append(matrices_calculadas)
