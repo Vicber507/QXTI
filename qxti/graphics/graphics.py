@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 import sys
 
+import numpy as np
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -14,9 +16,14 @@ os.environ.setdefault("MPLCONFIGDIR", "/private/tmp")
 os.environ.setdefault("XDG_CACHE_HOME", "/private/tmp")
 
 from qxti.core import QXTIConfig
-from qxti.data import load_dataset_npz
+from qxti.data import (
+    ResponseData,
+    load_dataset_npz,
+    load_rho_orders_from_dat,
+    load_rho_orders_from_npy,
+)
 from qxti.graphics.plot_hamiltonian import HamiltonianGraphics
-from qxti.graphics.plot_response import ResponseGraphics
+from qxti.graphics.plot_response import ResponseGraphics, resolve_response_plot_config
 
 
 DEFAULT_HAMILTONIAN_PLOTS = (
@@ -84,40 +91,106 @@ def plot_hamiltonian_graphics_from_saved_data(
 
 def plot_response_graphics_from_saved_data(
     config_path: str | Path,
+    *,
+    plot_config: dict[str, object] | None = None,
 ) -> dict[str, Path]:
     config = QXTIConfig.from_file(config_path)
     output_dir = Path(config.cmd.output_dir)
-    data_dir = output_dir / "data"
+    resolved_plot_config = resolve_response_plot_config(plot_config)
     outputs: dict[str, Path] = {}
 
-    heatmap_data_path = data_dir / "population_time_heatmap_all_orders.npz"
-    if not heatmap_data_path.exists():
+    rho_orders, time_axis, k_points, kx_values, ky_values, kz_values = _load_response_fallback_data(
+        config_path
+    )
+    if not rho_orders:
         raise FileNotFoundError(
-            f"Missing response dataset '{heatmap_data_path}'. "
+            "Missing response datasets and no saved rho_order_*.npy/.dat files were found. "
             "Run `python main.py inputParams.cfg` first."
         )
+    print("[graphics] plotting response graphics from saved rho_order tensors.")
 
-    heatmap_data = load_dataset_npz(heatmap_data_path)
-    print(f"[graphics] plotting response dataset '{heatmap_data_path.name}'.")
-    outputs["rho_population_heatmap"] = ResponseGraphics.plot_population_heatmap(
-        heatmap_data,
-        output_dir / "population_time_heatmap_all_orders.png",
-    )
+    requested_orders = _resolve_requested_orders(resolved_plot_config.get("orders"))
+    population_cfg = resolved_plot_config["population"]
+    coherence_cfg = resolved_plot_config["coherence"]
 
-    kmap_data_path = data_dir / "population_kx_ky_per_band.npz"
-    if kmap_data_path.exists():
-        kmap_data = load_dataset_npz(kmap_data_path)
+    try:
+        population_kmap_data = ResponseData.population_kxky_animation_data_from_saved_rho(
+            rho_orders,
+            time_axis=time_axis,
+            kx_values=kx_values,
+            ky_values=ky_values,
+            kz_values=kz_values,
+            orders=requested_orders,
+        )
+    except ValueError as exc:
+        population_kmap_data = None
+        print(f"[graphics] skipped population kx-ky data: {exc}")
+
+    try:
+        coherence_kmap_data = ResponseData.coherence_kxky_animation_data_from_saved_rho(
+            rho_orders,
+            time_axis=time_axis,
+            kx_values=kx_values,
+            ky_values=ky_values,
+            kz_values=kz_values,
+            orders=requested_orders,
+            component=str(coherence_cfg["component"]),
+        )
+    except ValueError as exc:
+        coherence_kmap_data = None
+        print(f"[graphics] skipped coherence kx-ky data: {exc}")
+
+    if population_kmap_data is not None and bool(population_cfg["video"]["enabled"]):
         try:
-            outputs["rho_population_kxky_animation"] = ResponseGraphics.animate_population_kxky_maps(
-                kmap_data,
-                output_dir / "population_kx_ky_per_band.gif",
-                fps=10,
-                frame_stride=2,
+            outputs["rho_population_kxky_video"] = ResponseGraphics.animate_population_kxky_maps(
+                population_kmap_data,
+                output_dir / str(population_cfg["video"]["output_file"]),
+                fps=int(population_cfg["video"]["fps"]),
+                frame_stride=int(population_cfg["video"]["frame_stride"]),
+                cmap=str(population_cfg["video"]["cmap"]),
             )
         except (RuntimeError, ValueError) as exc:
-            print(f"[graphics] skipped kx-ky animation: {exc}")
-    else:
-        print(f"[graphics] skipped kx-ky animation because '{kmap_data_path.name}' is missing.")
+            print(f"[graphics] skipped population video: {exc}")
+
+    if coherence_kmap_data is not None and bool(coherence_cfg["video"]["enabled"]):
+        try:
+            outputs["rho_coherence_kxky_video"] = ResponseGraphics.animate_coherence_kxky_maps(
+                coherence_kmap_data,
+                output_dir / str(coherence_cfg["video"]["output_file"]),
+                fps=int(coherence_cfg["video"]["fps"]),
+                frame_stride=int(coherence_cfg["video"]["frame_stride"]),
+                cmap=str(coherence_cfg["video"]["cmap"]),
+            )
+        except (RuntimeError, ValueError) as exc:
+            print(f"[graphics] skipped coherence video: {exc}")
+
+    if population_kmap_data is not None and bool(population_cfg["snapshots"]["enabled"]):
+        population_snapshot_indices = ResponseGraphics.resolve_snapshot_indices(
+            np.asarray(population_kmap_data["time_axis"], dtype=float),
+            num_snapshots=int(population_cfg["snapshots"]["num_snapshots"]),
+            snapshot_times=list(population_cfg["snapshots"]["snapshot_times"]),
+            snapshot_indices=list(population_cfg["snapshots"]["snapshot_indices"]),
+        )
+        outputs["rho_population_snapshots"] = ResponseGraphics.plot_population_snapshots(
+            population_kmap_data,
+            output_dir / str(population_cfg["snapshots"]["output_file"]),
+            snapshot_indices=population_snapshot_indices,
+            cmap=str(population_cfg["snapshots"]["cmap"]),
+        )
+
+    if coherence_kmap_data is not None and bool(coherence_cfg["snapshots"]["enabled"]):
+        coherence_snapshot_indices = ResponseGraphics.resolve_snapshot_indices(
+            np.asarray(coherence_kmap_data["time_axis"], dtype=float),
+            num_snapshots=int(coherence_cfg["snapshots"]["num_snapshots"]),
+            snapshot_times=list(coherence_cfg["snapshots"]["snapshot_times"]),
+            snapshot_indices=list(coherence_cfg["snapshots"]["snapshot_indices"]),
+        )
+        outputs["rho_coherence_snapshots"] = ResponseGraphics.plot_coherence_snapshots(
+            coherence_kmap_data,
+            output_dir / str(coherence_cfg["snapshots"]["output_file"]),
+            snapshot_indices=coherence_snapshot_indices,
+            cmap=str(coherence_cfg["snapshots"]["cmap"]),
+        )
 
     return outputs
 
@@ -187,6 +260,58 @@ def _normalize_plot_name(plot_name: str) -> str:
         "modulo_de_velocidad": "velocity_magnitude",
     }
     return aliases.get(key, key)
+
+
+def _load_response_fallback_data(
+    config_path: str | Path,
+) -> tuple[dict[int, object], object, object, object, object, object]:
+    config = QXTIConfig.from_file(config_path)
+    output_dir = Path(config.cmd.output_dir)
+
+    rho_orders = load_rho_orders_from_npy(output_dir)
+    if rho_orders:
+        from qxti.core import QXTISimulation
+
+        simulation = QXTISimulation.from_file(config_path)
+        hamiltonian = simulation.build_hamiltonian()
+        cmd = simulation.build_cmd(hamiltonian)
+        return (
+            rho_orders,
+            np.asarray(cmd.timegrid.generate(), dtype=float),
+            np.asarray(cmd.kgrid.points(), dtype=float),
+            np.asarray(cmd.kgrid.kx_values, dtype=float),
+            np.asarray(cmd.kgrid.ky_values, dtype=float),
+            np.asarray(cmd.kgrid.kz_values, dtype=float),
+        )
+
+    rho_orders_dat, k_points, time_axis = load_rho_orders_from_dat(output_dir)
+    if rho_orders_dat:
+        kx_values = np.unique(k_points[:, 0])
+        ky_values = np.unique(k_points[:, 1])
+        kz_values = np.unique(k_points[:, 2])
+        return (
+            rho_orders_dat,
+            time_axis,
+            k_points,
+            kx_values,
+            ky_values,
+            kz_values,
+        )
+
+    empty = []
+    return ({}, empty, empty, empty, empty, empty)
+
+
+def _resolve_requested_orders(config_value: object) -> tuple[int, ...] | None:
+    if config_value is None:
+        return None
+    if isinstance(config_value, str) and config_value.strip().lower() in {"", "all", "none"}:
+        return None
+    if isinstance(config_value, int):
+        return (int(config_value),)
+    if isinstance(config_value, (list, tuple)):
+        return tuple(int(item) for item in config_value)
+    raise ValueError("response plot config 'orders' must be 'all' or a list/tuple of ints.")
 
 
 if __name__ == "__main__":

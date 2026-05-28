@@ -3,11 +3,16 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import math
+import os
 from pathlib import Path
 import sys
 from typing import Any
 
 import numpy as np
+
+
+os.environ.setdefault("MPLCONFIGDIR", "/private/tmp")
+os.environ.setdefault("XDG_CACHE_HOME", "/private/tmp")
 
 
 HAS_MATPLOTLIB = importlib.util.find_spec("matplotlib") is not None

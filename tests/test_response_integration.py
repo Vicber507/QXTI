@@ -227,6 +227,22 @@ def test_response_population_heatmap_data_and_plot(tmp_path: Path) -> None:
     assert output_path.exists()
     assert output_path.stat().st_size > 0
 
+    coherence_data = response_data.coherence_heatmap_data(
+        orders=(0, 1, 2, 3),
+        k_aggregation="mean",
+        component="magnitude",
+        rho_orders=rho_orders,
+    )
+    assert coherence_data["coherence_map"].shape == (1, 11)
+    assert coherence_data["pair_labels"] == ["0-1"]
+
+    coherence_output_path = ResponseGraphics.plot_coherence_heatmap(
+        coherence_data,
+        tmp_path / "coherence_heatmap.png",
+    )
+    assert coherence_output_path.exists()
+    assert coherence_output_path.stat().st_size > 0
+
 
 def test_response_population_kxky_animation_data_and_plot(tmp_path: Path) -> None:
     cmd, _ = build_cmd_stack(
@@ -264,6 +280,25 @@ def test_response_population_kxky_animation_data_and_plot(tmp_path: Path) -> Non
     )
     assert output_path.exists()
     assert output_path.stat().st_size > 0
+
+    coherence_data = response_data.coherence_kxky_animation_data(
+        orders=(0, 1),
+        component="magnitude",
+        rho_orders=rho_orders,
+    )
+    assert coherence_data["coherence_frames"].shape == (11, 1, 2, 3)
+
+    coherence_snapshot_indices = ResponseGraphics.resolve_snapshot_indices(
+        np.asarray(coherence_data["time_axis"], dtype=float),
+        num_snapshots=3,
+    )
+    snapshot_output = ResponseGraphics.plot_coherence_snapshots(
+        coherence_data,
+        tmp_path / "coherence_snapshots.png",
+        snapshot_indices=coherence_snapshot_indices,
+    )
+    assert snapshot_output.exists()
+    assert snapshot_output.stat().st_size > 0
 
 
 def test_cmd_intraband_gradient_source_is_connected() -> None:
