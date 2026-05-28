@@ -156,13 +156,42 @@ class TimeGridConfig:
 class LaserConfig:
     omega: float = 1.0
     E0: float = 0.0
-    phase: float = 0.0
-    ellipticity: float = 0.0
-    fwhm: float = 1.0
-    envelope: str = "gaussian"
+    cep: float = 0.0
+    ellip: float = 0.0
+    ncycles: float = 1.0
+    envname: str = "gauss"
     t0: float = 0.0
-    theta: float = math.pi / 2.0
-    phi: float = 0.0
+    phix: float = 0.0
+    thetaz: float = 0.0
+    phiz: float = 0.0
+    ncycles_clipped: float = 0.0
+    blaser: float = 0.0
+    alaser: float = 0.0
+    pulses: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def phase(self) -> float:
+        return self.cep
+
+    @property
+    def ellipticity(self) -> float:
+        return self.ellip
+
+    @property
+    def num_cycles(self) -> float:
+        return self.ncycles
+
+    @property
+    def envelope(self) -> str:
+        return self.envname
+
+    @property
+    def theta(self) -> float:
+        return self.thetaz
+
+    @property
+    def phi(self) -> float:
+        return self.phiz
 
 
 @dataclass(slots=True)
@@ -360,16 +389,41 @@ class QXTIConfig:
 
     @staticmethod
     def _parse_laser_section(section: configparser.SectionProxy) -> LaserConfig:
+        omega_raw = section.get("omega", fallback=section.get("w0", fallback="1.0")).strip()
+        omega = float(_parse_scalar(omega_raw))
+        num_cycles_raw = section.get("ncycles", fallback=section.get("num_cycles", fallback="")).strip()
+        fwhm_raw = section.get("fwhm", fallback="").strip()
+        if num_cycles_raw:
+            num_cycles = float(_parse_scalar(num_cycles_raw))
+        elif fwhm_raw:
+            fwhm = float(_parse_scalar(fwhm_raw))
+            num_cycles = fwhm * omega / (2.0 * math.pi)
+        else:
+            num_cycles = 1.0
+
+        pulses_raw = section.get("pulses", fallback="").strip()
+        parsed_pulses: list[dict[str, Any]] = []
+        if pulses_raw:
+            pulses_value = _parse_scalar(pulses_raw)
+            if not isinstance(pulses_value, list) or any(not isinstance(item, dict) for item in pulses_value):
+                raise ValueError("[laser] pulses must be a list of dictionaries when provided.")
+            parsed_pulses = [dict(item) for item in pulses_value]
+
         return LaserConfig(
-            omega=section.getfloat("omega", fallback=1.0),
+            omega=omega,
             E0=section.getfloat("E0", fallback=0.0),
-            phase=section.getfloat("phase", fallback=0.0),
-            ellipticity=section.getfloat("ellipticity", fallback=0.0),
-            fwhm=section.getfloat("fwhm", fallback=1.0),
-            envelope=section.get("envelope", fallback="gaussian").strip() or "gaussian",
+            cep=section.getfloat("cep", fallback=section.getfloat("phase", fallback=0.0)),
+            ellip=section.getfloat("ellip", fallback=section.getfloat("ellipticity", fallback=0.0)),
+            ncycles=num_cycles,
+            envname=section.get("envname", fallback=section.get("envelope", fallback="gauss")).strip() or "gauss",
             t0=section.getfloat("t0", fallback=0.0),
-            theta=section.getfloat("theta", fallback=math.pi / 2.0),
-            phi=section.getfloat("phi", fallback=0.0),
+            phix=section.getfloat("phix", fallback=0.0),
+            thetaz=section.getfloat("thetaz", fallback=section.getfloat("theta", fallback=0.0)),
+            phiz=section.getfloat("phiz", fallback=section.getfloat("phi", fallback=0.0)),
+            ncycles_clipped=section.getfloat("ncycles_clipped", fallback=0.0),
+            blaser=section.getfloat("blaser", fallback=0.0),
+            alaser=section.getfloat("alaser", fallback=0.0),
+            pulses=parsed_pulses,
         )
 
     @staticmethod

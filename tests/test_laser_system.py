@@ -29,28 +29,34 @@ else:
 
 # Edit these values when you want to preview a composed laser system by running
 # `python tests/test_laser_system.py`.
+def cycles_for_fwhm(omega: float, fwhm: float) -> float:
+    return fwhm * omega / (2.0 * np.pi)
+
+
 PREVIEW_SYSTEM_LASERS = [
     {
         "omega": 1.0,
         "E0": 1.0,
-        "phase": 0.0,
-        "ellipticity": 1.0,
-        "fwhm": 18.0,
-        "envelope": "gaussian",
+        "cep": 0.0,
+        "ellip": 1.0,
+        "ncycles": cycles_for_fwhm(1.0, 18.0),
+        "envname": "gauss",
         "t0": 0.0,
-        "theta": 0.5 * np.pi,
-        "phi": 0.0,
+        "thetaz": 0.0,
+        "phiz": 0.0,
+        "phix": 0.0,
     },
     {
         "omega": 2.0,
         "E0": 1.0,
-        "phase": 0.0,
-        "ellipticity": -1.0,
-        "fwhm": 18.0,
-        "envelope": "gaussian",
+        "cep": 0.0,
+        "ellip": -1.0,
+        "ncycles": cycles_for_fwhm(2.0, 18.0),
+        "envname": "gauss",
         "t0": 0.0,
-        "theta": 0.5 * np.pi,
-        "phi": 0.0 * np.pi,
+        "thetaz": 0.0,
+        "phiz": 0.0,
+        "phix": 0.0,
     },
 ]
 
@@ -72,11 +78,12 @@ def build_laser_x() -> Laser:
     return Laser(
         omega=1.0,
         E0=1.0,
-        ellipticity=0.0,
-        fwhm=12.0,
-        envelope="constant",
-        theta=0.5 * np.pi,
-        phi=0.0,
+        ellip=0.0,
+        ncycles=cycles_for_fwhm(1.0, 12.0),
+        envname="constant",
+        thetaz=0.0,
+        phiz=0.0,
+        phix=0.0,
     )
 
 
@@ -84,12 +91,13 @@ def build_laser_y() -> Laser:
     return Laser(
         omega=1.0,
         E0=0.5,
-        phase=0.25 * np.pi,
-        ellipticity=0.0,
-        fwhm=12.0,
-        envelope="constant",
-        theta=0.5 * np.pi,
-        phi=0.5 * np.pi,
+        cep=0.25 * np.pi,
+        ellip=0.0,
+        ncycles=cycles_for_fwhm(1.0, 12.0),
+        envname="constant",
+        thetaz=0.0,
+        phiz=0.0,
+        phix=0.5 * np.pi,
     )
 
 
@@ -292,7 +300,7 @@ def test_total_electric_field_matches_sum_of_lasers() -> None:
     system = LaserSystem([laser_x, laser_y])
     t = np.linspace(-2.0, 2.0, 200)
 
-    expected = laser_x.electric_field(t) + laser_y.electric_field(t)
+    expected = laser_x.electric_field(t) + laser_y.electric_field(t) - system.initial_evec
     total = system.electric_field(t)
 
     assert total.shape == (200, 3)
@@ -305,7 +313,7 @@ def test_total_vector_potential_matches_sum_of_lasers() -> None:
     system = LaserSystem([laser_x, laser_y])
     t = np.linspace(-2.0, 2.0, 200)
 
-    expected = laser_x.vector_potential(t) + laser_y.vector_potential(t)
+    expected = laser_x.vector_potential(t) + laser_y.vector_potential(t) - system.initial_avec
     total = system.vector_potential(t)
 
     assert total.shape == (200, 3)
@@ -324,15 +332,36 @@ def test_total_intensity_is_sum_of_individual_intensities() -> None:
 def test_laser_system_temporal_bounds_cover_all_pulses() -> None:
     system = LaserSystem(
         [
-            Laser(omega=1.0, E0=1.0, ellipticity=0.0, fwhm=2.0, envelope="gaussian", t0=-1.0),
-            Laser(omega=1.0, E0=1.0, ellipticity=0.0, fwhm=3.0, envelope="gaussian", t0=4.0),
+            Laser(
+                omega=1.0,
+                E0=1.0,
+                ellip=0.0,
+                ncycles=cycles_for_fwhm(1.0, 2.0),
+                envname="gauss",
+                t0=-1.0,
+            ),
+            Laser(
+                omega=1.0,
+                E0=1.0,
+                ellip=0.0,
+                ncycles=cycles_for_fwhm(1.0, 3.0),
+                envname="gauss",
+                t0=4.0,
+            ),
         ]
     )
 
     t_min, t_max = system.temporal_bounds()
 
-    assert np.isclose(t_min, -9.0)
-    assert np.isclose(t_max, 16.0)
+    assert np.isclose(t_min, -5.0)
+    assert np.isclose(t_max, 10.0)
+
+
+def test_system_subtracts_initial_offsets_at_atmin() -> None:
+    system = LaserSystem([build_laser_x(), build_laser_y()], blaser=1.5, alaser=0.5)
+
+    assert np.allclose(system.electric_field(system.atmin), np.zeros(3), atol=1.0e-12)
+    assert np.allclose(system.vector_potential(system.atmin), np.zeros(3), atol=1.0e-12)
 
 
 def test_scalar_time_is_supported() -> None:
