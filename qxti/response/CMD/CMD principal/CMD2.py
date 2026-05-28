@@ -14,7 +14,7 @@ from qxti.physics import LaserSystem
 from qxti.grids import KGrid
 from qxti.grids import TimeGrid
 from qxti.physics import OperatorFactory
-from qxti.physics import Solver
+from qxti.solvers import Solver
 
 class CMD:
 
