@@ -69,6 +69,57 @@ def bose_einstein(
     return _scalar_or_array(np.asarray(values, dtype=float))
 
 
+def valence_occupation(
+    energy: ArrayLike,
+    chemical_potential: float,
+    temperature: float,
+    *,
+    boltzmann_constant: float = 1.0,
+) -> float | FloatArray:
+    """Return unit occupation for valence bands and zero for conduction bands.
+
+    The occupations are assigned by energy ordering at each ``k`` point:
+
+    - the lowest ``Nb // 2`` bands are treated as valence bands and get
+      occupation ``1``
+    - the remaining bands are treated as conduction bands and get occupation
+      ``0``
+
+    Since :class:`CMD` builds ``rho^(0)`` as ``diag(f_n)`` in the band basis,
+    this yields a diagonal equilibrium density matrix with zero coherences.
+    """
+
+    del chemical_potential, temperature, boltzmann_constant
+    energies = np.asarray(energy, dtype=float)
+    if energies.ndim == 0:
+        return 1.0
+
+    flat = energies.reshape(-1)
+    occupations = np.zeros_like(flat, dtype=float)
+    occupied_count = flat.size // 2
+    if occupied_count > 0:
+        occupied_indices = np.argsort(flat, kind="stable")[:occupied_count]
+        occupations[occupied_indices] = 1.0
+    return _scalar_or_array(occupations.reshape(energies.shape))
+
+
+def full_occupation(
+    energy: ArrayLike,
+    chemical_potential: float,
+    temperature: float,
+    *,
+    boltzmann_constant: float = 1.0,
+) -> float | FloatArray:
+    """Backward-compatible alias for :func:`valence_occupation`."""
+
+    return valence_occupation(
+        energy,
+        chemical_potential,
+        temperature,
+        boltzmann_constant=boltzmann_constant,
+    )
+
+
 @dataclass(slots=True)
 class T1T2Relaxation:
     """Phenomenological relaxation model with population and coherence times.

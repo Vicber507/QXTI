@@ -24,17 +24,24 @@ class ResponseData:
         *,
         orders: tuple[int, ...] | list[int] | None = None,
         k_aggregation: str = "mean",
+        value_mode: str = "absolute",
         rho_orders: dict[int, ComplexArray] | None = None,
     ) -> dict[str, Any]:
         time_domain = self.cmd.solve_time_domain() if rho_orders is None else rho_orders
         resolved_orders = self._resolve_orders(orders, time_domain)
         total_rho = self._sum_orders(time_domain, resolved_orders)
-        populations = np.real(np.diagonal(total_rho, axis1=2, axis2=3))
+        populations = self._population_values(
+            total_rho,
+            rho_orders=time_domain,
+            resolved_orders=resolved_orders,
+            value_mode=value_mode,
+        )
         aggregation_mode, aggregation_label = self._normalize_k_aggregation(k_aggregation)
         aggregated = self._aggregate_populations(populations, aggregation_mode)
 
         return {
             "orders": resolved_orders,
+            "value_mode": self._normalize_population_value_mode(value_mode),
             "time_axis": np.asarray(self.cmd.timegrid.generate(), dtype=float),
             "band_indices": np.arange(populations.shape[2], dtype=int),
             "population_map": aggregated.T,
@@ -50,12 +57,18 @@ class ResponseData:
         self,
         *,
         orders: tuple[int, ...] | list[int] | None = None,
+        value_mode: str = "absolute",
         rho_orders: dict[int, ComplexArray] | None = None,
     ) -> dict[str, Any]:
         time_domain = self.cmd.solve_time_domain() if rho_orders is None else rho_orders
         resolved_orders = self._resolve_orders(orders, time_domain)
         total_rho = self._sum_orders(time_domain, resolved_orders)
-        populations = np.real(np.diagonal(total_rho, axis1=2, axis2=3))
+        populations = self._population_values(
+            total_rho,
+            rho_orders=time_domain,
+            resolved_orders=resolved_orders,
+            value_mode=value_mode,
+        )
 
         if self.cmd.kgrid.dimension < 2:
             raise ValueError("A kx-ky population animation requires a 2D or 3D k-grid.")
@@ -71,6 +84,7 @@ class ResponseData:
 
         return {
             "orders": resolved_orders,
+            "value_mode": self._normalize_population_value_mode(value_mode),
             "time_axis": np.asarray(self.cmd.timegrid.generate(), dtype=float),
             "band_indices": np.arange(nb, dtype=int),
             "kx_values": np.asarray(self.cmd.kgrid.kx_values, dtype=float),
@@ -209,14 +223,21 @@ class ResponseData:
         k_points: FloatArray,
         orders: tuple[int, ...] | list[int] | None = None,
         k_aggregation: str = "mean",
+        value_mode: str = "absolute",
     ) -> dict[str, Any]:
         resolved_orders = cls._resolve_orders(orders, rho_orders)
         total_rho = cls._sum_orders(rho_orders, resolved_orders)
-        populations = np.real(np.diagonal(total_rho, axis1=2, axis2=3))
+        populations = cls._population_values(
+            total_rho,
+            rho_orders=rho_orders,
+            resolved_orders=resolved_orders,
+            value_mode=value_mode,
+        )
         aggregation_mode, aggregation_label = cls._normalize_k_aggregation(k_aggregation)
         aggregated = cls._aggregate_populations(populations, aggregation_mode)
         return {
             "orders": resolved_orders,
+            "value_mode": cls._normalize_population_value_mode(value_mode),
             "time_axis": np.asarray(time_axis, dtype=float),
             "band_indices": np.arange(populations.shape[2], dtype=int),
             "population_map": aggregated.T,
@@ -238,10 +259,16 @@ class ResponseData:
         ky_values: FloatArray,
         kz_values: FloatArray,
         orders: tuple[int, ...] | list[int] | None = None,
+        value_mode: str = "absolute",
     ) -> dict[str, Any]:
         resolved_orders = cls._resolve_orders(orders, rho_orders)
         total_rho = cls._sum_orders(rho_orders, resolved_orders)
-        populations = np.real(np.diagonal(total_rho, axis1=2, axis2=3))
+        populations = cls._population_values(
+            total_rho,
+            rho_orders=rho_orders,
+            resolved_orders=resolved_orders,
+            value_mode=value_mode,
+        )
 
         if len(ky_values) < 2:
             raise ValueError("A kx-ky population animation requires at least two ky points.")
@@ -257,12 +284,49 @@ class ResponseData:
 
         return {
             "orders": resolved_orders,
+            "value_mode": cls._normalize_population_value_mode(value_mode),
             "time_axis": np.asarray(time_axis, dtype=float),
             "band_indices": np.arange(nb, dtype=int),
             "kx_values": np.asarray(kx_values, dtype=float),
             "ky_values": np.asarray(ky_values, dtype=float),
             "population_frames": frames,
         }
+
+    @classmethod
+    def _population_values(
+        cls,
+        total_rho: ComplexArray,
+        *,
+        rho_orders: dict[int, ComplexArray],
+        resolved_orders: tuple[int, ...],
+        value_mode: str,
+    ) -> FloatArray:
+        mode = cls._normalize_population_value_mode(value_mode)
+        populations = np.real(np.diagonal(total_rho, axis1=2, axis2=3))
+        if mode == "absolute":
+            return populations
+
+        if 0 in rho_orders:
+            reference = np.real(np.diagonal(np.asarray(rho_orders[0], dtype=np.complex128), axis1=2, axis2=3))
+        else:
+            reference = populations[:, :1, :]
+        if 0 not in resolved_orders and reference.shape == populations.shape:
+            return populations
+        return populations - reference
+
+    @staticmethod
+    def _normalize_population_value_mode(value_mode: str) -> str:
+        key = value_mode.strip().lower()
+        aliases = {
+            "delta": "delta",
+            "change": "delta",
+            "difference": "delta",
+            "absolute": "absolute",
+            "total": "absolute",
+        }
+        if key not in aliases:
+            raise ValueError("population value_mode must be one of: delta, absolute.")
+        return aliases[key]
 
     @classmethod
     def coherence_heatmap_data_from_saved_rho(

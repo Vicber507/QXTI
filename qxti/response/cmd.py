@@ -9,7 +9,7 @@ from qxti.grids import KGrid, TimeGrid
 from qxti.physics import Hamiltonian, LaserSystem, OperatorFactory
 from qxti.solvers import Solver
 
-from .distributions import bose_einstein, fermi_dirac, maxwell_boltzmann
+from .distributions import T1T2Relaxation, bose_einstein, fermi_dirac, full_occupation, maxwell_boltzmann, valence_occupation
 
 
 ComplexArray = NDArray[np.complex128]
@@ -38,8 +38,8 @@ class CMD:
         operator_factory: OperatorFactory,
         solver: Solver,
         max_order: int,
-        gamma_population: float,
-        gamma_coherence: float,
+        population_time: float,
+        coherence_time: float,
         temperature: float,
         fermi_level: float,
         distribution: str,
@@ -56,8 +56,8 @@ class CMD:
         self.operator_factory = operator_factory
         self.solver = solver
         self.max_order = int(max_order)
-        self.gamma_population = float(gamma_population)
-        self.gamma_coherence = float(gamma_coherence)
+        self.population_time = float(population_time)
+        self.coherence_time = float(coherence_time)
         self.temperature = float(temperature)
         self.fermi_level = float(fermi_level)
         self.distribution_name = self._normalize_distribution(distribution)
@@ -70,15 +70,21 @@ class CMD:
 
         if self.max_order < 0:
             raise ValueError("max_order must be non-negative.")
-        if self.gamma_population < 0.0:
-            raise ValueError("gamma_population must be non-negative.")
-        if self.gamma_coherence < 0.0:
-            raise ValueError("gamma_coherence must be non-negative.")
+        if self.population_time <= 0.0 and not np.isinf(self.population_time):
+            raise ValueError("population_time must be strictly positive or infinite.")
+        if self.coherence_time <= 0.0 and not np.isinf(self.coherence_time):
+            raise ValueError("coherence_time must be strictly positive or infinite.")
         if self.temperature < 0.0:
             raise ValueError("temperature must be non-negative.")
         if self.operator_factory.hamiltonian is not self.hamiltonian:
             raise ValueError("operator_factory must be built from the same Hamiltonian instance.")
 
+        self.gamma_population = 0.0 if np.isinf(self.population_time) else 1.0 / self.population_time
+        self.gamma_coherence = 0.0 if np.isinf(self.coherence_time) else 1.0 / self.coherence_time
+        self.relaxation_model = T1T2Relaxation(
+            T1=self.population_time,
+            T2=self.coherence_time,
+        )
         self._diag_indices = np.diag_indices(self.hamiltonian.basis_size)
         self._offdiag_mask = ~np.eye(self.hamiltonian.basis_size, dtype=bool)
         self._time_domain_cache: dict[int, ComplexArray] | None = None
@@ -156,18 +162,12 @@ class CMD:
         return transformed
 
     def save_density_matrices(self, output_dir: str) -> None:
-        """Save all available time-domain density matrices as ``.npy`` and ``.dat`` files."""
+        """Save all available time-domain density matrices as ``.npy`` files."""
 
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         for order, tensor in self.solve_time_domain().items():
             np.save(output_path / f"rho_order_{order}.npy", tensor)
-            self.save_density_matrix_dat(
-                output_path / f"rho_order_{order}.dat",
-                tensor,
-                order=order,
-                domain="time",
-            )
 
     def _solve_orders_in_band_basis(
         self,
@@ -470,12 +470,11 @@ class CMD:
         )
 
     def _dephasing_term(self, rho: ComplexArray) -> ComplexArray:
-        derivative = np.zeros_like(rho, dtype=np.complex128)
-        if self.gamma_population > 0.0:
-            derivative[self._diag_indices] = -self.gamma_population * rho[self._diag_indices]
-        if self.gamma_coherence > 0.0:
-            derivative[self._offdiag_mask] = -self.gamma_coherence * rho[self._offdiag_mask]
-        return derivative
+        zero_equilibrium = np.zeros_like(rho, dtype=np.complex128)
+        return np.asarray(
+            self.relaxation_model.term(rho, zero_equilibrium),
+            dtype=np.complex128,
+        )
 
     @staticmethod
     def _linear_interpolate_series(
@@ -534,9 +533,19 @@ class CMD:
             "bose": "bose_einstein",
             "bose_einstein": "bose_einstein",
             "be": "bose_einstein",
+            "valence": "valence_occupation",
+            "valence_occupation": "valence_occupation",
+            "filled_valence": "valence_occupation",
+            "semiconductor": "valence_occupation",
+            "full": "full_occupation",
+            "full_occupation": "full_occupation",
+            "identity": "full_occupation",
         }
         if key not in aliases:
-            raise ValueError("distribution must be fermi_dirac, maxwell_boltzmann, or bose_einstein.")
+            raise ValueError(
+                "distribution must be fermi_dirac, maxwell_boltzmann, "
+                "bose_einstein, valence_occupation, or full_occupation."
+            )
         return aliases[key]
 
     @staticmethod
@@ -547,6 +556,10 @@ class CMD:
             return maxwell_boltzmann
         if distribution == "bose_einstein":
             return bose_einstein
+        if distribution == "valence_occupation":
+            return valence_occupation
+        if distribution == "full_occupation":
+            return full_occupation
         raise ValueError(f"Unsupported distribution '{distribution}'.")
 
     @staticmethod

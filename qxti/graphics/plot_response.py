@@ -18,12 +18,15 @@ os.environ.setdefault("XDG_CACHE_HOME", "/private/tmp")
 DEFAULT_RESPONSE_PLOT_CONFIG = {
     "orders": "all",
     "population": {
+        "value_mode": "absolute",
         "video": {
-            "enabled": False,
+            "enabled": True,
             "output_file": "population_kx_ky_per_band.mp4",
             "fps": 10,
             "frame_stride": 2,
-            "cmap": "inferno",
+            "cmap": "qx_diverging_black",
+            "center_zero": True,
+            "contrast_percentile": 98.5,
         },
         "snapshots": {
             "enabled": True,
@@ -31,17 +34,21 @@ DEFAULT_RESPONSE_PLOT_CONFIG = {
             "num_snapshots": 4,
             "snapshot_times": [],
             "snapshot_indices": [],
-            "cmap": "inferno",
+            "cmap": "qx_diverging_black",
+            "center_zero": True,
+            "contrast_percentile": 98.5,
         },
     },
     "coherence": {
-        "component": "magnitude",
+        "component": "real",
         "video": {
-            "enabled": False,
+            "enabled": True,
             "output_file": "coherence_kx_ky_per_pair.mp4",
             "fps": 10,
             "frame_stride": 2,
-            "cmap": "magma",
+            "cmap": "qx_diverging_black",
+            "center_zero": True,
+            "contrast_percentile": 98.5,
         },
         "snapshots": {
             "enabled": True,
@@ -49,7 +56,9 @@ DEFAULT_RESPONSE_PLOT_CONFIG = {
             "num_snapshots": 4,
             "snapshot_times": [],
             "snapshot_indices": [],
-            "cmap": "magma",
+            "cmap": "qx_diverging_black",
+            "center_zero": True,
+            "contrast_percentile": 98.5,
         },
     },
 }
@@ -64,9 +73,12 @@ if HAS_MATPLOTLIB:
 
     matplotlib.use("Agg")
     from matplotlib import animation
+    from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
     from matplotlib import pyplot as plt
 else:
     animation = None
+    LinearSegmentedColormap = None
+    TwoSlopeNorm = None
     plt = None
 
 
@@ -81,15 +93,18 @@ class ResponseGraphics:
         cmap: str = "inferno",
     ) -> Path:
         band_indices = [str(index) for index in np.asarray(data["band_indices"], dtype=int)]
+        value_mode = str(data.get("value_mode", "absolute"))
+        mode_title = "Population changes" if value_mode == "delta" else "Populations"
+        mode_label = "delta population" if value_mode == "delta" else "population"
         return ResponseGraphics._plot_time_heatmap(
             time_axis=np.asarray(data["time_axis"], dtype=float),
             value_map=np.asarray(data["population_map"], dtype=float),
             labels=band_indices,
             output_path=output_path,
             cmap=cmap,
-            title=f"Populations from sum of rho^(s), s = {ResponseGraphics._orders_text(data)}",
+            title=f"{mode_title} from sum of rho^(s), s = {ResponseGraphics._orders_text(data)}",
             ylabel="band index",
-            colorbar_label=f"population ({data['aggregation_label']})",
+            colorbar_label=f"{mode_label} ({data['aggregation_label']})",
         )
 
     @staticmethod
@@ -120,8 +135,13 @@ class ResponseGraphics:
         fps: int = 10,
         frame_stride: int = 1,
         cmap: str = "inferno",
+        center_zero: bool = False,
+        contrast_percentile: float = 100.0,
     ) -> Path:
         labels = [f"Band {index}" for index in np.asarray(data["band_indices"], dtype=int)]
+        value_mode = str(data.get("value_mode", "absolute"))
+        title_prefix = "Population change in kx-ky" if value_mode == "delta" else "Population density in kx-ky"
+        colorbar_label = "delta population" if value_mode == "delta" else "population density"
         return ResponseGraphics._animate_kxky_maps(
             frames=np.asarray(data["population_frames"], dtype=float),
             labels=labels,
@@ -132,8 +152,10 @@ class ResponseGraphics:
             fps=fps,
             frame_stride=frame_stride,
             cmap=cmap,
-            title_prefix="Population density in kx-ky",
-            colorbar_label="population density",
+            center_zero=center_zero,
+            contrast_percentile=contrast_percentile,
+            title_prefix=title_prefix,
+            colorbar_label=colorbar_label,
         )
 
     @staticmethod
@@ -144,6 +166,8 @@ class ResponseGraphics:
         fps: int = 10,
         frame_stride: int = 1,
         cmap: str = "magma",
+        center_zero: bool = False,
+        contrast_percentile: float = 100.0,
     ) -> Path:
         labels = [f"Pair {label}" for label in data["pair_labels"]]
         component = str(data["component"])
@@ -157,6 +181,8 @@ class ResponseGraphics:
             fps=fps,
             frame_stride=frame_stride,
             cmap=cmap,
+            center_zero=center_zero,
+            contrast_percentile=contrast_percentile,
             title_prefix=f"Coherence {component} in kx-ky",
             colorbar_label=f"coherence {component}",
         )
@@ -168,8 +194,13 @@ class ResponseGraphics:
         *,
         snapshot_indices: list[int] | np.ndarray,
         cmap: str = "inferno",
+        center_zero: bool = False,
+        contrast_percentile: float = 100.0,
     ) -> Path:
         labels = [f"Band {index}" for index in np.asarray(data["band_indices"], dtype=int)]
+        value_mode = str(data.get("value_mode", "absolute"))
+        title_prefix = "Population change" if value_mode == "delta" else "Population density"
+        colorbar_label = "delta population" if value_mode == "delta" else "population density"
         return ResponseGraphics._plot_kxky_snapshots(
             frames=np.asarray(data["population_frames"], dtype=float),
             labels=labels,
@@ -179,8 +210,10 @@ class ResponseGraphics:
             snapshot_indices=np.asarray(snapshot_indices, dtype=int),
             output_path=output_path,
             cmap=cmap,
-            title_prefix="Population density",
-            colorbar_label="population density",
+            center_zero=center_zero,
+            contrast_percentile=contrast_percentile,
+            title_prefix=title_prefix,
+            colorbar_label=colorbar_label,
         )
 
     @staticmethod
@@ -190,6 +223,8 @@ class ResponseGraphics:
         *,
         snapshot_indices: list[int] | np.ndarray,
         cmap: str = "magma",
+        center_zero: bool = False,
+        contrast_percentile: float = 100.0,
     ) -> Path:
         labels = [f"Pair {label}" for label in data["pair_labels"]]
         component = str(data["component"])
@@ -202,6 +237,8 @@ class ResponseGraphics:
             snapshot_indices=np.asarray(snapshot_indices, dtype=int),
             output_path=output_path,
             cmap=cmap,
+            center_zero=center_zero,
+            contrast_percentile=contrast_percentile,
             title_prefix=f"Coherence {component}",
             colorbar_label=f"coherence {component}",
         )
@@ -265,6 +302,8 @@ class ResponseGraphics:
         fps: int,
         frame_stride: int,
         cmap: str,
+        center_zero: bool,
+        contrast_percentile: float,
         title_prefix: str,
         colorbar_label: str,
     ) -> Path:
@@ -287,14 +326,18 @@ class ResponseGraphics:
 
         for axis, label, entity_index in zip(axes_flat, labels, range(n_entities), strict=False):
             entity_frames = frames[:, entity_index, :, :]
+            image_kwargs = ResponseGraphics._image_kwargs(
+                entity_frames,
+                cmap=cmap,
+                center_zero=center_zero,
+                contrast_percentile=contrast_percentile,
+            )
             image = axis.imshow(
                 entity_frames[frame_indices[0]],
                 origin="lower",
                 aspect="auto",
                 extent=extent,
-                cmap=cmap,
-                vmin=float(np.min(entity_frames)),
-                vmax=float(np.max(entity_frames)),
+                **image_kwargs,
             )
             axis.set_xlabel("kx (a.u.)")
             axis.set_ylabel("ky (a.u.)")
@@ -342,6 +385,8 @@ class ResponseGraphics:
         snapshot_indices: np.ndarray,
         output_path: Path,
         cmap: str,
+        center_zero: bool,
+        contrast_percentile: float,
         title_prefix: str,
         colorbar_label: str,
     ) -> Path:
@@ -355,6 +400,12 @@ class ResponseGraphics:
             squeeze=False,
         )
         extent = [float(kx_values[0]), float(kx_values[-1]), float(ky_values[0]), float(ky_values[-1])]
+        image_kwargs = ResponseGraphics._image_kwargs(
+            frames,
+            cmap=cmap,
+            center_zero=center_zero,
+            contrast_percentile=contrast_percentile,
+        )
 
         for row, label in enumerate(labels):
             for col, frame_index in enumerate(snapshot_indices):
@@ -364,7 +415,7 @@ class ResponseGraphics:
                     origin="lower",
                     aspect="auto",
                     extent=extent,
-                    cmap=cmap,
+                    **image_kwargs,
                 )
                 axis.set_xlabel("kx (a.u.)")
                 axis.set_ylabel("ky (a.u.)")
@@ -402,6 +453,43 @@ class ResponseGraphics:
         figure.savefig(output_path, dpi=160)
         plt.close(figure)
         return output_path
+
+    @staticmethod
+    def _image_kwargs(
+        values: np.ndarray,
+        *,
+        cmap: str,
+        center_zero: bool,
+        contrast_percentile: float,
+    ) -> dict[str, Any]:
+        array = np.asarray(values, dtype=float)
+        cmap_value = ResponseGraphics._resolve_cmap(cmap)
+        percentile = min(max(float(contrast_percentile), 1.0), 100.0)
+        if not center_zero:
+            return {"cmap": cmap_value}
+
+        finite = array[np.isfinite(array)]
+        max_abs = (
+            float(np.percentile(np.abs(finite), percentile))
+            if finite.size
+            else 0.0
+        )
+        if max_abs <= 0.0:
+            return {"cmap": cmap_value, "vmin": -1.0, "vmax": 1.0}
+        return {
+            "cmap": cmap_value,
+            "norm": TwoSlopeNorm(vmin=-max_abs, vcenter=0.0, vmax=max_abs),
+        }
+
+    @staticmethod
+    def _resolve_cmap(cmap: str):
+        if cmap != "qx_diverging_black":
+            return cmap
+        return LinearSegmentedColormap.from_list(
+            "qx_diverging_black",
+            ["#2553a1", "#000000", "#b01e2f"],
+            N=256,
+        )
 
     @staticmethod
     def _require_matplotlib() -> Any:

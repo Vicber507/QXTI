@@ -144,8 +144,8 @@ class QXTISimulation:
             operator_factory=operator_factory,
             solver=self._build_solver(timegrid),
             max_order=ccfg.max_order,
-            gamma_population=ccfg.gamma_population,
-            gamma_coherence=ccfg.gamma_coherence,
+            population_time=ccfg.population_time,
+            coherence_time=ccfg.coherence_time,
             temperature=ccfg.temperature,
             fermi_level=ccfg.fermi_level,
             distribution=ccfg.distribution,
@@ -278,20 +278,10 @@ class QXTISimulation:
         rho_orders = cmd.solve_time_domain()
         for order, tensor in rho_orders.items():
             npy_path = output_dir / f"rho_order_{order}.npy"
-            dat_path = output_dir / f"rho_order_{order}.dat"
             np.save(npy_path, tensor)
-            cmd.save_density_matrix_dat(
-                dat_path,
-                tensor,
-                order=order,
-                domain="time",
-                axis_values=np.asarray(cmd.timegrid.generate(), dtype=float),
-                axis_label="time",
-            )
             outputs[f"rho_order_{order}"] = npy_path
-            outputs[f"rho_order_{order}_dat"] = dat_path
             self._emit_progress(
-                f"CMD saved order {order}: '{npy_path.name}' and '{dat_path.name}'."
+                f"CMD saved order {order}: '{npy_path.name}'."
             )
 
         if cmd_cfg.save_frequency_domain:
@@ -299,20 +289,10 @@ class QXTISimulation:
             frequency_dir.mkdir(parents=True, exist_ok=True)
             for order, tensor in cmd.solve_frequency_domain().items():
                 npy_path = frequency_dir / f"rho_frequency_order_{order}.npy"
-                dat_path = frequency_dir / f"rho_frequency_order_{order}.dat"
                 np.save(npy_path, tensor)
-                cmd.save_density_matrix_dat(
-                    dat_path,
-                    tensor,
-                    order=order,
-                    domain="frequency",
-                    axis_values=np.asarray(cmd.timegrid.frequency_axis(), dtype=float),
-                    axis_label="omega",
-                )
                 outputs[f"rho_frequency_order_{order}"] = npy_path
-                outputs[f"rho_frequency_order_{order}_dat"] = dat_path
                 self._emit_progress(
-                    f"CMD saved frequency order {order}: '{npy_path.name}' and '{dat_path.name}'."
+                    f"CMD saved frequency order {order}: '{npy_path.name}'."
                 )
 
         outputs.update(self.generate_cmd_datasets(cmd, rho_orders))
@@ -393,6 +373,10 @@ class QXTISimulation:
             operator_factory=cmd.operator_factory,
             directions=self._active_directions(cmd.hamiltonian.dimension),
             orders=sorted(rho_orders),
+            bz_mask_enabled=self.config.xtp.bz_mask_enabled,
+            bz_mask_radius_percent=self.config.xtp.bz_mask_radius_percent,
+            bz_mask_sigma=self.config.xtp.bz_mask_sigma,
+            bz_mask_sigma_percent_legacy=self.config.xtp.bz_mask_sigma_percent_legacy,
         )
         electric_field_time = np.asarray(
             cmd.laser_system.electric_field(cmd.timegrid.generate()),
