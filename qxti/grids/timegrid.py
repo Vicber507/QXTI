@@ -10,7 +10,7 @@ RealArray = NDArray[np.float64]
 
 class TimeGrid:
     """
-    Defines temporal grid and FFT utilities.
+    Defines temporal grid and FFT utilities in atomic units.
     """
 
     def __init__(
@@ -22,6 +22,12 @@ class TimeGrid:
         zero_padding: bool = False,
         padding_factor: int = 2
     ) -> None:
+        if Nt < 2:
+            raise ValueError("Nt must be at least 2.")
+        if t_max <= t_min:
+            raise ValueError("t_max must be strictly larger than t_min.")
+        if padding_factor <= 0:
+            raise ValueError("padding_factor must be strictly positive.")
 
         self.t_min: float = t_min
         self.t_max: float = t_max
@@ -36,6 +42,36 @@ class TimeGrid:
         self.dt: float = (
             (self.t_max - self.t_min)
             / (self.Nt - 1)
+        )
+
+    @classmethod
+    def from_dt(
+        cls,
+        *,
+        t_min: float,
+        t_max: float,
+        dt: float,
+        fft_window: str = "hann",
+        zero_padding: bool = False,
+        padding_factor: int = 2,
+    ) -> TimeGrid:
+        """Build one grid from ``dt`` so that the interval covers ``[t_min, t_max]``."""
+
+        if dt <= 0.0:
+            raise ValueError("dt must be strictly positive.")
+        if t_max <= t_min:
+            raise ValueError("t_max must be strictly larger than t_min.")
+
+        duration = float(t_max) - float(t_min)
+        Nt = int(np.ceil(duration / float(dt))) + 1
+        effective_t_max = float(t_min) + (Nt - 1) * float(dt)
+        return cls(
+            t_min=float(t_min),
+            t_max=effective_t_max,
+            Nt=Nt,
+            fft_window=fft_window,
+            zero_padding=zero_padding,
+            padding_factor=padding_factor,
         )
 
     @property
@@ -153,7 +189,7 @@ class TimeGrid:
 
     def frequency_axis(self) -> RealArray:
         """
-        Returns FFT frequency axis.
+        Returns FFT angular-frequency axis in atomic units.
         """
 
         N = self.Nt
@@ -166,6 +202,5 @@ class TimeGrid:
             N,
             d=self.dt
         )
-        # si se necesita frecuencia angular es necesario editar
-        # omega = 2*np.pi*freq
-        return freq
+        omega = 2.0 * np.pi * freq
+        return np.asarray(omega, dtype=np.float64)

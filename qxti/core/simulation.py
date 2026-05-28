@@ -4,15 +4,30 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+from numpy.typing import NDArray
+
 from qxti.core.config import QXTIConfig
-from qxti.data import HamiltonianData
-from qxti.graphics import HamiltonianGraphics
-from qxti.physics import CustomHamiltonian, Hamiltonian
+from qxti.data import HamiltonianData, ResponseData, save_dataset_npz
+from qxti.grids import KGrid, TimeGrid
+from qxti.physics import CustomHamiltonian, Hamiltonian, Laser, LaserSystem, OperatorFactory
+from qxti.response import CMD
+from qxti.solvers import AdamsBashforth2Solver, RKF45Solver, Solver
+
+
+ComplexArray = NDArray[np.complex128]
+DEFAULT_HAMILTONIAN_PLOTS = (
+    "band_structure_2d",
+    "band_surface_3d",
+    "velocity_2d",
+    "velocity_field_3d",
+    "velocity_magnitude",
+)
 
 
 @dataclass(slots=True)
 class QXTISimulation:
-    """Minimal orchestrator for intrinsic Hamiltonian diagnostics and plots."""
+    """Orchestrator for Hamiltonian plots and CMD density-matrix runs."""
 
     config: QXTIConfig
 
@@ -38,23 +53,126 @@ class QXTISimulation:
             kwargs["dimension"] = hcfg.dimension
         return CustomHamiltonian(**kwargs)
 
+    def build_kgrid(self, hamiltonian: Hamiltonian) -> KGrid:
+        kcfg = self.config.kgrid
+        dimension = kcfg.dimension if kcfg.dimension is not None else hamiltonian.dimension
+        if kcfg.points_per_axis <= 0:
+            raise ValueError("kgrid.points_per_axis must be strictly positive.")
+
+        if kcfg.kx_values or kcfg.ky_values or kcfg.kz_values:
+            kx_values = np.asarray(kcfg.kx_values or [0.0], dtype=float)
+            ky_values = np.asarray(kcfg.ky_values or [0.0], dtype=float)
+            kz_values = np.asarray(kcfg.kz_values or [0.0], dtype=float)
+        else:
+            bounds = hamiltonian.reciprocal_box_bounds()
+            kx_values = np.linspace(bounds[0][0], bounds[0][1], kcfg.points_per_axis, dtype=float)
+            ky_values = (
+                np.linspace(bounds[1][0], bounds[1][1], kcfg.points_per_axis, dtype=float)
+                if dimension >= 2
+                else np.array([0.0], dtype=float)
+            )
+            kz_values = (
+                np.linspace(bounds[2][0], bounds[2][1], kcfg.points_per_axis, dtype=float)
+                if dimension >= 3
+                else np.array([0.0], dtype=float)
+            )
+
+        return KGrid(
+            kx_values=kx_values,
+            ky_values=ky_values,
+            kz_values=kz_values,
+            dimension=dimension,
+        )
+
+    def build_timegrid(self, laser_system: LaserSystem) -> TimeGrid:
+        tcfg = self.config.timegrid
+        if tcfg.dt <= 0.0:
+            raise ValueError("timegrid.dt must be strictly positive.")
+
+        if tcfg.t_min is not None and tcfg.t_max is not None and tcfg.Nt is not None:
+            return TimeGrid(
+                t_min=tcfg.t_min,
+                t_max=tcfg.t_max,
+                Nt=tcfg.Nt,
+                fft_window=tcfg.fft_window,
+                zero_padding=tcfg.zero_padding,
+                padding_factor=tcfg.padding_factor,
+            )
+
+        t_min, t_max = laser_system.temporal_bounds()
+        return TimeGrid.from_dt(
+            t_min=t_min if tcfg.t_min is None else tcfg.t_min,
+            t_max=t_max if tcfg.t_max is None else tcfg.t_max,
+            dt=tcfg.dt,
+            fft_window=tcfg.fft_window,
+            zero_padding=tcfg.zero_padding,
+            padding_factor=tcfg.padding_factor,
+        )
+
+    def build_laser_system(self) -> LaserSystem:
+        lcfg = self.config.laser
+        laser = Laser(
+            omega=lcfg.omega,
+            E0=lcfg.E0,
+            phase=lcfg.phase,
+            ellipticity=lcfg.ellipticity,
+            fwhm=lcfg.fwhm,
+            envelope=lcfg.envelope,
+            t0=lcfg.t0,
+            theta=lcfg.theta,
+            phi=lcfg.phi,
+        )
+        return LaserSystem([laser])
+
+    def build_cmd(self, hamiltonian: Hamiltonian) -> CMD:
+        ccfg = self.config.cmd
+        laser_system = self.build_laser_system()
+        timegrid = self.build_timegrid(laser_system)
+        operator_factory = OperatorFactory(hamiltonian=hamiltonian, basis=ccfg.basis)
+        return CMD(
+            hamiltonian=hamiltonian,
+            laser_system=laser_system,
+            kgrid=self.build_kgrid(hamiltonian),
+            timegrid=timegrid,
+            operator_factory=operator_factory,
+            solver=self._build_solver(timegrid),
+            max_order=ccfg.max_order,
+            gamma_population=ccfg.gamma_population,
+            gamma_coherence=ccfg.gamma_coherence,
+            temperature=ccfg.temperature,
+            fermi_level=ccfg.fermi_level,
+            distribution=ccfg.distribution,
+            basis=ccfg.basis,
+            gauge=ccfg.gauge,
+            include_intraband=ccfg.include_intraband,
+            include_interband=ccfg.include_interband,
+            include_dephasing=ccfg.include_dephasing,
+        )
+
     def run(self) -> dict[str, Path]:
         hamiltonian = self.build_hamiltonian()
         outputs: dict[str, Path] = {}
-        outputs.update(self.generate_hamiltonian_plots(hamiltonian))
+        self._emit_progress("Building data products from input configuration.")
+        outputs.update(self.generate_hamiltonian_datasets(hamiltonian))
+        outputs.update(self.generate_cmd_outputs(hamiltonian))
+        self._emit_progress(f"Simulation completed with {len(outputs)} generated files.")
         return outputs
 
-    def generate_hamiltonian_plots(self, hamiltonian: Hamiltonian) -> dict[str, Path]:
+    def generate_hamiltonian_datasets(self, hamiltonian: Hamiltonian) -> dict[str, Path]:
         plot_cfg = self.config.hamiltonian_plots
-        if not plot_cfg.enabled or not plot_cfg.plots:
+        if not plot_cfg.enabled:
             return {}
 
-        output_dir = Path(plot_cfg.output_dir)
+        output_dir = Path(plot_cfg.output_dir) / "data"
+        output_dir.mkdir(parents=True, exist_ok=True)
         data_builder = HamiltonianData(hamiltonian)
         outputs: dict[str, Path] = {}
+        requested_plots = plot_cfg.plots or DEFAULT_HAMILTONIAN_PLOTS
 
-        for plot_name in plot_cfg.plots:
+        total_plots = len(requested_plots)
+        for index, plot_name in enumerate(requested_plots, start=1):
             normalized = self._normalize_plot_name(plot_name)
+            self._emit_progress(f"Data {index}/{total_plots}: generating '{normalized}'.")
             if normalized == "band_structure_2d":
                 data = data_builder.band_structure_2d_data(
                     path_type=plot_cfg.path_type,
@@ -66,10 +184,8 @@ class QXTISimulation:
                     fixed_kz=plot_cfg.fixed_kz,
                     manual_path=plot_cfg.manual_path or None,
                 )
-                outputs[normalized] = HamiltonianGraphics.plot_band_structure_2d(
-                    data,
-                    output_dir / f"{normalized}.png",
-                )
+                dataset_path = save_dataset_npz(output_dir / f"{normalized}.npz", data)
+                outputs[f"{normalized}_data"] = dataset_path
             elif normalized == "band_surface_3d":
                 data = data_builder.band_surface_3d_data(
                     plane=plot_cfg.plane,
@@ -85,11 +201,8 @@ class QXTISimulation:
                     fixed_ky=plot_cfg.fixed_ky,
                     fixed_kz=plot_cfg.fixed_kz,
                 )
-                outputs[normalized] = HamiltonianGraphics.plot_band_surface_3d(
-                    data,
-                    output_dir / f"{normalized}.png",
-                    style=plot_cfg.surface_style,
-                )
+                dataset_path = save_dataset_npz(output_dir / f"{normalized}.npz", data)
+                outputs[f"{normalized}_data"] = dataset_path
             elif normalized == "velocity_2d":
                 data = data_builder.velocity_2d_data(
                     path_type=plot_cfg.path_type,
@@ -101,10 +214,8 @@ class QXTISimulation:
                     fixed_kz=plot_cfg.fixed_kz,
                     manual_path=plot_cfg.manual_path or None,
                 )
-                outputs[normalized] = HamiltonianGraphics.plot_velocity_2d(
-                    data,
-                    output_dir / f"{normalized}.png",
-                )
+                dataset_path = save_dataset_npz(output_dir / f"{normalized}.npz", data)
+                outputs[f"{normalized}_data"] = dataset_path
             elif normalized == "velocity_field_3d":
                 data = data_builder.velocity_field_3d_data(
                     plane=plot_cfg.plane,
@@ -120,11 +231,8 @@ class QXTISimulation:
                     fixed_ky=plot_cfg.fixed_ky,
                     fixed_kz=plot_cfg.fixed_kz,
                 )
-                outputs[normalized] = HamiltonianGraphics.plot_velocity_field_3d(
-                    data,
-                    output_dir / f"{normalized}.png",
-                    stride=plot_cfg.quiver_stride,
-                )
+                dataset_path = save_dataset_npz(output_dir / f"{normalized}.npz", data)
+                outputs[f"{normalized}_data"] = dataset_path
             elif normalized == "velocity_magnitude":
                 data = data_builder.velocity_magnitude_data(
                     plane=plot_cfg.plane,
@@ -140,14 +248,135 @@ class QXTISimulation:
                     fixed_ky=plot_cfg.fixed_ky,
                     fixed_kz=plot_cfg.fixed_kz,
                 )
-                outputs[normalized] = HamiltonianGraphics.plot_velocity_magnitude(
-                    data,
-                    output_dir / f"{normalized}.png",
-                )
+                dataset_path = save_dataset_npz(output_dir / f"{normalized}.npz", data)
+                outputs[f"{normalized}_data"] = dataset_path
             else:
                 raise ValueError(f"Unsupported Hamiltonian plot '{plot_name}'.")
 
         return outputs
+
+    def generate_cmd_outputs(self, hamiltonian: Hamiltonian) -> dict[str, Path]:
+        cmd_cfg = self.config.cmd
+        if not cmd_cfg.enabled:
+            return {}
+
+        cmd = self.build_cmd(hamiltonian)
+        output_dir = Path(cmd_cfg.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        self._emit_progress(
+            f"CMD enabled: solving density matrices up to order {cmd_cfg.max_order}."
+        )
+
+        outputs: dict[str, Path] = {}
+        rho_orders = cmd.solve_time_domain()
+        for order, tensor in rho_orders.items():
+            npy_path = output_dir / f"rho_order_{order}.npy"
+            dat_path = output_dir / f"rho_order_{order}.dat"
+            np.save(npy_path, tensor)
+            cmd.save_density_matrix_dat(
+                dat_path,
+                tensor,
+                order=order,
+                domain="time",
+                axis_values=np.asarray(cmd.timegrid.generate(), dtype=float),
+                axis_label="time",
+            )
+            outputs[f"rho_order_{order}"] = npy_path
+            outputs[f"rho_order_{order}_dat"] = dat_path
+            self._emit_progress(
+                f"CMD saved order {order}: '{npy_path.name}' and '{dat_path.name}'."
+            )
+
+        if cmd_cfg.save_frequency_domain:
+            frequency_dir = output_dir / "frequency"
+            frequency_dir.mkdir(parents=True, exist_ok=True)
+            for order, tensor in cmd.solve_frequency_domain().items():
+                npy_path = frequency_dir / f"rho_frequency_order_{order}.npy"
+                dat_path = frequency_dir / f"rho_frequency_order_{order}.dat"
+                np.save(npy_path, tensor)
+                cmd.save_density_matrix_dat(
+                    dat_path,
+                    tensor,
+                    order=order,
+                    domain="frequency",
+                    axis_values=np.asarray(cmd.timegrid.frequency_axis(), dtype=float),
+                    axis_label="omega",
+                )
+                outputs[f"rho_frequency_order_{order}"] = npy_path
+                outputs[f"rho_frequency_order_{order}_dat"] = dat_path
+                self._emit_progress(
+                    f"CMD saved frequency order {order}: '{npy_path.name}' and '{dat_path.name}'."
+                )
+
+        outputs.update(self.generate_cmd_datasets(cmd, rho_orders))
+        return outputs
+
+    def generate_cmd_datasets(
+        self,
+        cmd: CMD,
+        rho_orders: dict[int, ComplexArray],
+    ) -> dict[str, Path]:
+        self._emit_progress("CMD data products enabled: generating reusable population datasets.")
+        data_builder = ResponseData(cmd)
+        output_dir = Path(self.config.cmd.output_dir) / "data"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        all_orders = tuple(sorted(rho_orders))
+        heatmap_data = data_builder.population_heatmap_data(
+            orders=all_orders,
+            k_aggregation="mean",
+            rho_orders=rho_orders,
+        )
+
+        outputs: dict[str, Path] = {}
+        heatmap_path = save_dataset_npz(
+            output_dir / "population_time_heatmap_all_orders.npz",
+            heatmap_data,
+        )
+        outputs["rho_population_heatmap_data"] = heatmap_path
+        self._emit_progress(f"CMD population heatmap data saved as '{heatmap_path.name}'.")
+
+        try:
+            kmap_data = data_builder.population_kxky_animation_data(
+                orders=all_orders,
+                rho_orders=rho_orders,
+            )
+        except ValueError as exc:
+            self._emit_progress(f"CMD kx-ky population data skipped: {exc}")
+        else:
+            animation_data_path = save_dataset_npz(
+                output_dir / "population_kx_ky_per_band.npz",
+                kmap_data,
+            )
+            outputs["rho_population_kxky_data"] = animation_data_path
+            self._emit_progress(
+                f"CMD kx-ky population data saved as '{animation_data_path.name}'."
+            )
+
+        return outputs
+
+    def _build_solver(self, timegrid: TimeGrid) -> Solver:
+        cmd_cfg = self.config.cmd
+        solver_name = cmd_cfg.solver.strip().lower()
+
+        if solver_name in {"rkf45", "rkf", "fehlberg", "runge_kutta_fehlberg"}:
+            return RKF45Solver(
+                tolerance=cmd_cfg.solver_tolerance,
+                max_iterations=cmd_cfg.solver_max_iterations,
+                h_min=cmd_cfg.solver_h_min,
+                h_max=timegrid.dt if cmd_cfg.solver_h_max is None else cmd_cfg.solver_h_max,
+                enforce_hermiticity=True,
+                enforce_trace=False,
+            )
+        if solver_name in {"ab2", "adams_bashforth_2", "adams-bashforth-2"}:
+            return AdamsBashforth2Solver(
+                tolerance=cmd_cfg.solver_tolerance,
+                max_iterations=cmd_cfg.solver_max_iterations,
+                enforce_hermiticity=True,
+                enforce_trace=False,
+            )
+        raise ValueError(f"Unsupported CMD solver '{cmd_cfg.solver}'.")
+
     @staticmethod
     def _normalize_plot_name(plot_name: str) -> str:
         key = plot_name.strip().lower()
@@ -169,3 +398,7 @@ class QXTISimulation:
             "modulo_de_velocidad": "velocity_magnitude",
         }
         return aliases.get(key, key)
+
+    @staticmethod
+    def _emit_progress(message: str) -> None:
+        print(f"[QXTI] {message}")

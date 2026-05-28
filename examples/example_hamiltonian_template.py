@@ -19,7 +19,7 @@ BASIS_TYPE = "spin"
 IS_PERIODIC = True
 
 
-# Opcional pero muy util: parametros fisicos por defecto.
+# Opcional pero muy util: parametros fisicos por defecto en atomic units.
 DEFAULT_PARAMS = {
     "mass": 0.35,
     "velocity": 2.10,
@@ -28,7 +28,7 @@ DEFAULT_PARAMS = {
 }
 
 
-# Opcional: informacion de red para lectura/documentacion.
+# Opcional: informacion de red para lectura/documentacion en atomic units.
 DEFAULT_LATTICE = {
     "lattice_type": "2D square lattice",
     "lattice_constants": {

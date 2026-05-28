@@ -153,6 +153,23 @@ class Laser:
         data["intensity"] = self.intensity()
         return data
 
+    def temporal_bounds(self) -> tuple[float, float]:
+        """Return a finite time window that fully contains the pulse in atomic units."""
+
+        if self.envelope == "gaussian":
+            half_width = 4.0 * self.fwhm
+        elif self.envelope == "sech":
+            half_width = 6.0 * self.fwhm
+        elif self.envelope == "cos2":
+            half_width = 0.5 * self.fwhm
+        else:
+            raise ValueError(
+                "A finite automatic time window cannot be inferred for a constant envelope. "
+                "Use a pulsed envelope such as gaussian, sech, or cos2."
+            )
+
+        return float(self.t0 - half_width), float(self.t0 + half_width)
+
     def _field_basis(self) -> tuple[FloatArray, FloatArray, FloatArray]:
         major_axis = self.polarization_vector()
         major_axis /= np.linalg.norm(major_axis)

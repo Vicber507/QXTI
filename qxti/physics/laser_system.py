@@ -66,6 +66,18 @@ class LaserSystem:
 
         return len(self.lasers)
 
+    def temporal_bounds(self) -> tuple[float, float]:
+        """Return one time window that contains all pulses, in atomic units."""
+
+        if not self.lasers:
+            raise ValueError("Cannot infer temporal bounds from an empty LaserSystem.")
+
+        bounds = [laser.temporal_bounds() for laser in self.lasers]
+        return (
+            float(min(start for start, _ in bounds)),
+            float(max(stop for _, stop in bounds)),
+        )
+
     def _sum_vectors(self, method_name: str, t: ArrayLike) -> FloatArray:
         time = np.asarray(t, dtype=float)
 
