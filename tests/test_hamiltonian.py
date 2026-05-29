@@ -17,6 +17,8 @@ class TwoBandHamiltonian(Hamiltonian):
     DEFAULT_LATTICE = {
         "lattice_constants": {"ax": 1.0, "ay": 1.0},
         "real_space_vectors": {"a1": [1.0, 0.0], "a2": [0.0, 1.0]},
+        "BZorigin": [0.0, 0.0, 0.0],
+        "BZaxis": [[2.0 * np.pi, 0.0, 0.0], [0.0, 2.0 * np.pi, 0.0], [0.0, 0.0, 0.0]],
     }
 
     def default_params(self) -> dict[str, float]:
@@ -94,9 +96,11 @@ def test_hamiltonian_construction_and_summary() -> None:
 
     assert hamiltonian.params == {"mass": 1.0, "coupling": 2.0}
     assert hamiltonian.lattice["lattice_constants"] == {"ax": 1.0, "ay": 1.0}
+    assert hamiltonian.lattice["BZorigin"] == [0.0, 0.0, 0.0]
     assert hamiltonian.H(0.0, 0.0, 0.0).shape == (2, 2)
     assert summary["model_name"] == "two-band"
     assert summary["lattice"]["lattice_constants"] == {"ax": 1.0, "ay": 1.0}
+    assert summary["lattice"]["BZorigin"] == [0.0, 0.0, 0.0]
     assert summary["basis_size"] == 2
     assert summary["dimension"] == 2
     assert summary["basis_type"] == "orbital"
@@ -114,6 +118,14 @@ def test_hamiltonian_infers_real_space_lengths_and_reciprocal_box() -> None:
     np.testing.assert_allclose(
         reciprocal_bounds,
         np.array([[-np.pi, np.pi], [-np.pi, np.pi]], dtype=float),
+    )
+    np.testing.assert_allclose(
+        hamiltonian.brillouin_zone_axis_matrix(),
+        np.array([[2.0 * np.pi, 0.0, 0.0], [0.0, 2.0 * np.pi, 0.0], [0.0, 0.0, 0.0]], dtype=float),
+    )
+    np.testing.assert_allclose(
+        hamiltonian.brillouin_zone_origin(),
+        np.array([0.0, 0.0, 0.0], dtype=float),
     )
 
 

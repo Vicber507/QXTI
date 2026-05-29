@@ -23,6 +23,7 @@ DEFAULT_RESPONSE_PLOT_CONFIG = {
             "enabled": True,
             "output_file": "population_kx_ky_per_band.mp4",
             "fps": 10,
+            "duration_seconds": 20.0,
             "frame_stride": 2,
             "cmap": "qx_diverging_black",
             "center_zero": True,
@@ -45,6 +46,7 @@ DEFAULT_RESPONSE_PLOT_CONFIG = {
             "enabled": True,
             "output_file": "coherence_kx_ky_per_pair.mp4",
             "fps": 10,
+            "duration_seconds": 20.0,
             "frame_stride": 2,
             "cmap": "qx_diverging_black",
             "center_zero": True,
@@ -133,6 +135,7 @@ class ResponseGraphics:
         output_path: Path,
         *,
         fps: int = 10,
+        duration_seconds: float | None = None,
         frame_stride: int = 1,
         cmap: str = "inferno",
         center_zero: bool = False,
@@ -150,6 +153,7 @@ class ResponseGraphics:
             ky_values=np.asarray(data["ky_values"], dtype=float),
             output_path=output_path,
             fps=fps,
+            duration_seconds=duration_seconds,
             frame_stride=frame_stride,
             cmap=cmap,
             center_zero=center_zero,
@@ -164,6 +168,7 @@ class ResponseGraphics:
         output_path: Path,
         *,
         fps: int = 10,
+        duration_seconds: float | None = None,
         frame_stride: int = 1,
         cmap: str = "magma",
         center_zero: bool = False,
@@ -179,6 +184,7 @@ class ResponseGraphics:
             ky_values=np.asarray(data["ky_values"], dtype=float),
             output_path=output_path,
             fps=fps,
+            duration_seconds=duration_seconds,
             frame_stride=frame_stride,
             cmap=cmap,
             center_zero=center_zero,
@@ -300,6 +306,7 @@ class ResponseGraphics:
         ky_values: np.ndarray,
         output_path: Path,
         fps: int,
+        duration_seconds: float | None,
         frame_stride: int,
         cmap: str,
         center_zero: bool,
@@ -309,8 +316,12 @@ class ResponseGraphics:
     ) -> Path:
         pyplot = ResponseGraphics._require_matplotlib()
         frame_stride = max(int(frame_stride), 1)
-        fps = max(int(fps), 1)
         frame_indices = np.arange(0, frames.shape[0], frame_stride, dtype=int)
+        fps = ResponseGraphics._resolve_animation_fps(
+            num_frames=len(frame_indices),
+            fps=fps,
+            duration_seconds=duration_seconds,
+        )
         n_entities = len(labels)
         ncols = min(2, max(n_entities, 1))
         nrows = int(np.ceil(max(n_entities, 1) / ncols))
@@ -444,6 +455,17 @@ class ResponseGraphics:
                 return animation.FFMpegWriter(fps=fps)
             raise RuntimeError("FFMpegWriter is not available; install ffmpeg to save MP4 animations.")
         raise ValueError("Animation output_path must end in .gif or .mp4.")
+
+    @staticmethod
+    def _resolve_animation_fps(
+        *,
+        num_frames: int,
+        fps: int,
+        duration_seconds: float | None,
+    ) -> int:
+        if duration_seconds is not None and duration_seconds > 0.0:
+            return max(1, int(round(float(num_frames) / float(duration_seconds))))
+        return max(int(fps), 1)
 
     @staticmethod
     def _save(figure: Any, output_path: Path) -> Path:

@@ -81,6 +81,8 @@ class CMD:
 
         self.gamma_population = 0.0 if np.isinf(self.population_time) else 1.0 / self.population_time
         self.gamma_coherence = 0.0 if np.isinf(self.coherence_time) else 1.0 / self.coherence_time
+        self._has_population_relaxation = self.gamma_population > 0.0
+        self._has_coherence_relaxation = self.gamma_coherence > 0.0
         self.relaxation_model = T1T2Relaxation(
             T1=self.population_time,
             T2=self.coherence_time,
@@ -178,6 +180,7 @@ class CMD:
         orders_band: dict[int, ComplexArray] = {0: equilibrium}
         total_order_solves = max(0, self.max_order * len(k_points))
         completed_solves = 0
+        field_series = self._field_series(target_times)
 
         self._emit_progress(
             f"CMD starting: {self.max_order} driven orders, {len(k_points)} k-points, "
@@ -195,6 +198,7 @@ class CMD:
             orders_band[order], completed_solves = self._solve_single_order_band(
                 k_points,
                 target_times,
+                field_series,
                 driving_components,
                 order=order,
                 completed_solves=completed_solves,
@@ -226,6 +230,7 @@ class CMD:
         self,
         k_points: FloatArray,
         target_times: FloatArray,
+        field_series: FloatArray,
         driving_components: ComplexArray,
         *,
         order: int,
@@ -236,22 +241,19 @@ class CMD:
         nt = len(target_times)
         nb = self.hamiltonian.basis_size
         solved = np.empty((nk, nt, nb, nb), dtype=np.complex128)
-        initial_state = np.zeros((nb, nb), dtype=np.complex128)
 
         for ik, k_point in enumerate(k_points):
             kx, ky, kz = self._k_components(k_point)
             omega_matrix = self._omega_matrix(kx, ky, kz)
-            times, states = self.solver.solve(
-                self._order_equation_of_motion,
-                self.timegrid.t0,
-                self.timegrid.tf,
-                initial_state,
-                self.timegrid.initial_h,
-                target_times,
+            source_series = self._field_weighted_source_series(
+                field_series,
                 driving_components[ik],
+            )
+            solved[ik] = self._solve_linear_order_band_on_grid(
+                target_times,
+                source_series,
                 omega_matrix,
             )
-            solved[ik] = self._resample_density_trajectory(times, states, target_times)
             completed_solves += 1
             self._emit_progress(
                 f"CMD progress: order {order}/{self.max_order}, "
@@ -260,6 +262,31 @@ class CMD:
             )
 
         return solved, completed_solves
+
+    def _solve_linear_order_band_on_grid(
+        self,
+        target_times: FloatArray,
+        source_series: ComplexArray,
+        omega_matrix: ComplexArray,
+    ) -> ComplexArray:
+        nt = len(target_times)
+        nb = self.hamiltonian.basis_size
+        rho_series = np.zeros((nt, nb, nb), dtype=np.complex128)
+        damping = self._damping_matrix()
+        lambda_matrix = damping + 1.0j * omega_matrix
+
+        for it in range(nt - 1):
+            dt = float(target_times[it + 1] - target_times[it])
+            if dt <= 0.0:
+                raise ValueError("target_times must be strictly increasing.")
+            propagator = np.exp(-lambda_matrix * dt)
+            rho_next = (
+                propagator * rho_series[it]
+                + 0.5 * dt * (propagator * source_series[it] + source_series[it + 1])
+            )
+            rho_series[it + 1] = self.hamiltonian.validate_matrix(rho_next)
+
+        return rho_series
 
     def save_density_matrix_dat(
         self,
@@ -364,6 +391,28 @@ class CMD:
                     components[ik, :, axis] += -1.0j * commutator
 
         return components
+
+    def _field_series(self, target_times: FloatArray) -> FloatArray:
+        field = np.asarray(self.laser_system.electric_field(target_times), dtype=float)
+        return np.atleast_2d(field)
+
+    def _field_weighted_source_series(
+        self,
+        field_series: FloatArray,
+        source_components: ComplexArray,
+    ) -> ComplexArray:
+        active_dim = min(self.hamiltonian.dimension, source_components.shape[1], field_series.shape[1])
+        if active_dim <= 0:
+            raise ValueError("No active field/source dimensions are available for CMD.")
+        return np.asarray(
+            np.einsum(
+                "ta,tabc->tbc",
+                field_series[:, :active_dim],
+                source_components[:, :active_dim],
+                optimize=True,
+            ),
+            dtype=np.complex128,
+        )
 
     def _k_gradient_components(self, tensor: ComplexArray) -> ComplexArray:
         nk, nt, nb, _ = tensor.shape
@@ -470,11 +519,23 @@ class CMD:
         )
 
     def _dephasing_term(self, rho: ComplexArray) -> ComplexArray:
-        zero_equilibrium = np.zeros_like(rho, dtype=np.complex128)
-        return np.asarray(
-            self.relaxation_model.term(rho, zero_equilibrium),
-            dtype=np.complex128,
-        )
+        derivative = np.zeros_like(rho, dtype=np.complex128)
+
+        if self._has_population_relaxation:
+            derivative[self._diag_indices] = -self.gamma_population * rho[self._diag_indices]
+
+        if self._has_coherence_relaxation:
+            derivative[self._offdiag_mask] = -self.gamma_coherence * rho[self._offdiag_mask]
+
+        return derivative
+
+    def _damping_matrix(self) -> ComplexArray:
+        damping = np.zeros((self.hamiltonian.basis_size, self.hamiltonian.basis_size), dtype=np.complex128)
+        if self._has_population_relaxation:
+            damping[self._diag_indices] = self.gamma_population
+        if self._has_coherence_relaxation:
+            damping[self._offdiag_mask] = self.gamma_coherence
+        return damping
 
     @staticmethod
     def _linear_interpolate_series(

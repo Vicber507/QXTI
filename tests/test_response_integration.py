@@ -381,16 +381,14 @@ def test_cmd_velocity_gauge_is_rejected_for_recursive_solver() -> None:
         raise AssertionError("CMD should reject velocity gauge for the recursive solver.")
 
 
-def test_cmd_raises_when_solver_does_not_reach_final_time() -> None:
+def test_cmd_band_recursive_solver_is_not_limited_by_external_solver_iteration_caps() -> None:
     cmd, _ = build_cmd_stack(max_order=1)
     cmd.solver.max_iterations = 1
 
-    try:
-        cmd.solve_time_domain()
-    except RuntimeError as exc:
-        assert "final time" in str(exc)
-    else:
-        raise AssertionError("CMD should fail if the solver does not reach the final time.")
+    rho_orders = cmd.solve_time_domain()
+
+    assert rho_orders[1].shape[-2:] == (2, 2)
+    assert np.max(np.abs(rho_orders[1])) > 0.0
 
 
 def test_resample_density_trajectory_rejects_incomplete_time_coverage() -> None:
@@ -563,17 +561,31 @@ def test_xtp_current_frequency_domain_matches_manual_fft_and_plot(tmp_path: Path
         xtp,
         electric_field_time=cmd.laser_system.electric_field(cmd.timegrid.generate()),
     ).current_spectrum_data()
-    assert harmonic_data["orders"] == (0, 1)
+    equilibrium_current = np.column_stack(
+        [xtp.current(0, direction) for direction in ("x", "y")]
+        + [np.zeros(len(cmd.timegrid), dtype=float)]
+    )
+    induced_current = current_time - equilibrium_current
+    _, induced_spectrum = xtp._fft_time_signal(induced_current)
+
+    assert harmonic_data["orders"] == (1,)
+    assert harmonic_data["all_orders"] == (0, 1)
+    assert bool(harmonic_data["equilibrium_subtracted"]) is True
     assert harmonic_data["omega_axis"].shape == (nfft,)
     assert harmonic_data["current_spectrum"].shape == (nfft, 3)
     assert harmonic_data["current_magnitude"].shape == (nfft, 3)
     assert harmonic_data["current_time"].shape == (len(cmd.timegrid), 3)
+    assert harmonic_data["current_time_total"].shape == (len(cmd.timegrid), 3)
+    assert harmonic_data["equilibrium_current_time"].shape == (len(cmd.timegrid), 3)
     assert harmonic_data["electric_field_time"].shape == (len(cmd.timegrid), 3)
     assert harmonic_data["bz_mask"]["enabled"] is False
     assert harmonic_data["kx_grid"].shape == harmonic_data["ky_grid"].shape
     assert harmonic_data["integration_region"].shape == harmonic_data["mask_weights"].shape
     np.testing.assert_allclose(harmonic_data["integration_region"], 1.0)
     np.testing.assert_allclose(harmonic_data["mask_weights"], 1.0)
+    np.testing.assert_allclose(harmonic_data["current_time_total"], current_time, atol=1.0e-12)
+    np.testing.assert_allclose(harmonic_data["current_time"], induced_current, atol=1.0e-12)
+    np.testing.assert_allclose(harmonic_data["current_spectrum"], induced_spectrum, atol=1.0e-10)
 
     if "matplotlib" not in sys.modules and importlib.util.find_spec("matplotlib") is None:
         return
@@ -581,7 +593,7 @@ def test_xtp_current_frequency_domain_matches_manual_fft_and_plot(tmp_path: Path
     current_time_output = HarmonicGraphics.plot_field_current_time_comparison(
         np.asarray(cmd.timegrid.generate(), dtype=float),
         np.asarray(harmonic_data["electric_field_time"], dtype=float),
-        current_time,
+        np.asarray(harmonic_data["current_time"], dtype=float),
         tmp_path / "field_current_time.png",
         directions=("x", "y"),
         include_total=True,
@@ -590,8 +602,8 @@ def test_xtp_current_frequency_domain_matches_manual_fft_and_plot(tmp_path: Path
     assert current_time_output.stat().st_size > 0
 
     output_path = HarmonicGraphics.plot_current_magnitude_spectrum(
-        omega_axis,
-        current_spectrum,
+        np.asarray(harmonic_data["omega_axis"], dtype=float),
+        np.asarray(harmonic_data["current_spectrum"], dtype=np.complex128),
         tmp_path / "current_spectrum.png",
         orders=tuple(harmonic_data["orders"]),
         directions=("x", "y"),
@@ -601,8 +613,8 @@ def test_xtp_current_frequency_domain_matches_manual_fft_and_plot(tmp_path: Path
     assert output_path.stat().st_size > 0
 
     circular_output_path = HarmonicGraphics.plot_circular_current_spectrum(
-        omega_axis,
-        current_spectrum,
+        np.asarray(harmonic_data["omega_axis"], dtype=float),
+        np.asarray(harmonic_data["current_spectrum"], dtype=np.complex128),
         tmp_path / "current_circular_spectrum.png",
         orders=tuple(harmonic_data["orders"]),
         positive_only=True,

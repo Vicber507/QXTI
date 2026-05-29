@@ -94,7 +94,7 @@ def write_config_file(tmp_path: Path, model_path: Path) -> Path:
 
             [kgrid]
             dimension = 2
-            points_per_axis = 3
+            k_points = [3, 3]
 
             [timegrid]
             dt = 0.2
@@ -168,7 +168,8 @@ def test_qxti_config_parses_hamiltonian_and_plot_sections(tmp_path: Path) -> Non
     )
     assert config.hamiltonian_plots.band_indices is None
     assert config.kgrid.dimension == 2
-    assert config.kgrid.points_per_axis == 3
+    assert config.kgrid.k_points == (3, 3)
+    assert config.kgrid.points_per_axis is None
     assert config.kgrid.kx_values == []
     assert np.isclose(config.timegrid.dt, 0.2)
     assert config.timegrid.Nt is None
@@ -199,6 +200,7 @@ def test_simulation_builds_custom_hamiltonian_from_config(tmp_path: Path) -> Non
 
     simulation = QXTISimulation.from_file(config_path)
     hamiltonian = simulation.build_hamiltonian()
+    kgrid = simulation.build_kgrid(hamiltonian)
 
     assert hamiltonian.model_name == "toy-surface"
     assert hamiltonian.basis_size == 2
@@ -211,6 +213,7 @@ def test_simulation_builds_custom_hamiltonian_from_config(tmp_path: Path) -> Non
         reciprocal_bounds,
         np.array([[-np.pi, np.pi], [-np.pi, np.pi]], dtype=float),
     )
+    assert kgrid.shape == (3, 3, 1)
 
 
 def test_simulation_builds_rkf45_with_full_window_default_hmax(tmp_path: Path) -> None:
@@ -225,6 +228,58 @@ def test_simulation_builds_rkf45_with_full_window_default_hmax(tmp_path: Path) -
         cmd.solver.h_max,  # type: ignore[attr-defined]
         cmd.timegrid.t_max - cmd.timegrid.t_min,
     )
+
+
+def test_config_parses_unlimited_rkf45_iterations_and_adaptation_controls(tmp_path: Path) -> None:
+    model_path = write_model_file(tmp_path)
+    config_path = tmp_path / "inputParams_unlimited.cfg"
+    config_path.write_text(
+        dedent(
+            f"""
+            [hamiltonian]
+            source_file = {model_path}
+
+            [kgrid]
+            dimension = 2
+            k_points = [3, 3]
+
+            [timegrid]
+            dt = 0.2
+
+            [laser]
+            omega = 0.8
+            E0 = 0.05
+            ellip = 0.0
+            ncycles = 1.0
+            envname = gauss
+
+            [cmd]
+            enabled = true
+            solver = rkf45
+            solver_tolerance = 5.0e-4
+            solver_max_iterations = 0
+            solver_max_rejections = 25000
+            solver_safety_factor = 0.95
+            solver_min_factor = 0.25
+            solver_max_factor = 6.0
+            """
+        )
+    )
+
+    config = QXTIConfig.from_file(config_path)
+    assert config.cmd.solver_max_iterations is None
+    assert config.cmd.solver_max_rejections == 25000
+    assert np.isclose(config.cmd.solver_safety_factor, 0.95)
+    assert np.isclose(config.cmd.solver_min_factor, 0.25)
+    assert np.isclose(config.cmd.solver_max_factor, 6.0)
+
+    simulation = QXTISimulation.from_file(config_path)
+    hamiltonian = simulation.build_hamiltonian()
+    cmd = simulation.build_cmd(hamiltonian)
+    assert cmd.solver.max_iterations is None
+    assert np.isclose(cmd.solver.safety_factor, 0.95)  # type: ignore[attr-defined]
+    assert np.isclose(cmd.solver.min_factor, 0.25)  # type: ignore[attr-defined]
+    assert np.isclose(cmd.solver.max_factor, 6.0)  # type: ignore[attr-defined]
 
 
 def test_simulation_generates_requested_outputs(tmp_path: Path) -> None:

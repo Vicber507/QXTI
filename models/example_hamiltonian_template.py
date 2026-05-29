@@ -36,6 +36,12 @@ DEFAULT_LATTICE = {
         "a1": [1.0, 0.0],
         "a2": [0.0, 1.0],
     },
+    "BZorigin": [0.0, 0.0, 0.0],
+    "BZaxis": [
+        [2.0 * np.pi, 0.0, 0.0],
+        [0.0, 2.0 * np.pi, 0.0],
+        [0.0, 0.0, 0.0],
+    ],
     "notes": "Puedes guardar aqui informacion extra del modelo.",
 }
 
