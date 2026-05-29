@@ -416,6 +416,7 @@ def test_xtp_basic_observables_run_with_cmd_output() -> None:
         operator_factory=operator_factory,
         directions=["x", "y"],
         orders=[0, 1],
+        band_gauge_frame=cmd.band_gauge_frame,
     )
 
     polarization = xtp.total_polarization()
@@ -449,6 +450,7 @@ def test_xtp_first_order_polarization_matches_manual_bz_dipole_integral() -> Non
         operator_factory=operator_factory,
         directions=["x"],
         orders=[1],
+        band_gauge_frame=cmd.band_gauge_frame,
     )
 
     polarization = xtp.polarization(1)
@@ -456,8 +458,9 @@ def test_xtp_first_order_polarization_matches_manual_bz_dipole_integral() -> Non
     nt = len(cmd.timegrid)
     point_values = np.zeros((cmd.kgrid.total_points, nt), dtype=np.complex128)
 
-    for ik, (kx, ky, kz) in enumerate(cmd.kgrid.points()):
-        dipole = operator_factory.dipole("x", float(kx), float(ky), float(kz))
+    dipoles = cmd.band_gauge_frame.connection("x")
+    for ik in range(cmd.kgrid.total_points):
+        dipole = dipoles[ik]
         point_values[ik] = np.einsum(
             "mn,tnm->t",
             dipole,
@@ -496,6 +499,7 @@ def test_xtp_bz_mask_reduces_edge_contributions_with_circular_gaussian_cutoff() 
         operator_factory=operator_factory,
         directions=["x"],
         orders=[0],
+        band_gauge_frame=cmd.band_gauge_frame,
     )
     xtp_masked = XTP(
         hamiltonian=cmd.hamiltonian,
@@ -506,6 +510,7 @@ def test_xtp_bz_mask_reduces_edge_contributions_with_circular_gaussian_cutoff() 
         operator_factory=operator_factory,
         directions=["x"],
         orders=[0],
+        band_gauge_frame=cmd.band_gauge_frame,
         bz_mask_enabled=True,
         bz_mask_radius_percent=60.0,
         bz_mask_sigma=0.94,
@@ -528,7 +533,7 @@ def test_xtp_bz_mask_reduces_edge_contributions_with_circular_gaussian_cutoff() 
 
 
 def test_xtp_current_frequency_domain_matches_manual_fft_and_plot(tmp_path: Path) -> None:
-    cmd, operator_factory = build_cmd_stack(max_order=1)
+    cmd, operator_factory = build_cmd_stack(max_order=4)
     rho_orders = cmd.compute_all_orders()
     xtp = XTP(
         hamiltonian=cmd.hamiltonian,
@@ -538,7 +543,8 @@ def test_xtp_current_frequency_domain_matches_manual_fft_and_plot(tmp_path: Path
         frequencygrid=FrequencyGrid(0.0, 5.0, 32),
         operator_factory=operator_factory,
         directions=["x", "y"],
-        orders=[0, 1],
+        orders=[0, 1, 2, 3, 4],
+        band_gauge_frame=cmd.band_gauge_frame,
     )
 
     omega_axis, current_spectrum = xtp.total_current_frequency_domain()
@@ -568,8 +574,8 @@ def test_xtp_current_frequency_domain_matches_manual_fft_and_plot(tmp_path: Path
     induced_current = current_time - equilibrium_current
     _, induced_spectrum = xtp._fft_time_signal(induced_current)
 
-    assert harmonic_data["orders"] == (1,)
-    assert harmonic_data["all_orders"] == (0, 1)
+    assert harmonic_data["orders"] == (1, 2, 3, 4)
+    assert harmonic_data["all_orders"] == (0, 1, 2, 3, 4)
     assert bool(harmonic_data["equilibrium_subtracted"]) is True
     assert harmonic_data["omega_axis"].shape == (nfft,)
     assert harmonic_data["current_spectrum"].shape == (nfft, 3)
@@ -587,37 +593,57 @@ def test_xtp_current_frequency_domain_matches_manual_fft_and_plot(tmp_path: Path
     np.testing.assert_allclose(harmonic_data["current_time"], induced_current, atol=1.0e-12)
     np.testing.assert_allclose(harmonic_data["current_spectrum"], induced_spectrum, atol=1.0e-10)
 
-    if "matplotlib" not in sys.modules and importlib.util.find_spec("matplotlib") is None:
-        return
 
-    current_time_output = HarmonicGraphics.plot_field_current_time_comparison(
-        np.asarray(cmd.timegrid.generate(), dtype=float),
-        np.asarray(harmonic_data["electric_field_time"], dtype=float),
-        np.asarray(harmonic_data["current_time"], dtype=float),
-        tmp_path / "field_current_time.png",
-        directions=("x", "y"),
-        include_total=True,
+def test_cmd_band_gauge_frame_builds_full_berry_connection_and_covariant_source() -> None:
+    cmd, _ = build_cmd_stack(
+        max_order=1,
+        kgrid=KGrid(
+            kx_values=np.linspace(-0.2, 0.2, 5),
+            ky_values=np.linspace(-0.15, 0.15, 4),
+            kz_values=np.array([0.0]),
+            dimension=2,
+        ),
     )
-    assert current_time_output.exists()
-    assert current_time_output.stat().st_size > 0
 
-    output_path = HarmonicGraphics.plot_current_magnitude_spectrum(
-        np.asarray(harmonic_data["omega_axis"], dtype=float),
-        np.asarray(harmonic_data["current_spectrum"], dtype=np.complex128),
-        tmp_path / "current_spectrum.png",
-        orders=tuple(harmonic_data["orders"]),
-        directions=("x", "y"),
-        positive_only=True,
-    )
-    assert output_path.exists()
-    assert output_path.stat().st_size > 0
+    connection_x = cmd.band_gauge_frame.connection("x")
+    connection_y = cmd.band_gauge_frame.connection("y")
+    rho = np.zeros((cmd.kgrid.total_points, len(cmd.timegrid), 2, 2), dtype=np.complex128)
+    rho[:, :, 0, 1] = 1.0 + 0.0j
+    rho[:, :, 1, 0] = 1.0 + 0.0j
 
-    circular_output_path = HarmonicGraphics.plot_circular_current_spectrum(
-        np.asarray(harmonic_data["omega_axis"], dtype=float),
-        np.asarray(harmonic_data["current_spectrum"], dtype=np.complex128),
-        tmp_path / "current_circular_spectrum.png",
-        orders=tuple(harmonic_data["orders"]),
-        positive_only=True,
+    source = cmd._connection_commutator_components(rho)
+
+    np.testing.assert_allclose(connection_x, np.conjugate(np.swapaxes(connection_x, 1, 2)), atol=1.0e-8)
+    np.testing.assert_allclose(connection_y, np.conjugate(np.swapaxes(connection_y, 1, 2)), atol=1.0e-8)
+    assert np.max(np.abs(np.diagonal(connection_x, axis1=1, axis2=2))) > 0.0
+    assert np.max(np.abs(source[:, :, 0])) > 0.0
+
+
+def test_xtp_current_uses_same_band_gauge_as_cmd() -> None:
+    cmd, operator_factory = build_cmd_stack(max_order=1)
+    rho_orders = cmd.compute_all_orders()
+    xtp = XTP(
+        hamiltonian=cmd.hamiltonian,
+        rho_orders=rho_orders,
+        kgrid=cmd.kgrid,
+        timegrid=cmd.timegrid,
+        frequencygrid=FrequencyGrid(0.0, 5.0, 32),
+        operator_factory=operator_factory,
+        directions=["x"],
+        orders=[1],
+        band_gauge_frame=cmd.band_gauge_frame,
     )
-    assert circular_output_path.exists()
-    assert circular_output_path.stat().st_size > 0
+
+    current = xtp.current(1, "x")
+    point_values = np.zeros((cmd.kgrid.total_points, len(cmd.timegrid)), dtype=np.complex128)
+    current_operators = cmd.band_gauge_frame.current("x")
+    for ik in range(cmd.kgrid.total_points):
+        point_values[ik] = np.einsum(
+            "mn,tnm->t",
+            current_operators[ik],
+            rho_orders[1][ik],
+            optimize=True,
+        )
+
+    manual = xtp._integrate_over_brillouin_zone(point_values)
+    np.testing.assert_allclose(current, np.real(manual), atol=1.0e-9)

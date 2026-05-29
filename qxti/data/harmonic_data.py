@@ -22,16 +22,16 @@ class HarmonicData:
     def current_spectrum_data(self) -> dict[str, Any]:
         """Return one serializable dataset for the induced current spectrum.
 
-        Harmonic plots use only the radiative orders ``rho^(1) + rho^(2) + rho^(3)``
-        from whatever subset is available in ``xtp.orders``. This keeps the
-        exported HHG observables aligned with the usual perturbative
-        interpretation and avoids contamination from the equilibrium
-        contribution ``rho^(0)``.
+        Harmonic plots use the sum of every radiative order available in
+        ``xtp.orders`` except the equilibrium contribution ``rho^(0)``.
+        This keeps the exported HHG observables aligned with the induced
+        response stored in the saved ``rho_order_*.npy`` files without
+        hard-coding a maximum perturbative order.
         """
 
-        selected_orders = tuple(order for order in self.xtp.orders if 1 <= int(order) <= 3)
+        selected_orders = tuple(order for order in self.xtp.orders if int(order) > 0)
         if not selected_orders:
-            selected_orders = tuple(order for order in self.xtp.orders if int(order) > 0)
+            raise ValueError("Harmonic spectra require at least one positive perturbative order.")
 
         current_time_total = np.asarray(self.xtp.total_current(), dtype=float)
         polarization_time_total = np.asarray(self.xtp.total_polarization(), dtype=float)

@@ -249,6 +249,7 @@ def plot_harmonic_graphics_from_saved_data(
             output_dir / str(field_current_cfg["output_file"]),
             directions=tuple(str(direction) for direction in field_current_cfg["directions"]),
             include_total=bool(field_current_cfg["include_total"]),
+            combine_planar=bool(field_current_cfg.get("combine_planar", False)),
         )
 
     current_cfg = resolved_plot_config["current_spectrum"]

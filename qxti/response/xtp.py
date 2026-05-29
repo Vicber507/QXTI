@@ -6,7 +6,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from qxti.grids import FrequencyGrid, KGrid, TimeGrid
-from qxti.physics import Hamiltonian, OperatorFactory
+from qxti.physics import BandGaugeFrame, Hamiltonian, OperatorFactory
 
 
 ComplexArray = NDArray[np.complex128]
@@ -43,6 +43,7 @@ class XTP:
         operator_factory: OperatorFactory,
         directions: list[str],
         orders: list[int],
+        band_gauge_frame: BandGaugeFrame | None = None,
         bz_mask_enabled: bool = False,
         bz_mask_radius_percent: float = 100.0,
         bz_mask_sigma: float | None = None,
@@ -56,6 +57,7 @@ class XTP:
         self.operator_factory = operator_factory
         self.directions = [self._normalize_direction(direction) for direction in directions]
         self.orders = sorted({int(order) for order in orders})
+        self.band_gauge_frame = band_gauge_frame
         self.bz_mask_enabled = bool(bz_mask_enabled)
         self.bz_mask_radius_percent = float(bz_mask_radius_percent)
         self.bz_mask_sigma = None if bz_mask_sigma is None else float(bz_mask_sigma)
@@ -84,9 +86,14 @@ class XTP:
         for direction in self.directions:
             axis = self._direction_axis(direction)
             expectation = np.zeros((nk, nt), dtype=np.complex128)
+            cached_dipole = None if self.band_gauge_frame is None else self.band_gauge_frame.connection(direction)
 
             for ik, (kx, ky, kz) in enumerate(k_points):
-                dipole = self.operator_factory.dipole(direction, float(kx), float(ky), float(kz))
+                dipole = (
+                    self.operator_factory.dipole(direction, float(kx), float(ky), float(kz))
+                    if cached_dipole is None
+                    else cached_dipole[ik]
+                )
                 expectation[ik] = np.einsum(
                     "mn,tnm->t",
                     dipole,
@@ -107,9 +114,14 @@ class XTP:
         nt = rho_tensor.shape[1]
         expectation = np.zeros((nk, nt), dtype=np.complex128)
         k_points = self.kgrid.points()
+        cached_current = None if self.band_gauge_frame is None else self.band_gauge_frame.current(direction)
 
         for ik, (kx, ky, kz) in enumerate(k_points):
-            current_operator = self.operator_factory.current(direction, float(kx), float(ky), float(kz))
+            current_operator = (
+                self.operator_factory.current(direction, float(kx), float(ky), float(kz))
+                if cached_current is None
+                else cached_current[ik]
+            )
             expectation[ik] = np.einsum(
                 "mn,tnm->t",
                 current_operator,
