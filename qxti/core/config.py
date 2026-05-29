@@ -61,6 +61,19 @@ def _parse_int_tuple_or_none(value: str) -> tuple[int, ...] | None:
     raise ValueError("Expected an int, a sequence of ints, or 'all'.")
 
 
+def _parse_int_tuple(value: str, *, default: tuple[int, ...] = ()) -> tuple[int, ...]:
+    stripped = value.strip()
+    if not stripped:
+        return tuple(default)
+
+    parsed = _parse_scalar(stripped)
+    if isinstance(parsed, int):
+        return (int(parsed),)
+    if isinstance(parsed, (list, tuple)):
+        return tuple(int(item) for item in parsed)
+    raise ValueError(f"Expected an integer tuple/list, got {value!r}.")
+
+
 def _parse_float_list(value: str, *, default: list[float] | None = None) -> list[float]:
     stripped = value.strip()
     if not stripped:
@@ -135,7 +148,8 @@ class HamiltonianPlotsConfig:
 @dataclass(slots=True)
 class KGridConfig:
     dimension: int | None = None
-    points_per_axis: int = 3
+    k_points: tuple[int, ...] = field(default_factory=tuple)
+    points_per_axis: int | None = None
     kx_values: list[float] = field(default_factory=list)
     ky_values: list[float] = field(default_factory=list)
     kz_values: list[float] = field(default_factory=list)
@@ -211,9 +225,13 @@ class CMDConfig:
     include_dephasing: bool = True
     solver: str = "rkf45"
     solver_tolerance: float = 1.0e-6
-    solver_max_iterations: int = 100000
+    solver_max_iterations: int | None = None
+    solver_max_rejections: int = 10000
     solver_h_min: float = 1.0e-12
     solver_h_max: float | None = None
+    solver_safety_factor: float = 0.9
+    solver_min_factor: float = 0.2
+    solver_max_factor: float = 4.0
     save_frequency_domain: bool = False
 
 
@@ -374,9 +392,12 @@ class QXTIConfig:
 
     @staticmethod
     def _parse_kgrid_section(section: configparser.SectionProxy) -> KGridConfig:
+        k_points_raw = section.get("k_points", fallback="").strip()
+        points_per_axis_raw = section.get("points_per_axis", fallback=section.get("num_points", fallback="")).strip()
         return KGridConfig(
             dimension=section.getint("dimension", fallback=None),
-            points_per_axis=section.getint("points_per_axis", fallback=section.getint("num_points", fallback=3)),
+            k_points=_parse_int_tuple(k_points_raw, default=()),
+            points_per_axis=None if not points_per_axis_raw else int(_parse_scalar(points_per_axis_raw)),
             kx_values=_parse_float_list(section.get("kx_values", fallback=""), default=[]),
             ky_values=_parse_float_list(section.get("ky_values", fallback=""), default=[]),
             kz_values=_parse_float_list(section.get("kz_values", fallback=""), default=[]),
@@ -440,10 +461,17 @@ class QXTIConfig:
     @staticmethod
     def _parse_cmd_section(section: configparser.SectionProxy) -> CMDConfig:
         solver_h_max = section.get("solver_h_max", fallback="").strip()
+        solver_max_iterations_raw = section.get("solver_max_iterations", fallback="").strip()
         population_time_raw = section.get("population_time", fallback=section.get("T1", fallback="")).strip()
         coherence_time_raw = section.get("coherence_time", fallback=section.get("T2", fallback="")).strip()
         gamma_population_raw = section.get("gamma_population", fallback="").strip()
         gamma_coherence_raw = section.get("gamma_coherence", fallback="").strip()
+
+        if not solver_max_iterations_raw:
+            solver_max_iterations: int | None = None
+        else:
+            parsed_max_iterations = int(_parse_scalar(solver_max_iterations_raw))
+            solver_max_iterations = None if parsed_max_iterations <= 0 else parsed_max_iterations
 
         if population_time_raw:
             population_time = float(_parse_scalar(population_time_raw))
@@ -477,9 +505,13 @@ class QXTIConfig:
             include_dephasing=section.getboolean("include_dephasing", fallback=True),
             solver=section.get("solver", fallback="rkf45").strip() or "rkf45",
             solver_tolerance=section.getfloat("solver_tolerance", fallback=1.0e-6),
-            solver_max_iterations=section.getint("solver_max_iterations", fallback=100000),
+            solver_max_iterations=solver_max_iterations,
+            solver_max_rejections=section.getint("solver_max_rejections", fallback=10000),
             solver_h_min=section.getfloat("solver_h_min", fallback=1.0e-12),
             solver_h_max=None if not solver_h_max else float(_parse_scalar(solver_h_max)),
+            solver_safety_factor=section.getfloat("solver_safety_factor", fallback=0.9),
+            solver_min_factor=section.getfloat("solver_min_factor", fallback=0.2),
+            solver_max_factor=section.getfloat("solver_max_factor", fallback=4.0),
             save_frequency_domain=section.getboolean("save_frequency_domain", fallback=False),
         )
 

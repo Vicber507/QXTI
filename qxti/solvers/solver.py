@@ -27,19 +27,21 @@ class Solver(ABC):
     def __init__(
         self,
         tolerance: float = 1e-6,
-        max_iterations: int = 100000,
+        max_iterations: int | None = None,
         dtype: str = "complex128"
     ):
-
+        if tolerance <= 0.0:
+            raise ValueError("tolerance must be strictly positive.")
 
         self.tolerance: float = tolerance
 
-        self.max_iterations: int = max_iterations
+        self.max_iterations: int | None = max_iterations
 
         self.dtype: str = dtype
 
-
         self.last_error: float = np.inf
+        self.last_allowed_error: float = np.inf
+        self.last_scale: float = 0.0
 
         self.iterations: int = 0
 
@@ -69,9 +71,7 @@ class Solver(ABC):
         to the requested tolerance.
         """
 
-        self.converged = (
-            self.last_error < self.tolerance
-        )
+        self.converged = self.last_error < self.last_allowed_error
 
         return self.converged
 
@@ -92,6 +92,7 @@ class Solver(ABC):
             "solver": self.__class__.__name__,
 
             "tolerance": self.tolerance,
+            "tolerance_mode": "relative",
 
             "max_iterations": self.max_iterations,
 
@@ -101,8 +102,31 @@ class Solver(ABC):
 
             "last_error": self.last_error,
 
+            "last_allowed_error": self.last_allowed_error,
+
+            "last_scale": self.last_scale,
+
             "converged": self.converged
         }
+
+    def _error_budget(self, *references: ComplexArray) -> float:
+        """Return one scale-aware error budget for the current tentative step.
+
+        The user-facing ``tolerance`` acts as a relative tolerance. The solver
+        converts it into an absolute step-acceptance threshold by looking at the
+        magnitude of the states/increments involved in the current step.
+        """
+
+        scales = [
+            float(np.linalg.norm(np.asarray(reference, dtype=np.complex128).ravel()))
+            for reference in references
+        ]
+        scale = max(scales, default=0.0)
+        floor = 1.0e-14
+        allowed_error = max(floor, self.tolerance * max(scale, floor))
+        self.last_scale = scale
+        self.last_allowed_error = allowed_error
+        return allowed_error
 
 class RKF45Solver(Solver):
     """
@@ -119,10 +143,14 @@ class RKF45Solver(Solver):
     def __init__(
         self,
         tolerance: float = 1e-6,
-        max_iterations: int = 100000,
+        max_iterations: int | None = None,
         dtype: str = "complex128",
         h_min: float = 1e-12,
         h_max: float = 1.0,
+        safety_factor: float = 0.9,
+        min_factor: float = 0.2,
+        max_factor: float = 4.0,
+        max_rejections: int = 10000,
         enforce_hermiticity: bool = True,
         enforce_trace: bool = False
     ):
@@ -136,6 +164,29 @@ class RKF45Solver(Solver):
         self.h_min = h_min
 
         self.h_max = h_max
+
+        self.safety_factor = safety_factor
+
+        self.min_factor = min_factor
+
+        self.max_factor = max_factor
+
+        self.max_rejections = max_rejections
+
+        if self.h_min <= 0.0:
+            raise ValueError("h_min must be strictly positive.")
+        if self.h_max <= 0.0:
+            raise ValueError("h_max must be strictly positive.")
+        if self.h_max < self.h_min:
+            raise ValueError("h_max must be greater than or equal to h_min.")
+        if self.safety_factor <= 0.0:
+            raise ValueError("safety_factor must be strictly positive.")
+        if self.min_factor <= 0.0:
+            raise ValueError("min_factor must be strictly positive.")
+        if self.max_factor < self.min_factor:
+            raise ValueError("max_factor must be greater than or equal to min_factor.")
+        if self.max_rejections <= 0:
+            raise ValueError("max_rejections must be strictly positive.")
 
         self.enforce_hermiticity = (
             enforce_hermiticity
@@ -166,6 +217,7 @@ class RKF45Solver(Solver):
         y_l = [y.copy()]
 
         self.iterations = 0
+        rejected_steps = 0
 
         while t < tf:
 
@@ -178,8 +230,6 @@ class RKF45Solver(Solver):
             yi = y
 
             k1 = h * derivative_function(ti,yi,*args)
-
-            k2 = h * derivative_function(ti + h / 4,yi + k1 / 4,*args)
 
             k2 = h * derivative_function(ti + h / 4, yi + k1 / 4, *args)
 
@@ -204,6 +254,7 @@ class RKF45Solver(Solver):
             error_tensor = (k1 / 360 - 128 * k3 / 4275 - 2197 * k4 / 75240 + k5 / 50 + 2* k6 / 55 )
 
             err = np.linalg.norm(error_tensor)
+            allowed_error = self._error_budget(yi, y5, k1, k2, k3, k4, k5, k6)
 
             if err == 0:
 
@@ -215,11 +266,12 @@ class RKF45Solver(Solver):
             # Accept timestep
             # =================================================
 
-            if err < self.tolerance:
+            if err < allowed_error:
 
                 t = t + h
 
                 y = y5
+                rejected_steps = 0
 
                 # Hermiticity enforcement
                 if self.enforce_hermiticity:
@@ -244,19 +296,21 @@ class RKF45Solver(Solver):
                 if t >= tf:
                     reached_final_time = True
                     break
+            else:
+                rejected_steps += 1
 
             # =================================================
             # Adaptive timestep update
             # =================================================
 
             factor = (
-                0.84
-                * (self.tolerance / err) ** (1 / 4)
+                self.safety_factor
+                * (allowed_error / err) ** (1 / 4)
             )
 
             factor = min(
-                2.0,
-                max(0.1, factor)
+                self.max_factor,
+                max(self.min_factor, factor)
             )
 
             h = h * factor
@@ -265,13 +319,29 @@ class RKF45Solver(Solver):
 
             h = max(self.h_min, h)
 
+            if err >= allowed_error and h <= self.h_min:
+                raise RuntimeError(
+                    "RKF45Solver reached solver_h_min before satisfying the "
+                    f"requested scale-aware tolerance. Current error={err:.16e}, "
+                    f"allowed_error={allowed_error:.16e}, scale={self.last_scale:.16e}, "
+                    f"h_min={self.h_min:.16e}."
+                )
+
+            if rejected_steps >= self.max_rejections:
+                raise RuntimeError(
+                    "RKF45Solver accumulated too many consecutive rejected steps. "
+                    f"Reached {rejected_steps} rejected steps at t={t:.16e}. "
+                    "Relax the tolerance, increase solver_h_max, or increase "
+                    "solver_max_rejections."
+                )
+
             # =================================================
             # Iteration counter
             # =================================================
 
             self.iterations += 1
 
-            if self.iterations >= self.max_iterations:
+            if self.max_iterations is not None and self.max_iterations > 0 and self.iterations >= self.max_iterations:
 
                 break
 
@@ -280,7 +350,7 @@ class RKF45Solver(Solver):
                 "RKF45Solver stopped before reaching the final time. "
                 f"Reached t={t:.16e} while tf={tf:.16e}. "
                 "Increase solver_max_iterations, increase solver_h_max, "
-                "or relax the tolerance."
+                "or relax the relative tolerance."
             )
 
         self.check_convergence()
@@ -304,7 +374,7 @@ class AdamsBashforth2Solver(Solver):
     def __init__(
         self,
         tolerance: float = 1e-6,
-        max_iterations: int = 100000,
+        max_iterations: int | None = None,
         dtype: str = "complex128",
         enforce_hermiticity: bool = True,
         enforce_trace: bool = False
@@ -450,6 +520,7 @@ class AdamsBashforth2Solver(Solver):
             self.last_error = np.linalg.norm(
                 y_next - y_n
             )
+            self._error_budget(y_nm1, y_n, y_next, h * f_nm1, h * f_n)
 
             # Hermiticity correction
             if self.enforce_hermiticity:
@@ -475,7 +546,7 @@ class AdamsBashforth2Solver(Solver):
             if n == len(time_values) - 2:
                 reached_final_time = True
 
-            if self.iterations >= self.max_iterations:
+            if self.max_iterations is not None and self.max_iterations > 0 and self.iterations >= self.max_iterations:
 
                 break
 

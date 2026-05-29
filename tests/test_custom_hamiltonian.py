@@ -126,6 +126,8 @@ def test_custom_hamiltonian_loads_model_metadata_defaults_and_summary() -> None:
     assert "B11" in hamiltonian.params
     assert "lattice_constants" in hamiltonian.lattice
     assert "real_space_vectors" in hamiltonian.lattice
+    assert "BZaxis" in hamiltonian.lattice
+    assert "BZorigin" in hamiltonian.lattice
     assert matrix.shape == (2, 2)
     assert np.iscomplexobj(matrix)
     assert hamiltonian.validate_hermiticity(0.08, -0.11, 0.0)
@@ -157,8 +159,27 @@ def test_custom_hamiltonian_default_lattice_matches_external_model_defaults() ->
     defaults = hamiltonian.default_lattice()
 
     assert defaults == hamiltonian.lattice
-    assert set(defaults) == {"lattice_type", "lattice_constants", "real_space_vectors"}
+    assert set(defaults) == {"lattice_type", "lattice_constants", "real_space_vectors", "BZorigin", "BZaxis"}
     assert np.isclose(defaults["lattice_constants"]["a0"], hamiltonian.params["a0"])
+
+
+def test_custom_hamiltonian_uses_explicit_brillouin_zone_box_from_model() -> None:
+    hamiltonian = build_surface_model()
+    bounds = np.asarray(hamiltonian.reciprocal_box_bounds(), dtype=float)
+
+    np.testing.assert_allclose(
+        bounds,
+        np.array(
+            [
+                [-np.pi / hamiltonian.params["a0"], np.pi / hamiltonian.params["a0"]],
+                [
+                    -2.0 * np.pi / (np.sqrt(3.0) * hamiltonian.params["a0"]),
+                    2.0 * np.pi / (np.sqrt(3.0) * hamiltonian.params["a0"]),
+                ],
+            ],
+            dtype=float,
+        ),
+    )
 
 
 def test_custom_hamiltonian_accepts_source_file_without_py_suffix() -> None:

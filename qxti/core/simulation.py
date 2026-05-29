@@ -56,23 +56,39 @@ class QXTISimulation:
     def build_kgrid(self, hamiltonian: Hamiltonian) -> KGrid:
         kcfg = self.config.kgrid
         dimension = kcfg.dimension if kcfg.dimension is not None else hamiltonian.dimension
-        if kcfg.points_per_axis <= 0:
-            raise ValueError("kgrid.points_per_axis must be strictly positive.")
 
         if kcfg.kx_values or kcfg.ky_values or kcfg.kz_values:
             kx_values = np.asarray(kcfg.kx_values or [0.0], dtype=float)
             ky_values = np.asarray(kcfg.ky_values or [0.0], dtype=float)
             kz_values = np.asarray(kcfg.kz_values or [0.0], dtype=float)
         else:
+            if kcfg.k_points:
+                if len(kcfg.k_points) != dimension:
+                    raise ValueError(
+                        f"kgrid.k_points must have exactly {dimension} components for dimension={dimension}."
+                    )
+                if any(points <= 0 for points in kcfg.k_points):
+                    raise ValueError("All entries in kgrid.k_points must be strictly positive.")
+                nkx = int(kcfg.k_points[0])
+                nky = int(kcfg.k_points[1]) if dimension >= 2 else 1
+                nkz = int(kcfg.k_points[2]) if dimension >= 3 else 1
+            else:
+                points_per_axis = 3 if kcfg.points_per_axis is None else int(kcfg.points_per_axis)
+                if points_per_axis <= 0:
+                    raise ValueError("kgrid.points_per_axis must be strictly positive.")
+                nkx = points_per_axis
+                nky = points_per_axis if dimension >= 2 else 1
+                nkz = points_per_axis if dimension >= 3 else 1
+
             bounds = hamiltonian.reciprocal_box_bounds()
-            kx_values = np.linspace(bounds[0][0], bounds[0][1], kcfg.points_per_axis, dtype=float)
+            kx_values = np.linspace(bounds[0][0], bounds[0][1], nkx, dtype=float)
             ky_values = (
-                np.linspace(bounds[1][0], bounds[1][1], kcfg.points_per_axis, dtype=float)
+                np.linspace(bounds[1][0], bounds[1][1], nky, dtype=float)
                 if dimension >= 2
                 else np.array([0.0], dtype=float)
             )
             kz_values = (
-                np.linspace(bounds[2][0], bounds[2][1], kcfg.points_per_axis, dtype=float)
+                np.linspace(bounds[2][0], bounds[2][1], nkz, dtype=float)
                 if dimension >= 3
                 else np.array([0.0], dtype=float)
             )
@@ -406,6 +422,10 @@ class QXTISimulation:
                 max_iterations=cmd_cfg.solver_max_iterations,
                 h_min=cmd_cfg.solver_h_min,
                 h_max=window_duration if cmd_cfg.solver_h_max is None else cmd_cfg.solver_h_max,
+                safety_factor=cmd_cfg.solver_safety_factor,
+                min_factor=cmd_cfg.solver_min_factor,
+                max_factor=cmd_cfg.solver_max_factor,
+                max_rejections=cmd_cfg.solver_max_rejections,
                 enforce_hermiticity=True,
                 enforce_trace=False,
             )

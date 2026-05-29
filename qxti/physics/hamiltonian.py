@@ -388,14 +388,71 @@ class Hamiltonian(ABC):
         where ``a_i`` is the corresponding real-space lattice length.
         """
 
+        explicit_bounds = self._explicit_brillouin_zone_bounds()
+        if explicit_bounds is not None:
+            return explicit_bounds
+
         bounds: list[tuple[float, float]] = []
         for length in self.real_space_axis_lengths():
             half_width = float(np.pi / length)
             bounds.append((-half_width, half_width))
         return tuple(bounds)
 
+    def brillouin_zone_origin(self) -> RealArray:
+        """Return the Brillouin-zone origin in reciprocal atomic units."""
+
+        origin = self.lattice.get("BZorigin")
+        if origin is None:
+            return np.zeros(3, dtype=np.float64)
+
+        values = np.asarray(origin, dtype=float).reshape(-1)
+        if values.size != 3:
+            raise ValueError("BZorigin must define exactly three components.")
+        return np.asarray(values, dtype=np.float64)
+
+    def brillouin_zone_axis_matrix(self) -> RealArray | None:
+        """Return the Brillouin-zone axis matrix whose columns span the domain.
+
+        The expected convention is the same as in the reference C++ code:
+        each column is one reciprocal-space vector defining the integration box
+        and the origin is given by :meth:`brillouin_zone_origin`.
+        """
+
+        axis = self.lattice.get("BZaxis")
+        if axis is None:
+            return None
+
+        values = np.asarray(axis, dtype=float)
+        if values.size == 9:
+            matrix = values.reshape(3, 3)
+        else:
+            raise ValueError("BZaxis must define a 3x3 matrix (9 values).")
+        return np.asarray(matrix, dtype=np.float64)
+
     def _matrix_at(self, kx: float, ky: float, kz: float) -> ComplexArray:
         return self.validate_matrix(self.H(float(kx), float(ky), float(kz)))
+
+    def _explicit_brillouin_zone_bounds(self) -> tuple[tuple[float, float], ...] | None:
+        axis_matrix = self.brillouin_zone_axis_matrix()
+        if axis_matrix is None:
+            return None
+
+        origin = self.brillouin_zone_origin()
+        tolerance = 1.0e-14
+        bounds: list[tuple[float, float]] = []
+
+        for axis in range(self.dimension):
+            active_column = axis_matrix[:, axis]
+            off_axis = np.delete(active_column, axis)
+            if np.any(np.abs(off_axis) > tolerance):
+                raise ValueError(
+                    "BZaxis currently supports only axis-aligned Brillouin-zone boxes "
+                    "for automatic KGrid generation."
+                )
+            half_width = 0.5 * float(active_column[axis])
+            bounds.append((float(origin[axis] - half_width), float(origin[axis] + half_width)))
+
+        return tuple(bounds)
 
     def _shifted_k_points(
         self,
