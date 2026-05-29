@@ -6,7 +6,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from qxti.grids import KGrid, TimeGrid
-from qxti.physics import Hamiltonian, LaserSystem, OperatorFactory
+from qxti.physics import BandGaugeFrame, Hamiltonian, LaserSystem, OperatorFactory
 from qxti.solvers import Solver
 
 from .distributions import T1T2Relaxation, bose_einstein, fermi_dirac, full_occupation, maxwell_boltzmann, valence_occupation
@@ -23,7 +23,11 @@ class CMD:
 
         d rho^(s) / dt =
             -(i omega + gamma) rho^(s)
-            + E(t) · [grad_k rho^(s-1) - i [d, rho^(s-1)]]
+            + E(t) · [D_k rho^(s-1)]
+
+    where, in the internal band basis,
+
+        D_k rho = grad_k rho - i [A, rho]
 
     on a discrete k-grid. Zeroth order is the equilibrium density matrix and
     higher orders are built iteratively from the previous one.
@@ -89,18 +93,21 @@ class CMD:
         )
         self._diag_indices = np.diag_indices(self.hamiltonian.basis_size)
         self._offdiag_mask = ~np.eye(self.hamiltonian.basis_size, dtype=bool)
+        self.band_gauge_frame = BandGaugeFrame(
+            hamiltonian=self.hamiltonian,
+            kgrid=self.kgrid,
+        )
         self._time_domain_cache: dict[int, ComplexArray] | None = None
         self._frequency_domain_cache: dict[int, ComplexArray] | None = None
 
     def rho_equilibrium(self, k: NDArray[np.float64]) -> ComplexArray:
         """Return the equilibrium density matrix at one k-point."""
 
-        kx, ky, kz = self._k_components(k)
-        rho_band = self._rho_equilibrium_band(kx, ky, kz)
+        rho_band = self._rho_equilibrium_band(self._k_index(k))
 
         if self.basis == "band":
             return self.hamiltonian.validate_matrix(rho_band)
-        return self.hamiltonian.transform_from_band_basis(rho_band, kx, ky, kz)
+        return self._transform_one_matrix_from_band_basis(rho_band, self._k_index(k))
 
     def compute_rho_order(self, order: int) -> ComplexArray:
         """Return one density-matrix order with shape ``(Nk, Nt, Nb, Nb)``."""
@@ -220,9 +227,8 @@ class CMD:
         nb = self.hamiltonian.basis_size
 
         equilibrium_tensor = np.empty((nk, nt, nb, nb), dtype=np.complex128)
-        for ik, k_point in enumerate(k_points):
-            kx, ky, kz = self._k_components(k_point)
-            rho0_band = self._rho_equilibrium_band(kx, ky, kz)
+        for ik in range(nk):
+            rho0_band = self._rho_equilibrium_band(ik)
             equilibrium_tensor[ik] = np.broadcast_to(rho0_band, (nt, nb, nb)).copy()
         return equilibrium_tensor
 
@@ -243,8 +249,7 @@ class CMD:
         solved = np.empty((nk, nt, nb, nb), dtype=np.complex128)
 
         for ik, k_point in enumerate(k_points):
-            kx, ky, kz = self._k_components(k_point)
-            omega_matrix = self._omega_matrix(kx, ky, kz)
+            omega_matrix = self.band_gauge_frame.omega_matrix(ik)
             source_series = self._field_weighted_source_series(
                 field_series,
                 driving_components[ik],
@@ -366,29 +371,14 @@ class CMD:
     ) -> ComplexArray:
         nk, nt, nb, _ = previous_order.shape
         components = np.zeros((nk, nt, 3, nb, nb), dtype=np.complex128)
+        gradient_components = self._k_gradient_components(previous_order)
+        connection_commutator = self._connection_commutator_components(previous_order)
 
         if self.include_intraband:
-            components += self._k_gradient_components(previous_order)
+            components += gradient_components
 
         if self.include_interband:
-            for ik, k_point in enumerate(k_points):
-                kx, ky, kz = self._k_components(k_point)
-                rho_series = previous_order[ik]
-                for axis, direction in enumerate(("x", "y", "z")):
-                    if axis >= self.hamiltonian.dimension:
-                        break
-                    dipole = self.operator_factory.dipole_operator(
-                        kx,
-                        ky,
-                        kz,
-                        direction,
-                        basis="band",
-                    )
-                    commutator = np.matmul(dipole[np.newaxis, :, :], rho_series) - np.matmul(
-                        rho_series,
-                        dipole[np.newaxis, :, :],
-                    )
-                    components[ik, :, axis] += -1.0j * commutator
+            components += connection_commutator
 
         return components
 
@@ -437,8 +427,32 @@ class CMD:
 
         return gradients
 
-    def _rho_equilibrium_band(self, kx: float, ky: float, kz: float) -> ComplexArray:
-        energies = self.hamiltonian.eigenvalues(kx, ky, kz)
+    def _connection_commutator_components(self, tensor: ComplexArray) -> ComplexArray:
+        nk, nt, nb, _ = tensor.shape
+        components = np.zeros((nk, nt, 3, nb, nb), dtype=np.complex128)
+
+        for axis, direction in enumerate(("x", "y", "z")):
+            if axis >= self.hamiltonian.dimension:
+                break
+            connection = self.band_gauge_frame.connection(direction)
+            left = np.einsum(
+                "kij,ktjl->ktil",
+                connection,
+                tensor,
+                optimize=True,
+            )
+            right = np.einsum(
+                "ktij,kjl->ktil",
+                tensor,
+                connection,
+                optimize=True,
+            )
+            components[:, :, axis] = -1.0j * (left - right)
+
+        return np.asarray(components, dtype=np.complex128)
+
+    def _rho_equilibrium_band(self, index: int) -> ComplexArray:
+        energies = self.band_gauge_frame.energies[index]
         occupations = np.asarray(
             self.distribution(energies, self.fermi_level, self.temperature),
             dtype=float,
@@ -455,15 +469,16 @@ class CMD:
         tensor: ComplexArray,
         k_points: FloatArray,
     ) -> ComplexArray:
-        transformed = np.empty_like(tensor)
-        for ik, k_point in enumerate(k_points):
-            kx, ky, kz = self._k_components(k_point)
-            unitary = self.hamiltonian.eigenvectors(kx, ky, kz)
-            transformed[ik] = np.matmul(
-                np.matmul(unitary[np.newaxis, :, :], tensor[ik]),
-                unitary.conj().T[np.newaxis, :, :],
-            )
-        return transformed
+        del k_points
+        return self.band_gauge_frame.transform_from_band_basis(tensor)
+
+    def _transform_one_matrix_from_band_basis(
+        self,
+        matrix: ComplexArray,
+        index: int,
+    ) -> ComplexArray:
+        unitary = self.band_gauge_frame.eigenvectors[index]
+        return np.asarray(unitary @ matrix @ unitary.conj().T, dtype=np.complex128)
 
     @staticmethod
     def _resample_density_trajectory(
@@ -629,6 +644,15 @@ class CMD:
         if k_vector.shape != (3,):
             raise ValueError("k must have shape (3,).")
         return float(k_vector[0]), float(k_vector[1]), float(k_vector[2])
+
+    def _k_index(self, k_point: NDArray[np.float64]) -> int:
+        k_vector = np.asarray(k_point, dtype=float)
+        if k_vector.shape != (3,):
+            raise ValueError("k must have shape (3,).")
+        matches = np.where(np.all(np.isclose(self.kgrid.points(), k_vector[np.newaxis, :], atol=1.0e-12), axis=1))[0]
+        if matches.size == 0:
+            raise ValueError("The requested k-point is not present in the configured KGrid.")
+        return int(matches[0])
 
     @staticmethod
     def _field_vector(values: NDArray[np.float64] | list[float]) -> NDArray[np.float64]:

@@ -32,7 +32,8 @@ DEFAULT_HARMONIC_PLOT_CONFIG = {
         "dataset_file": "current_spectrum.npz",
         "output_file": "field_current_time.png",
         "directions": ("x", "y", "z"),
-        "include_total": True,
+        "include_total": False,
+        "combine_planar": True,
     },
     "current_spectrum": {
         "enabled": True,
@@ -43,7 +44,7 @@ DEFAULT_HARMONIC_PLOT_CONFIG = {
         "omega_min": None,
         "omega_max": None,
         "use_harmonic_order": True,
-        "max_harmonic_order": 4.0,
+        "max_harmonic_order": 10.0,
         "log_scale": True,
     },
     "current_circular_spectrum": {
@@ -54,7 +55,7 @@ DEFAULT_HARMONIC_PLOT_CONFIG = {
         "omega_min": None,
         "omega_max": None,
         "use_harmonic_order": True,
-        "max_harmonic_order": 4.0,
+        "max_harmonic_order": 10.0,
         "log_scale": True,
     },
 }
@@ -75,6 +76,7 @@ class HarmonicGraphics:
         *,
         directions: tuple[str, ...] = ("x", "y", "z"),
         include_total: bool = True,
+        combine_planar: bool = False,
     ) -> Path:
         pyplot = HarmonicGraphics._require_matplotlib()
         time = np.asarray(time_axis, dtype=float)
@@ -88,59 +90,78 @@ class HarmonicGraphics:
         if field.shape[0] != time.size or current.shape[0] != time.size:
             raise ValueError("time_axis must match the first dimension of electric_field_time and current_time.")
 
-        rows = len(directions) + (1 if include_total else 0)
+        panel_specs: list[tuple[str, tuple[str, ...]]] = []
+        normalized_directions = tuple(direction.strip().lower() for direction in directions)
+        if combine_planar and "x" in normalized_directions and "y" in normalized_directions:
+            panel_specs.append(("xy-plane", ("x", "y")))
+            normalized_directions = tuple(direction for direction in normalized_directions if direction not in {"x", "y"})
+        for direction in normalized_directions:
+            panel_specs.append((f"{direction}-component", (direction,)))
+        if include_total:
+            panel_specs.append(("total", ("total",)))
+
+        rows = len(panel_specs)
         figure, axes = pyplot.subplots(rows, 1, figsize=(10.0, 3.0 * rows), sharex=True, squeeze=False)
         field_colors = {"x": "#c23b22", "y": "#1f6aa5", "z": "#2c8c4a", "total": "#8f3fb0"}
         current_colors = {"x": "#ff8c69", "y": "#58a5f0", "z": "#65c18c", "total": "#c98df0"}
 
-        for row, direction in enumerate(directions):
-            idir = HarmonicGraphics._direction_axis(direction)
+        for row, (title, panel_directions) in enumerate(panel_specs):
             axis = axes[row, 0]
             twin = axis.twinx()
-            field_line = axis.plot(
-                time,
-                field[:, idir],
-                linewidth=1.6,
-                color=field_colors.get(direction, None),
-                label=f"E{direction}(t)",
-            )[0]
-            current_line = twin.plot(
-                time,
-                current[:, idir],
-                linewidth=1.4,
-                color=current_colors.get(direction, None),
-                label=f"J{direction}(t)",
-            )[0]
-            axis.set_ylabel(f"E{direction}(t)")
-            twin.set_ylabel(f"J{direction}(t)")
-            axis.set_title(f"{direction}-component")
+            field_lines = []
+            current_lines = []
+            if panel_directions == ("total",):
+                field_total = np.linalg.norm(field, axis=1)
+                current_total = np.linalg.norm(current, axis=1)
+                field_lines.append(
+                    axis.plot(
+                        time,
+                        field_total,
+                        linewidth=1.8,
+                        color=field_colors["total"],
+                        label="|E(t)|",
+                    )[0]
+                )
+                current_lines.append(
+                    twin.plot(
+                        time,
+                        current_total,
+                        linewidth=1.6,
+                        color=current_colors["total"],
+                        label="|J(t)|",
+                    )[0]
+                )
+                axis.set_ylabel("|E(t)|")
+                twin.set_ylabel("|J(t)|")
+            else:
+                for direction in panel_directions:
+                    idir = HarmonicGraphics._direction_axis(direction)
+                    field_lines.append(
+                        axis.plot(
+                            time,
+                            field[:, idir],
+                            linewidth=1.7,
+                            color=field_colors.get(direction, None),
+                            label=f"E{direction}(t)",
+                        )[0]
+                    )
+                    current_lines.append(
+                        twin.plot(
+                            time,
+                            current[:, idir],
+                            linewidth=1.5,
+                            color=current_colors.get(direction, None),
+                            label=f"J{direction}(t)",
+                        )[0]
+                    )
+                field_label = ", ".join(f"E{direction}(t)" for direction in panel_directions)
+                current_label = ", ".join(f"J{direction}(t)" for direction in panel_directions)
+                axis.set_ylabel(field_label)
+                twin.set_ylabel(current_label)
+            axis.set_title(title)
             axis.grid(alpha=0.25)
-            axis.legend([field_line, current_line], [field_line.get_label(), current_line.get_label()], loc="upper right")
-
-        if include_total:
-            axis = axes[len(directions), 0]
-            twin = axis.twinx()
-            field_total = np.linalg.norm(field, axis=1)
-            current_total = np.linalg.norm(current, axis=1)
-            field_line = axis.plot(
-                time,
-                field_total,
-                linewidth=1.8,
-                color=field_colors["total"],
-                label="|E(t)|",
-            )[0]
-            current_line = twin.plot(
-                time,
-                current_total,
-                linewidth=1.6,
-                color=current_colors["total"],
-                label="|J(t)|",
-            )[0]
-            axis.set_ylabel("|E(t)|")
-            twin.set_ylabel("|J(t)|")
-            axis.set_title("total")
-            axis.grid(alpha=0.25)
-            axis.legend([field_line, current_line], [field_line.get_label(), current_line.get_label()], loc="upper right")
+            legend_lines = field_lines + current_lines
+            axis.legend(legend_lines, [line.get_label() for line in legend_lines], loc="upper right", ncol=2)
 
         axes[-1, 0].set_xlabel("time (a.u.)")
         figure.suptitle("Electric field and current in time", fontsize=14)

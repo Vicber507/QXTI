@@ -389,6 +389,7 @@ class QXTISimulation:
             operator_factory=cmd.operator_factory,
             directions=self._active_directions(cmd.hamiltonian.dimension),
             orders=sorted(rho_orders),
+            band_gauge_frame=cmd.band_gauge_frame if cmd.basis == "band" else None,
             bz_mask_enabled=self.config.xtp.bz_mask_enabled,
             bz_mask_radius_percent=self.config.xtp.bz_mask_radius_percent,
             bz_mask_sigma=self.config.xtp.bz_mask_sigma,
