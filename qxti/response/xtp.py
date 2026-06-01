@@ -137,17 +137,41 @@ class XTP:
             name=f"current(order={order}, direction={direction})",
         )
 
-    def susceptibility(self, order: int) -> ComplexArray:
-        """Return the FFT of the order-resolved polarization signal."""
-
-        polarization = self.polarization(order)
-        return np.asarray(np.fft.fft(polarization, axis=0), dtype=np.complex128)
-
     def polarization_frequency_domain(self, order: int) -> tuple[RealArray, ComplexArray]:
         """Return ``(omega_axis, P(omega))`` for one perturbative order."""
 
         polarization = self.polarization(order)
         return self._fft_time_signal(polarization)
+    
+    def electric_field_frequency_domain(self) -> tuple[RealArray, ComplexArray]: # Necesario para tensores X
+        """Return ``(omega_axis, E(omega))`` for the total applied electric field."""
+
+        times = self.timegrid.generate()
+        electric_field_t = self.laser_system.electric_field(times)
+        return self._fft_time_signal(electric_field_t)
+    
+    def linear_susceptibility(self,*, input_direction: str, eps: float = 1.0e-14,) -> tuple[RealArray, ComplexArray]:
+        """Return chi_ij^(1)(omega) for one input direction j.
+
+    Output shape:
+        (Nomega, 3)
+    """
+
+        input_direction = self._normalize_direction(input_direction)
+        input_axis = self._direction_axis(input_direction)
+
+        omega_axis, polarization_w = self.polarization_frequency_domain(order=1)
+        _, electric_field_w = self.electric_field_frequency_domain()
+
+        denominator = electric_field_w[:, input_axis]
+        safe_denominator = np.where(
+        np.abs(denominator) > eps,
+        denominator,
+        np.nan + 0.0j,
+    )
+
+        chi = polarization_w / safe_denominator[:, np.newaxis]
+        return omega_axis, np.asarray(chi, dtype=np.complex128)
 
     def current_frequency_domain(
         self,
