@@ -146,6 +146,11 @@ class XTP:
     def electric_field_frequency_domain(self) -> tuple[RealArray, ComplexArray]: # Necesario para tensores X
         """Return ``(omega_axis, E(omega))`` for the total applied electric field."""
 
+        if self.laser_system is None:
+            raise ValueError(
+            "laser_system is required to compute electric-field spectra and susceptibilities."
+        )
+
         times = self.timegrid.generate()
         electric_field_t = self.laser_system.electric_field(times)
         return self._fft_time_signal(electric_field_t)
@@ -218,13 +223,24 @@ class XTP:
         """Return all observables currently implemented by XTP."""
 
         omega_axis, current_spectrum = self.total_current_frequency_domain()
-        return {
-            "polarization": self.total_polarization(),
-            "current": self.total_current(),
-            "omega_axis": omega_axis,
-            "current_spectrum": current_spectrum,
-            "susceptibility": {order: self.susceptibility(order) for order in self.orders},
+        outputs: dict[str, Any] = {
+        "polarization": self.total_polarization(),
+        "current": self.total_current(),
+        "omega_axis": omega_axis,
+        "current_spectrum": current_spectrum,
+        "polarization_frequency_domain": {
+            order: self.polarization_frequency_domain(order)[1]
+            for order in self.orders
+        },
+    }
+
+        if self.laser_system is not None and 1 in self.orders:
+            outputs["linear_susceptibility"] = {
+            direction: self.linear_susceptibility(input_direction=direction)[1]
+            for direction in self.directions
         }
+
+        return outputs
 
     def bz_mask_summary(self) -> dict[str, Any]:
         """Return one serializable description of the Brillouin-zone mask."""
