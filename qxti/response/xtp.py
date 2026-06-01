@@ -6,7 +6,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from qxti.grids import FrequencyGrid, KGrid, TimeGrid
-from qxti.physics import BandGaugeFrame, Hamiltonian, OperatorFactory
+from qxti.physics import BandGaugeFrame, Hamiltonian, LaserSystem, OperatorFactory
 
 
 ComplexArray = NDArray[np.complex128]
@@ -44,6 +44,7 @@ class XTP:
         directions: list[str],
         orders: list[int],
         band_gauge_frame: BandGaugeFrame | None = None,
+        laser_system: LaserSystem | None = None,
         bz_mask_enabled: bool = False,
         bz_mask_radius_percent: float = 100.0,
         bz_mask_sigma: float | None = None,
@@ -54,6 +55,7 @@ class XTP:
         self.kgrid = kgrid
         self.timegrid = timegrid
         self.frequencygrid = frequencygrid
+        self.laser_system = laser_system
         self.operator_factory = operator_factory
         self.directions = [self._normalize_direction(direction) for direction in directions]
         self.orders = sorted({int(order) for order in orders})
