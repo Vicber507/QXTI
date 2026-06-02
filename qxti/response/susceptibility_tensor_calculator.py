@@ -25,8 +25,7 @@ class SusceptibilityTensorCalculator:
         """
         Build the full linear tensor chi_ij^(1)(omega).
 
-        Required labels:
-            "x", "y", "z"
+        The tensor dimension is inferred from the first XTP Hamiltonian.
 
         Returns
         -------
@@ -34,14 +33,25 @@ class SusceptibilityTensorCalculator:
             Shape (Nomega,)
 
         chi:
-            Shape (Nomega, 3, 3)
+            Shape (Nomega, dimension, dimension)
             chi[:, i, j] = chi_ij^(1)(omega)
         """
+
+        if not self.xtp_by_label:
+            raise ValueError("At least one XTP calculation is required.")
+
+        first_xtp = next(iter(self.xtp_by_label.values()))
+        dimension = int(first_xtp.hamiltonian.dimension)
+
+        if dimension not in {1, 2, 3}:
+            raise ValueError("Hamiltonian dimension must be 1, 2, or 3.")
+
+        directions = tuple(self._DIRECTION_TO_AXIS.keys())[:dimension]
 
         chi: ComplexArray | None = None
         reference_omega: RealArray | None = None
 
-        for direction, input_axis in self._DIRECTION_TO_AXIS.items():
+        for input_axis, direction in enumerate(directions):
             xtp = self._get_xtp(direction)
             omega_axis, chi_column = xtp.linear_susceptibility(
                 input_direction=direction,
@@ -50,11 +60,20 @@ class SusceptibilityTensorCalculator:
 
             if chi is None:
                 reference_omega = omega_axis
-                chi = np.zeros((len(omega_axis), 3, 3), dtype=np.complex128)
+                chi = np.zeros(
+                    (len(omega_axis), dimension, dimension),
+                    dtype=np.complex128,
+                )
             else:
                 self._validate_same_frequency_axis(reference_omega, omega_axis)
 
-            chi[:, :, input_axis] = chi_column
+            if chi_column.shape[1] < dimension:
+                raise ValueError(
+                    f"chi column for direction {direction!r} has shape {chi_column.shape}, "
+                    f"expected at least {dimension} output components."
+                )
+
+            chi[:, :, input_axis] = chi_column[:, :dimension]
 
         if chi is None or reference_omega is None:
             raise ValueError("No XTP calculations were provided.")
