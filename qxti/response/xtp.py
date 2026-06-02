@@ -159,7 +159,7 @@ class XTP:
         """Return chi_ij^(1)(omega) for one input direction j.
 
     Output shape:
-        (Nomega, 3)
+        (Nomega, dimension)
     """
 
         input_direction = self._normalize_direction(input_direction)
@@ -172,10 +172,11 @@ class XTP:
         safe_denominator = np.where(
         np.abs(denominator) > eps,
         denominator,
-        np.nan + 0.0j,
-    )
+        np.nan + 0.0j,)
+    
+        active_dimension = self.hamiltonian.dimension
+        chi = polarization_w[:, :active_dimension] / safe_denominator[:, np.newaxis]
 
-        chi = polarization_w / safe_denominator[:, np.newaxis]
         return omega_axis, np.asarray(chi, dtype=np.complex128)
 
     def current_frequency_domain(
