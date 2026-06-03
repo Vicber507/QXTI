@@ -291,26 +291,24 @@ class QXTISimulation:
         )
 
         outputs: dict[str, Path] = {}
-        rho_orders = cmd.solve_time_domain()
-        for order, tensor in rho_orders.items():
-            npy_path = output_dir / f"rho_order_{order}.npy"
-            np.save(npy_path, tensor)
+        rho_order_paths = cmd.solve_time_domain(output_dir)
+        for order, npy_path in rho_order_paths.items():
             outputs[f"rho_order_{order}"] = npy_path
-            self._emit_progress(
-                f"CMD saved order {order}: '{npy_path.name}'."
-            )
 
         if cmd_cfg.save_frequency_domain:
             frequency_dir = output_dir / "frequency"
             frequency_dir.mkdir(parents=True, exist_ok=True)
-            for order, tensor in cmd.solve_frequency_domain().items():
-                npy_path = frequency_dir / f"rho_frequency_order_{order}.npy"
-                np.save(npy_path, tensor)
+            for order, npy_path in self._save_frequency_domain_from_saved_orders(
+                cmd,
+                rho_order_paths,
+                frequency_dir,
+            ).items():
                 outputs[f"rho_frequency_order_{order}"] = npy_path
                 self._emit_progress(
                     f"CMD saved frequency order {order}: '{npy_path.name}'."
                 )
 
+        rho_orders = self._load_saved_rho_order_paths(rho_order_paths)
         outputs.update(self.generate_cmd_datasets(cmd, rho_orders))
         outputs.update(self.generate_xtp_datasets(cmd, rho_orders))
         return outputs
@@ -438,6 +436,39 @@ class QXTISimulation:
                 enforce_trace=False,
             )
         raise ValueError(f"Unsupported CMD solver '{cmd_cfg.solver}'.")
+
+    @staticmethod
+    def _save_frequency_domain_from_saved_orders(
+        cmd: CMD,
+        rho_order_paths: dict[int, Path],
+        output_dir: Path,
+    ) -> dict[int, Path]:
+        window = np.asarray(
+            cmd.timegrid.apply_window(np.ones(cmd.timegrid.Nt, dtype=float)),
+            dtype=float,
+        )
+        nfft = cmd.timegrid.Nt * cmd.timegrid.padding_factor if cmd.timegrid.zero_padding else cmd.timegrid.Nt
+
+        saved_paths: dict[int, Path] = {}
+        for order, path in rho_order_paths.items():
+            tensor = np.load(path, mmap_mode="r")
+            weighted = tensor * window[np.newaxis, :, np.newaxis, np.newaxis]
+            transformed = np.asarray(np.fft.fft(weighted, n=nfft, axis=1), dtype=np.complex128)
+            npy_path = output_dir / f"rho_frequency_order_{order}.npy"
+            np.save(npy_path, transformed)
+            saved_paths[order] = npy_path
+        return saved_paths
+
+    @staticmethod
+    def _load_saved_rho_order_paths(rho_order_paths: dict[int, Path]) -> dict[int, ComplexArray]:
+        rho_orders: dict[int, ComplexArray] = {}
+        for order, path in rho_order_paths.items():
+            tensor = np.load(path, mmap_mode="r")
+            if tensor.dtype == np.complex128:
+                rho_orders[order] = tensor
+            else:
+                rho_orders[order] = np.asarray(tensor, dtype=np.complex128)
+        return rho_orders
 
     @staticmethod
     def _build_laser_from_mapping(spec: dict[str, Any]) -> Laser:

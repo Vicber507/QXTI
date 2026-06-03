@@ -120,10 +120,15 @@ class CMD:
     def compute_all_orders(self) -> dict[int, ComplexArray]:
         """Return the full dictionary of density-matrix orders."""
 
-        return self.solve_time_domain()
+        return self.solve_time_domain_in_memory()
 
-    def solve_time_domain(self) -> dict[int, ComplexArray]:
-        """Solve the recursive perturbative density-matrix dynamics."""
+    def solve_time_domain_in_memory(self) -> dict[int, ComplexArray]:
+        """Solve all density-matrix orders and keep them in memory.
+
+        This is the legacy/convenience path. It is useful for small grids and
+        tests, but large ``Nk * Nt * Nb * Nb`` runs should prefer
+        :meth:`solve_time_domain`.
+        """
 
         if self.gauge != "length":
             raise NotImplementedError(
@@ -149,13 +154,18 @@ class CMD:
         self._frequency_domain_cache = None
         return result
 
+    def solve_time_domain_legacy(self) -> dict[int, ComplexArray]:
+        """Backward-compatible name for :meth:`solve_time_domain_in_memory`."""
+
+        return self.solve_time_domain_in_memory()
+
     def solve_frequency_domain(self) -> dict[int, ComplexArray]:
         """FFT-transform the time-domain density matrices along the time axis."""
 
         if self._frequency_domain_cache is not None:
             return self._frequency_domain_cache
 
-        rho_orders = self.solve_time_domain()
+        rho_orders = self.solve_time_domain_in_memory()
         window = np.asarray(
             self.timegrid.apply_window(np.ones(self.timegrid.Nt, dtype=float)),
             dtype=float,
@@ -170,12 +180,93 @@ class CMD:
         self._frequency_domain_cache = transformed
         return transformed
 
+    def solve_time_domain(self, output_dir: str | Path) -> dict[int, Path]:
+        """Solve density-matrix orders sequentially and save each one to disk.
+
+        This is the primary low-memory time-domain path. It keeps only the
+        previous order in the internal band basis, because that is the only
+        tensor needed to build the next perturbative source term. Use
+        :meth:`solve_time_domain_in_memory` for the legacy all-orders-in-RAM
+        behavior.
+        """
+
+        if self.gauge != "length":
+            raise NotImplementedError(
+                "CMD currently implements the recursive perturbative equation "
+                "only in length gauge."
+            )
+
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        target_times = np.asarray(self.timegrid.generate(), dtype=float)
+        k_points = np.asarray(self.kgrid.points(), dtype=float)
+        field_series = self._field_series(target_times)
+        total_order_solves = max(0, self.max_order * len(k_points))
+        completed_solves = 0
+        saved_paths: dict[int, Path] = {}
+
+        self._emit_progress(
+            f"CMD streaming start: {self.max_order} driven orders, {len(k_points)} k-points, "
+            f"{total_order_solves} order/k-point solves total."
+        )
+
+        previous_order_band = self._equilibrium_tensor_band(k_points, target_times)
+        saved_paths[0] = self._save_order_tensor(
+            output_path,
+            order=0,
+            tensor_band=previous_order_band,
+        )
+        self._emit_progress(f"CMD saved order 0: '{saved_paths[0].name}'.")
+
+        for order in range(1, self.max_order + 1):
+            self._emit_progress(
+                f"CMD order {order}/{self.max_order}: building source terms."
+            )
+            driving_components = self._build_driving_components(
+                previous_order_band,
+                k_points,
+            )
+            current_order_band, completed_solves = self._solve_single_order_band(
+                k_points,
+                target_times,
+                field_series,
+                driving_components,
+                order=order,
+                completed_solves=completed_solves,
+                total_order_solves=total_order_solves,
+            )
+            saved_paths[order] = self._save_order_tensor(
+                output_path,
+                order=order,
+                tensor_band=current_order_band,
+            )
+            self._emit_progress(f"CMD saved order {order}: '{saved_paths[order].name}'.")
+            previous_order_band = current_order_band
+
+        self._time_domain_cache = None
+        self._frequency_domain_cache = None
+        return saved_paths
+
+    def save_time_domain_orders(self, output_dir: str | Path) -> dict[int, Path]:
+        """Alias for the primary low-memory :meth:`solve_time_domain` path."""
+
+        return self.solve_time_domain(output_dir)
+
+    def solve_time_domain_to_directory(self, output_dir: str | Path) -> dict[int, Path]:
+        """Backward-compatible alias for :meth:`solve_time_domain`."""
+
+        return self.solve_time_domain(output_dir)
+
     def save_density_matrices(self, output_dir: str) -> None:
         """Save all available time-domain density matrices as ``.npy`` files."""
 
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
-        for order, tensor in self.solve_time_domain().items():
+        if self._time_domain_cache is None:
+            self.solve_time_domain(output_path)
+            return
+        for order, tensor in self.solve_time_domain_in_memory().items():
             np.save(output_path / f"rho_order_{order}.npy", tensor)
 
     def _solve_orders_in_band_basis(
@@ -479,6 +570,22 @@ class CMD:
     ) -> ComplexArray:
         unitary = self.band_gauge_frame.eigenvectors[index]
         return np.asarray(unitary @ matrix @ unitary.conj().T, dtype=np.complex128)
+
+    def _save_order_tensor(
+        self,
+        output_dir: Path,
+        *,
+        order: int,
+        tensor_band: ComplexArray,
+    ) -> Path:
+        tensor = (
+            tensor_band
+            if self.basis == "band"
+            else self._transform_tensor_from_band_basis(tensor_band, self.kgrid.points())
+        )
+        path = output_dir / f"rho_order_{order}.npy"
+        np.save(path, np.asarray(tensor, dtype=np.complex128))
+        return path
 
     @staticmethod
     def _resample_density_trajectory(

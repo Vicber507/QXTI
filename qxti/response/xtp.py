@@ -51,7 +51,10 @@ class XTP:
         bz_mask_sigma_percent_legacy: float | None = None,
     ) -> None:
         self.hamiltonian = hamiltonian
-        self.rho_orders = {int(order): np.asarray(tensor, dtype=np.complex128) for order, tensor in rho_orders.items()}
+        self.rho_orders = {
+            int(order): self._as_complex_tensor(tensor)
+            for order, tensor in rho_orders.items()
+        }
         self.kgrid = kgrid
         self.timegrid = timegrid
         self.frequencygrid = frequencygrid
@@ -388,6 +391,12 @@ class XTP:
             return self.rho_orders[int(order)]
         except KeyError as exc:
             raise ValueError(f"rho_orders does not contain order {order}.") from exc
+
+    @staticmethod
+    def _as_complex_tensor(tensor: ComplexArray) -> ComplexArray:
+        if isinstance(tensor, np.ndarray) and tensor.dtype == np.complex128:
+            return tensor
+        return np.asarray(tensor, dtype=np.complex128)
 
     def _fft_time_signal(
         self,
