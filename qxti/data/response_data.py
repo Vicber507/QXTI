@@ -27,7 +27,7 @@ class ResponseData:
         value_mode: str = "absolute",
         rho_orders: dict[int, ComplexArray] | None = None,
     ) -> dict[str, Any]:
-        time_domain = self.cmd.solve_time_domain() if rho_orders is None else rho_orders
+        time_domain = self.cmd.solve_time_domain_in_memory() if rho_orders is None else rho_orders
         resolved_orders = self._resolve_orders(orders, time_domain)
         total_rho = self._sum_orders(time_domain, resolved_orders)
         populations = self._population_values(
@@ -60,7 +60,7 @@ class ResponseData:
         value_mode: str = "absolute",
         rho_orders: dict[int, ComplexArray] | None = None,
     ) -> dict[str, Any]:
-        time_domain = self.cmd.solve_time_domain() if rho_orders is None else rho_orders
+        time_domain = self.cmd.solve_time_domain_in_memory() if rho_orders is None else rho_orders
         resolved_orders = self._resolve_orders(orders, time_domain)
         total_rho = self._sum_orders(time_domain, resolved_orders)
         populations = self._population_values(
@@ -100,7 +100,7 @@ class ResponseData:
         component: str = "magnitude",
         rho_orders: dict[int, ComplexArray] | None = None,
     ) -> dict[str, Any]:
-        time_domain = self.cmd.solve_time_domain() if rho_orders is None else rho_orders
+        time_domain = self.cmd.solve_time_domain_in_memory() if rho_orders is None else rho_orders
         resolved_orders = self._resolve_orders(orders, time_domain)
         total_rho = self._sum_orders(time_domain, resolved_orders)
         coherence_values, pair_indices, pair_labels = self._coherence_series(total_rho, component=component)
@@ -129,7 +129,7 @@ class ResponseData:
         component: str = "magnitude",
         rho_orders: dict[int, ComplexArray] | None = None,
     ) -> dict[str, Any]:
-        time_domain = self.cmd.solve_time_domain() if rho_orders is None else rho_orders
+        time_domain = self.cmd.solve_time_domain_in_memory() if rho_orders is None else rho_orders
         resolved_orders = self._resolve_orders(orders, time_domain)
         total_rho = self._sum_orders(time_domain, resolved_orders)
         coherence_values, pair_indices, pair_labels = self._coherence_series(total_rho, component=component)
@@ -180,10 +180,10 @@ class ResponseData:
         rho_orders: dict[int, ComplexArray],
         resolved_orders: tuple[int, ...],
     ) -> ComplexArray:
-        reference = np.asarray(rho_orders[resolved_orders[0]], dtype=np.complex128)
-        total = np.zeros_like(reference)
+        reference = ResponseData._as_complex_tensor(rho_orders[resolved_orders[0]])
+        total = np.zeros(reference.shape, dtype=np.complex128)
         for order in resolved_orders:
-            total += np.asarray(rho_orders[order], dtype=np.complex128)
+            total += ResponseData._as_complex_tensor(rho_orders[order])
         return total
 
     @staticmethod
@@ -307,7 +307,13 @@ class ResponseData:
             return populations
 
         if 0 in rho_orders:
-            reference = np.real(np.diagonal(np.asarray(rho_orders[0], dtype=np.complex128), axis1=2, axis2=3))
+            reference = np.real(
+                np.diagonal(
+                    cls._as_complex_tensor(rho_orders[0]),
+                    axis1=2,
+                    axis2=3,
+                )
+            )
         else:
             reference = populations[:, :1, :]
         if 0 not in resolved_orders and reference.shape == populations.shape:
@@ -432,3 +438,9 @@ class ResponseData:
         if key == "imag":
             return np.imag(values)
         raise ValueError("component must be one of: magnitude, real, imag.")
+
+    @staticmethod
+    def _as_complex_tensor(tensor: ComplexArray) -> ComplexArray:
+        if isinstance(tensor, np.ndarray) and tensor.dtype == np.complex128:
+            return tensor
+        return np.asarray(tensor, dtype=np.complex128)

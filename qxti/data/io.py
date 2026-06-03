@@ -44,8 +44,16 @@ def load_dataset_npz(input_path: str | Path) -> dict[str, Any]:
     return result
 
 
-def load_rho_orders_from_npy(output_dir: str | Path) -> dict[int, np.ndarray]:
-    """Load every available ``rho_order_*.npy`` tensor from one output directory."""
+def load_rho_orders_from_npy(
+    output_dir: str | Path,
+    *,
+    mmap_mode: str | None = None,
+) -> dict[int, np.ndarray]:
+    """Load every available ``rho_order_*.npy`` tensor from one output directory.
+
+    Pass ``mmap_mode="r"`` to keep large tensors on disk and page them in only
+    as needed.
+    """
 
     directory = Path(output_dir)
     pattern = re.compile(r"rho_order_(\d+)\.npy$")
@@ -54,7 +62,11 @@ def load_rho_orders_from_npy(output_dir: str | Path) -> dict[int, np.ndarray]:
         match = pattern.match(path.name)
         if match is None:
             continue
-        rho_orders[int(match.group(1))] = np.asarray(np.load(path), dtype=np.complex128)
+        tensor = np.load(path, mmap_mode=mmap_mode)
+        if tensor.dtype == np.complex128:
+            rho_orders[int(match.group(1))] = tensor
+        else:
+            rho_orders[int(match.group(1))] = np.asarray(tensor, dtype=np.complex128)
     return rho_orders
 
 

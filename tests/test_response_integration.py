@@ -228,7 +228,7 @@ def test_cmd_time_and_frequency_domain_outputs_have_expected_shapes(tmp_path: Pa
     cmd, _ = build_cmd_stack(max_order=2)
 
     rho_eq = cmd.rho_equilibrium(np.array([0.05, 0.0, 0.0], dtype=float))
-    rho_orders = cmd.solve_time_domain()
+    rho_orders = cmd.solve_time_domain_in_memory()
     rho_freq = cmd.solve_frequency_domain()
     cmd.save_density_matrices(str(tmp_path))
 
@@ -251,9 +251,25 @@ def test_cmd_time_and_frequency_domain_outputs_have_expected_shapes(tmp_path: Pa
     assert (tmp_path / "rho_order_2.npy").exists()
 
 
+def test_cmd_solve_time_domain_streams_without_cache(tmp_path: Path) -> None:
+    cmd, _ = build_cmd_stack(max_order=2)
+
+    paths = cmd.solve_time_domain(tmp_path)
+
+    assert set(paths) == {0, 1, 2}
+    assert cmd._time_domain_cache is None
+    for order in (0, 1, 2):
+        assert paths[order] == tmp_path / f"rho_order_{order}.npy"
+        tensor = np.load(paths[order], mmap_mode="r")
+        assert isinstance(tensor, np.memmap)
+        assert tensor.shape == (1, 11, 2, 2)
+    assert np.max(np.abs(np.load(paths[1], mmap_mode="r"))) > 0.0
+    assert np.max(np.abs(np.load(paths[2], mmap_mode="r"))) > 0.0
+
+
 def test_response_population_heatmap_data_and_plot(tmp_path: Path) -> None:
     cmd, _ = build_cmd_stack(max_order=3)
-    rho_orders = cmd.solve_time_domain()
+    rho_orders = cmd.solve_time_domain_in_memory()
     response_data = ResponseData(cmd)
     data = response_data.population_heatmap_data(
         orders=(0, 1, 2, 3),
@@ -304,7 +320,7 @@ def test_response_population_kxky_animation_data_and_plot(tmp_path: Path) -> Non
             dimension=2,
         ),
     )
-    rho_orders = cmd.solve_time_domain()
+    rho_orders = cmd.solve_time_domain_in_memory()
     response_data = ResponseData(cmd)
     data = response_data.population_kxky_animation_data(
         orders=(0, 1),
@@ -364,7 +380,7 @@ def test_cmd_intraband_gradient_source_is_connected() -> None:
         ),
     )
 
-    rho_orders = cmd.solve_time_domain()
+    rho_orders = cmd.solve_time_domain_in_memory()
 
     assert rho_orders[1].shape == (3, 11, 2, 2)
     assert np.max(np.abs(rho_orders[1])) > 0.0
@@ -374,7 +390,7 @@ def test_cmd_velocity_gauge_is_rejected_for_recursive_solver() -> None:
     cmd, _ = build_cmd_stack(gauge="velocity")
 
     try:
-        cmd.solve_time_domain()
+        cmd.solve_time_domain_in_memory()
     except NotImplementedError as exc:
         assert "length gauge" in str(exc)
     else:
@@ -385,7 +401,7 @@ def test_cmd_band_recursive_solver_is_not_limited_by_external_solver_iteration_c
     cmd, _ = build_cmd_stack(max_order=1)
     cmd.solver.max_iterations = 1
 
-    rho_orders = cmd.solve_time_domain()
+    rho_orders = cmd.solve_time_domain_in_memory()
 
     assert rho_orders[1].shape[-2:] == (2, 2)
     assert np.max(np.abs(rho_orders[1])) > 0.0
