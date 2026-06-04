@@ -222,7 +222,14 @@ def plot_harmonic_graphics_from_saved_data(
     outputs: dict[str, Path] = {}
 
     dataset_name = None
-    for section_name in ("field_current_time", "current_spectrum", "current_circular_spectrum"):
+    for section_name in (
+        "field_current_time",
+        "current_total_spectrum",
+        "current_components_spectrum",
+        "current_inter_intra_spectrum",
+        "current_circular_spectrum",
+        "current_overview_spectrum",
+    ):
         section_cfg = resolved_plot_config[section_name]
         if bool(section_cfg["enabled"]):
             dataset_name = str(section_cfg["dataset_file"])
@@ -238,7 +245,9 @@ def plot_harmonic_graphics_from_saved_data(
         )
 
     data = load_dataset_npz(dataset_path)
+    data = _augment_legacy_harmonic_dataset(data)
     print(f"[graphics] plotting harmonic dataset '{dataset_path.name}'.")
+    reference_omega = _harmonic_reference_omega(config)
 
     field_current_cfg = resolved_plot_config["field_current_time"]
     if bool(field_current_cfg["enabled"]):
@@ -252,21 +261,54 @@ def plot_harmonic_graphics_from_saved_data(
             combine_planar=bool(field_current_cfg.get("combine_planar", False)),
         )
 
-    current_cfg = resolved_plot_config["current_spectrum"]
-    if bool(current_cfg["enabled"]):
-        outputs["current_spectrum"] = HarmonicGraphics.plot_current_magnitude_spectrum(
+    total_cfg = resolved_plot_config["current_total_spectrum"]
+    if bool(total_cfg["enabled"]):
+        outputs["current_total_spectrum"] = HarmonicGraphics.plot_total_current_spectrum(
+            np.asarray(data["omega_axis"], dtype=float),
+            np.asarray(data["current_total_magnitude"], dtype=float),
+            output_dir / str(total_cfg["output_file"]),
+            orders=tuple(int(order) for order in data.get("orders", ())),
+            positive_only=bool(total_cfg["positive_only"]),
+            omega_min=None if total_cfg["omega_min"] is None else float(total_cfg["omega_min"]),
+            omega_max=None if total_cfg["omega_max"] is None else float(total_cfg["omega_max"]),
+            fundamental_omega=reference_omega,
+            use_harmonic_order=bool(total_cfg.get("use_harmonic_order", False)),
+            max_harmonic_order=None if total_cfg.get("max_harmonic_order") is None else float(total_cfg["max_harmonic_order"]),
+            log_scale=bool(total_cfg["log_scale"]),
+        )
+
+    components_cfg = resolved_plot_config["current_components_spectrum"]
+    if bool(components_cfg["enabled"]):
+        outputs["current_components_spectrum"] = HarmonicGraphics.plot_current_magnitude_spectrum(
             np.asarray(data["omega_axis"], dtype=float),
             np.asarray(data["current_spectrum"], dtype=np.complex128),
-            output_dir / str(current_cfg["output_file"]),
+            output_dir / str(components_cfg["output_file"]),
             orders=tuple(int(order) for order in data.get("orders", ())),
-            directions=tuple(str(direction) for direction in current_cfg["directions"]),
-            positive_only=bool(current_cfg["positive_only"]),
-            omega_min=None if current_cfg["omega_min"] is None else float(current_cfg["omega_min"]),
-            omega_max=None if current_cfg["omega_max"] is None else float(current_cfg["omega_max"]),
-            fundamental_omega=float(config.laser.omega),
-            use_harmonic_order=bool(current_cfg.get("use_harmonic_order", False)),
-            max_harmonic_order=None if current_cfg.get("max_harmonic_order") is None else float(current_cfg["max_harmonic_order"]),
-            log_scale=bool(current_cfg["log_scale"]),
+            directions=tuple(str(direction) for direction in components_cfg["directions"]),
+            positive_only=bool(components_cfg["positive_only"]),
+            omega_min=None if components_cfg["omega_min"] is None else float(components_cfg["omega_min"]),
+            omega_max=None if components_cfg["omega_max"] is None else float(components_cfg["omega_max"]),
+            fundamental_omega=reference_omega,
+            use_harmonic_order=bool(components_cfg.get("use_harmonic_order", False)),
+            max_harmonic_order=None if components_cfg.get("max_harmonic_order") is None else float(components_cfg["max_harmonic_order"]),
+            log_scale=bool(components_cfg["log_scale"]),
+        )
+
+    inter_intra_cfg = resolved_plot_config["current_inter_intra_spectrum"]
+    if bool(inter_intra_cfg["enabled"]) and bool(data.get("current_decomposition_available", False)):
+        outputs["current_inter_intra_spectrum"] = HarmonicGraphics.plot_inter_intra_current_spectrum(
+            np.asarray(data["omega_axis"], dtype=float),
+            np.asarray(data["current_total_magnitude_intraband"], dtype=float),
+            np.asarray(data["current_total_magnitude_interband"], dtype=float),
+            output_dir / str(inter_intra_cfg["output_file"]),
+            orders=tuple(int(order) for order in data.get("orders", ())),
+            positive_only=bool(inter_intra_cfg["positive_only"]),
+            omega_min=None if inter_intra_cfg["omega_min"] is None else float(inter_intra_cfg["omega_min"]),
+            omega_max=None if inter_intra_cfg["omega_max"] is None else float(inter_intra_cfg["omega_max"]),
+            fundamental_omega=reference_omega,
+            use_harmonic_order=bool(inter_intra_cfg.get("use_harmonic_order", False)),
+            max_harmonic_order=None if inter_intra_cfg.get("max_harmonic_order") is None else float(inter_intra_cfg["max_harmonic_order"]),
+            log_scale=bool(inter_intra_cfg["log_scale"]),
         )
 
     circular_cfg = resolved_plot_config["current_circular_spectrum"]
@@ -279,10 +321,38 @@ def plot_harmonic_graphics_from_saved_data(
             positive_only=bool(circular_cfg["positive_only"]),
             omega_min=None if circular_cfg["omega_min"] is None else float(circular_cfg["omega_min"]),
             omega_max=None if circular_cfg["omega_max"] is None else float(circular_cfg["omega_max"]),
-            fundamental_omega=float(config.laser.omega),
+            fundamental_omega=reference_omega,
             use_harmonic_order=bool(circular_cfg.get("use_harmonic_order", False)),
             max_harmonic_order=None if circular_cfg.get("max_harmonic_order") is None else float(circular_cfg["max_harmonic_order"]),
             log_scale=bool(circular_cfg["log_scale"]),
+        )
+
+    overview_cfg = resolved_plot_config["current_overview_spectrum"]
+    if bool(overview_cfg["enabled"]):
+        outputs["current_overview_spectrum"] = HarmonicGraphics.plot_current_overview_spectrum(
+            np.asarray(data["omega_axis"], dtype=float),
+            np.asarray(data["current_spectrum"], dtype=np.complex128),
+            np.asarray(data["current_total_magnitude"], dtype=float),
+            output_dir / str(overview_cfg["output_file"]),
+            orders=tuple(int(order) for order in data.get("orders", ())),
+            directions=tuple(str(direction) for direction in overview_cfg.get("directions", ("x", "y", "z"))),
+            intraband_magnitude=(
+                np.asarray(data["current_total_magnitude_intraband"], dtype=float)
+                if bool(data.get("current_decomposition_available", False))
+                else None
+            ),
+            interband_magnitude=(
+                np.asarray(data["current_total_magnitude_interband"], dtype=float)
+                if bool(data.get("current_decomposition_available", False))
+                else None
+            ),
+            positive_only=bool(overview_cfg["positive_only"]),
+            omega_min=None if overview_cfg["omega_min"] is None else float(overview_cfg["omega_min"]),
+            omega_max=None if overview_cfg["omega_max"] is None else float(overview_cfg["omega_max"]),
+            fundamental_omega=reference_omega,
+            use_harmonic_order=bool(overview_cfg.get("use_harmonic_order", False)),
+            max_harmonic_order=None if overview_cfg.get("max_harmonic_order") is None else float(overview_cfg["max_harmonic_order"]),
+            log_scale=bool(overview_cfg["log_scale"]),
         )
 
     return outputs
@@ -356,6 +426,25 @@ def _normalize_plot_name(plot_name: str) -> str:
         "modulo_de_velocidad": "velocity_magnitude",
     }
     return aliases.get(key, key)
+
+
+def _harmonic_reference_omega(config: QXTIConfig) -> float:
+    if config.laser.pulses:
+        omegas = [float(pulse.get("omega", pulse.get("w0", 0.0))) for pulse in config.laser.pulses]
+        positive_omegas = [omega for omega in omegas if omega > 0.0]
+        if positive_omegas:
+            return float(min(positive_omegas))
+    return float(config.laser.omega)
+
+
+def _augment_legacy_harmonic_dataset(data: dict[str, object]) -> dict[str, object]:
+    augmented = dict(data)
+    if "current_total_magnitude" not in augmented and "current_spectrum" in augmented:
+        spectrum = np.asarray(augmented["current_spectrum"], dtype=np.complex128)
+        augmented["current_total_magnitude"] = np.sqrt(np.sum(np.abs(spectrum) ** 2, axis=1))
+    if "current_decomposition_available" not in augmented:
+        augmented["current_decomposition_available"] = False
+    return augmented
 
 
 def _load_response_fallback_data(

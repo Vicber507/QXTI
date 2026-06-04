@@ -308,8 +308,10 @@ def test_simulation_generates_requested_outputs(tmp_path: Path) -> None:
     assert harmonic_dataset["bz_mask"]["enabled"] is True
     assert np.isclose(float(harmonic_dataset["bz_mask"]["radius_percent"]), 80.0)
     assert np.isclose(float(harmonic_dataset["bz_mask"]["sigma"]), 0.75)
-
-
+    assert bool(harmonic_dataset["current_decomposition_available"]) is True
+    assert np.asarray(harmonic_dataset["current_total_magnitude"], dtype=float).ndim == 1
+    assert np.asarray(harmonic_dataset["current_total_magnitude_intraband"], dtype=float).ndim == 1
+    assert np.asarray(harmonic_dataset["current_total_magnitude_interband"], dtype=float).ndim == 1
 def test_graphics_runners_generate_outputs_from_config(tmp_path: Path) -> None:
     if importlib.util.find_spec("matplotlib") is None:
         pytest.skip("matplotlib is not available in this environment.")
@@ -333,9 +335,11 @@ def test_graphics_runners_generate_outputs_from_config(tmp_path: Path) -> None:
     assert "velocity_magnitude" in hamiltonian_outputs
     assert "rho_population_snapshots" in response_outputs
     assert "rho_coherence_snapshots" in response_outputs
-    assert "field_current_time" in harmonic_outputs
-    assert "current_spectrum" in harmonic_outputs
+    assert "current_total_spectrum" in harmonic_outputs
+    assert "current_components_spectrum" in harmonic_outputs
+    assert "current_inter_intra_spectrum" in harmonic_outputs
     assert "current_circular_spectrum" in harmonic_outputs
+    assert "current_overview_spectrum" in harmonic_outputs
     for path in (*hamiltonian_outputs.values(), *response_outputs.values(), *harmonic_outputs.values()):
         assert path.exists()
         assert path.stat().st_size > 0

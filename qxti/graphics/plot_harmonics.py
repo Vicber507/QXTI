@@ -18,12 +18,22 @@ try:
     import matplotlib
 
     matplotlib.use("Agg")
+    import matplotlib.patheffects as pe
     from matplotlib import pyplot as plt
+    from matplotlib import colors as mcolors
+    from matplotlib.ticker import LogLocator, NullFormatter
 
     HAS_MATPLOTLIB = True
 except ImportError:  # pragma: no cover - environment dependent
+    pe = None
     plt = None
+    mcolors = None
+    LogLocator = None
+    NullFormatter = None
     HAS_MATPLOTLIB = False
+
+
+AU_TO_EV = 27.211386245988
 
 
 DEFAULT_HARMONIC_PLOT_CONFIG = {
@@ -35,11 +45,33 @@ DEFAULT_HARMONIC_PLOT_CONFIG = {
         "include_total": False,
         "combine_planar": True,
     },
-    "current_spectrum": {
+    "current_total_spectrum": {
         "enabled": True,
         "dataset_file": "current_spectrum.npz",
-        "output_file": "current_spectrum.png",
+        "output_file": "current_total_spectrum.png",
+        "positive_only": True,
+        "omega_min": None,
+        "omega_max": None,
+        "use_harmonic_order": True,
+        "max_harmonic_order": 10.0,
+        "log_scale": True,
+    },
+    "current_components_spectrum": {
+        "enabled": True,
+        "dataset_file": "current_spectrum.npz",
+        "output_file": "current_components_spectrum.png",
         "directions": ("x", "y", "z"),
+        "positive_only": True,
+        "omega_min": None,
+        "omega_max": None,
+        "use_harmonic_order": True,
+        "max_harmonic_order": 10.0,
+        "log_scale": True,
+    },
+    "current_inter_intra_spectrum": {
+        "enabled": True,
+        "dataset_file": "current_spectrum.npz",
+        "output_file": "current_inter_intra_spectrum.png",
         "positive_only": True,
         "omega_min": None,
         "omega_max": None,
@@ -51,6 +83,18 @@ DEFAULT_HARMONIC_PLOT_CONFIG = {
         "enabled": True,
         "dataset_file": "current_spectrum.npz",
         "output_file": "current_circular_spectrum.png",
+        "positive_only": True,
+        "omega_min": None,
+        "omega_max": None,
+        "use_harmonic_order": True,
+        "max_harmonic_order": 10.0,
+        "log_scale": True,
+    },
+    "current_overview_spectrum": {
+        "enabled": True,
+        "dataset_file": "current_spectrum.npz",
+        "output_file": "current_overview_spectrum.png",
+        "directions": ("x", "y", "z"),
         "positive_only": True,
         "omega_min": None,
         "omega_max": None,
@@ -102,74 +146,110 @@ class HarmonicGraphics:
 
         rows = len(panel_specs)
         figure, axes = pyplot.subplots(rows, 1, figsize=(10.0, 3.0 * rows), sharex=True, squeeze=False)
-        field_colors = {"x": "#c23b22", "y": "#1f6aa5", "z": "#2c8c4a", "total": "#8f3fb0"}
-        current_colors = {"x": "#ff8c69", "y": "#58a5f0", "z": "#65c18c", "total": "#c98df0"}
+        field_colors = {"x": "#E69F00", "y": "#56B4E9", "z": "#009E73", "total": "#000000"}
+        current_colors = {"x": "#D55E00", "y": "#0072B2", "z": "#117733", "total": "#CC79A7"}
 
         for row, (title, panel_directions) in enumerate(panel_specs):
             axis = axes[row, 0]
             twin = axis.twinx()
+            axis.set_facecolor("white")
             field_lines = []
             current_lines = []
             if panel_directions == ("total",):
                 field_total = np.linalg.norm(field, axis=1)
                 current_total = np.linalg.norm(current, axis=1)
+                axis.fill_between(
+                    time,
+                    0.0,
+                    field_total,
+                    color=field_colors["total"],
+                    alpha=0.10,
+                    linewidth=0.0,
+                )
                 field_lines.append(
                     axis.plot(
                         time,
                         field_total,
-                        linewidth=1.8,
+                        linewidth=1.6,
                         color=field_colors["total"],
-                        label="|E(t)|",
+                        label=r"$|E(t)|$",
                     )[0]
                 )
                 current_lines.append(
                     twin.plot(
                         time,
                         current_total,
-                        linewidth=1.6,
+                        linewidth=1.4,
                         color=current_colors["total"],
-                        label="|J(t)|",
+                        label=r"$|J(t)|$",
                     )[0]
                 )
-                axis.set_ylabel("|E(t)|")
-                twin.set_ylabel("|J(t)|")
+                axis.set_ylabel(r"$|E(t)|$")
+                twin.set_ylabel(r"$|J(t)|$")
             else:
                 for direction in panel_directions:
                     idir = HarmonicGraphics._direction_axis(direction)
+                    axis.fill_between(
+                        time,
+                        0.0,
+                        field[:, idir],
+                        color=field_colors.get(direction, "#000000"),
+                        alpha=0.08,
+                        linewidth=0.0,
+                    )
                     field_lines.append(
                         axis.plot(
                             time,
                             field[:, idir],
-                            linewidth=1.7,
+                            linewidth=1.5,
                             color=field_colors.get(direction, None),
-                            label=f"E{direction}(t)",
+                            label=rf"$E_{{{direction}}}(t)$",
                         )[0]
                     )
                     current_lines.append(
                         twin.plot(
                             time,
                             current[:, idir],
-                            linewidth=1.5,
+                            linewidth=1.35,
+                            linestyle="--",
                             color=current_colors.get(direction, None),
-                            label=f"J{direction}(t)",
+                            label=rf"$J_{{{direction}}}(t)$",
                         )[0]
                     )
-                field_label = ", ".join(f"E{direction}(t)" for direction in panel_directions)
-                current_label = ", ".join(f"J{direction}(t)" for direction in panel_directions)
+                field_label = ", ".join(rf"$E_{{{direction}}}(t)$" for direction in panel_directions)
+                current_label = ", ".join(rf"$J_{{{direction}}}(t)$" for direction in panel_directions)
                 axis.set_ylabel(field_label)
                 twin.set_ylabel(current_label)
-            axis.set_title(title)
-            axis.grid(alpha=0.25)
+            axis.axhline(0.0, color="#cfcfcf", linewidth=0.7, zorder=0)
+            axis.set_title(title, fontsize=9, color="black")
+            axis.grid(False)
+            axis.spines["top"].set_visible(False)
+            axis.spines["right"].set_visible(False)
+            axis.spines["left"].set_linewidth(0.5)
+            axis.spines["bottom"].set_linewidth(0.5)
+            axis.tick_params(axis="both", which="major", labelsize=7, width=0.5, length=3, direction="out")
+            twin.spines["top"].set_visible(False)
+            twin.spines["left"].set_visible(False)
+            twin.spines["right"].set_linewidth(0.5)
+            twin.tick_params(axis="y", which="major", labelsize=7, width=0.5, length=3, direction="out")
             legend_lines = field_lines + current_lines
-            axis.legend(legend_lines, [line.get_label() for line in legend_lines], loc="upper right", ncol=2)
+            axis.legend(
+                legend_lines,
+                [line.get_label() for line in legend_lines],
+                loc="upper right",
+                ncol=2,
+                frameon=False,
+                fontsize=7,
+            )
 
-        axes[-1, 0].set_xlabel("time (a.u.)")
-        figure.suptitle("Electric field and current in time", fontsize=14)
+        axes[-1, 0].set_xlabel(r"$t\;(\mathrm{a.u.})$")
+        figure.patch.set_facecolor("white")
+        figure.suptitle(r"Driving field and induced current in time", fontsize=10, color="black")
 
         output = Path(output_path)
         output.parent.mkdir(parents=True, exist_ok=True)
         figure.tight_layout()
-        figure.savefig(output, dpi=160)
+        figure.savefig(output, dpi=300, facecolor=figure.get_facecolor())
         pyplot.close(figure)
         return output
 
@@ -189,7 +269,6 @@ class HarmonicGraphics:
         max_harmonic_order: float | None = None,
         log_scale: bool = False,
     ) -> Path:
-        pyplot = HarmonicGraphics._require_matplotlib()
         omega = np.asarray(omega_axis, dtype=float)
         spectrum = np.asarray(current_spectrum, dtype=np.complex128)
 
@@ -198,68 +277,142 @@ class HarmonicGraphics:
         if spectrum.shape[0] != omega.size:
             raise ValueError("omega_axis and current_spectrum must share the same first dimension.")
 
-        mask = np.ones_like(omega, dtype=bool)
-        if positive_only:
-            mask &= omega >= 0.0
-        if omega_min is not None:
-            mask &= omega >= float(omega_min)
-        if omega_max is not None:
-            mask &= omega <= float(omega_max)
-        if not np.any(mask):
-            raise ValueError("No frequency points remain after applying the requested filters.")
-
-        figure, axis = pyplot.subplots(figsize=(9.2, 5.4))
-        axis.set_facecolor("#fbfaf7")
-        colors = {"x": "#c23b22", "y": "#1f6aa5", "z": "#2c8c4a"}
-        x_values = omega[mask]
-        xlabel = "ω (a.u.)"
-        if use_harmonic_order:
-            if fundamental_omega is None or fundamental_omega <= 0.0:
-                raise ValueError("fundamental_omega must be positive when use_harmonic_order=True.")
-            x_values = omega[mask] / float(fundamental_omega)
-            xlabel = "harmonic order"
+        mask = HarmonicGraphics._build_frequency_mask(
+            omega,
+            positive_only=positive_only,
+            omega_min=omega_min,
+            omega_max=omega_max,
+        )
+        x_values, xlabel = HarmonicGraphics._build_spectral_xaxis(
+            omega[mask],
+            fundamental_omega=fundamental_omega,
+            use_harmonic_order=use_harmonic_order,
+        )
+        colors = {"x": "#E69F00", "y": "#56B4E9", "z": "#009E73"}
+        series: list[tuple[str, np.ndarray, str]] = []
         for direction in directions:
-            idir = HarmonicGraphics._direction_axis(direction)
-            magnitude = np.abs(spectrum[mask, idir])
-            if not np.any(magnitude > 0.0):
-                continue
-            axis.plot(
-                x_values,
-                magnitude,
-                linewidth=2.0,
-                color=colors.get(direction, None),
-                label=f"|J_{direction}(ω)|",
+            axis_index = HarmonicGraphics._direction_axis(direction)
+            series.append(
+                (
+                    rf"$|J_{{{direction}}}(\omega)|$",
+                    np.abs(spectrum[mask, axis_index]),
+                    colors.get(direction, "#444444"),
+                )
             )
 
-        axis.set_xlabel(xlabel)
-        axis.set_ylabel("|J(ω)|")
-        if orders:
-            orders_text = ", ".join(str(order) for order in orders)
-            axis.set_title(f"Current spectrum from sum of rho^(s), s = {orders_text}")
-        else:
-            axis.set_title("Current spectrum")
-        if use_harmonic_order and max_harmonic_order is not None:
-            axis.set_xlim(0.0, float(max_harmonic_order))
-            tick_max = int(np.floor(float(max_harmonic_order)))
-            axis.set_xticks(np.arange(0, tick_max + 1, 1, dtype=int))
-            for ho in range(1, tick_max + 1):
-                axis.axvline(float(ho), color="#d7d1c6", linewidth=0.9, linestyle="--", zorder=0)
-        if log_scale:
-            axis.set_yscale("log")
-        axis.grid(alpha=0.24, color="#b9b2a6")
-        axis.spines["top"].set_visible(False)
-        axis.spines["right"].set_visible(False)
-        if axis.has_data():
-            axis.legend()
-        else:
-            raise ValueError("Selected directions do not contain any non-zero spectral data.")
+        return HarmonicGraphics._plot_multi_series_spectrum(
+            x_values=x_values,
+            xlabel=xlabel,
+            series=series,
+            output_path=output_path,
+            title="Current Spectrum",
+            ylabel=r"$|J_i(\omega)|$",
+            use_harmonic_order=use_harmonic_order,
+            max_harmonic_order=max_harmonic_order,
+            log_scale=log_scale,
+            top_energy_scale_ev=None if fundamental_omega is None else float(fundamental_omega) * AU_TO_EV,
+            panel_tag="Cartesian components",
+            context_note=HarmonicGraphics._format_orders_badge(orders),
+        )
 
-        output = Path(output_path)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        figure.tight_layout()
-        figure.savefig(output, dpi=160)
-        pyplot.close(figure)
-        return output
+    @staticmethod
+    def plot_total_current_spectrum(
+        omega_axis: np.ndarray,
+        total_magnitude: np.ndarray,
+        output_path: str | Path,
+        *,
+        orders: tuple[int, ...] | None = None,
+        positive_only: bool = True,
+        omega_min: float | None = None,
+        omega_max: float | None = None,
+        fundamental_omega: float | None = None,
+        use_harmonic_order: bool = False,
+        max_harmonic_order: float | None = None,
+        log_scale: bool = False,
+    ) -> Path:
+        omega = np.asarray(omega_axis, dtype=float)
+        magnitude = np.asarray(total_magnitude, dtype=float)
+        if magnitude.ndim != 1 or magnitude.shape[0] != omega.size:
+            raise ValueError("total_magnitude must have shape (Nomega,).")
+
+        mask = HarmonicGraphics._build_frequency_mask(
+            omega,
+            positive_only=positive_only,
+            omega_min=omega_min,
+            omega_max=omega_max,
+        )
+        x_values, xlabel = HarmonicGraphics._build_spectral_xaxis(
+            omega[mask],
+            fundamental_omega=fundamental_omega,
+            use_harmonic_order=use_harmonic_order,
+        )
+        return HarmonicGraphics._plot_multi_series_spectrum(
+            x_values=x_values,
+            xlabel=xlabel,
+            series=[(r"$|J(\omega)|$", magnitude[mask], "#000000")],
+            output_path=output_path,
+            title="Current Spectrum",
+            ylabel=r"$|J(\omega)|$",
+            use_harmonic_order=use_harmonic_order,
+            max_harmonic_order=max_harmonic_order,
+            log_scale=log_scale,
+            top_energy_scale_ev=None if fundamental_omega is None else float(fundamental_omega) * AU_TO_EV,
+            panel_tag="Total magnitude",
+            context_note=HarmonicGraphics._format_orders_badge(orders),
+        )
+
+    @staticmethod
+    def plot_inter_intra_current_spectrum(
+        omega_axis: np.ndarray,
+        intraband_magnitude: np.ndarray,
+        interband_magnitude: np.ndarray,
+        output_path: str | Path,
+        *,
+        orders: tuple[int, ...] | None = None,
+        positive_only: bool = True,
+        omega_min: float | None = None,
+        omega_max: float | None = None,
+        fundamental_omega: float | None = None,
+        use_harmonic_order: bool = False,
+        max_harmonic_order: float | None = None,
+        log_scale: bool = False,
+    ) -> Path:
+        omega = np.asarray(omega_axis, dtype=float)
+        intraband = np.asarray(intraband_magnitude, dtype=float)
+        interband = np.asarray(interband_magnitude, dtype=float)
+        if intraband.ndim != 1 or interband.ndim != 1:
+            raise ValueError("intraband_magnitude and interband_magnitude must be 1D arrays.")
+        if intraband.shape[0] != omega.size or interband.shape[0] != omega.size:
+            raise ValueError("Magnitude arrays must match omega_axis.")
+
+        mask = HarmonicGraphics._build_frequency_mask(
+            omega,
+            positive_only=positive_only,
+            omega_min=omega_min,
+            omega_max=omega_max,
+        )
+        x_values, xlabel = HarmonicGraphics._build_spectral_xaxis(
+            omega[mask],
+            fundamental_omega=fundamental_omega,
+            use_harmonic_order=use_harmonic_order,
+        )
+        return HarmonicGraphics._plot_multi_series_spectrum(
+            x_values=x_values,
+            xlabel=xlabel,
+            series=[
+                (r"$|J_{\mathrm{intra}}(\omega)|$", intraband[mask], "#0072B2"),
+                (r"$|J_{\mathrm{inter}}(\omega)|$", interband[mask], "#D55E00"),
+            ],
+            output_path=output_path,
+            title="Current Spectrum",
+            ylabel=r"$|J(\omega)|$",
+            use_harmonic_order=use_harmonic_order,
+            max_harmonic_order=max_harmonic_order,
+            log_scale=log_scale,
+            top_energy_scale_ev=None if fundamental_omega is None else float(fundamental_omega) * AU_TO_EV,
+            panel_tag="Interband and intraband",
+            context_note=HarmonicGraphics._format_orders_badge(orders),
+        )
 
     @staticmethod
     def plot_circular_current_spectrum(
@@ -276,7 +429,6 @@ class HarmonicGraphics:
         max_harmonic_order: float | None = None,
         log_scale: bool = False,
     ) -> Path:
-        pyplot = HarmonicGraphics._require_matplotlib()
         omega = np.asarray(omega_axis, dtype=float)
         spectrum = np.asarray(current_spectrum, dtype=np.complex128)
 
@@ -285,75 +437,156 @@ class HarmonicGraphics:
         if spectrum.shape[0] != omega.size:
             raise ValueError("omega_axis and current_spectrum must share the same first dimension.")
 
-        mask = np.ones_like(omega, dtype=bool)
-        if positive_only:
-            mask &= omega >= 0.0
-        if omega_min is not None:
-            mask &= omega >= float(omega_min)
-        if omega_max is not None:
-            mask &= omega <= float(omega_max)
-        if not np.any(mask):
-            raise ValueError("No frequency points remain after applying the requested filters.")
+        mask = HarmonicGraphics._build_frequency_mask(
+            omega,
+            positive_only=positive_only,
+            omega_min=omega_min,
+            omega_max=omega_max,
+        )
 
         jx = spectrum[:, 0]
         jy = spectrum[:, 1]
         current_right = (jx - 1.0j * jy) / np.sqrt(2.0)
         current_left = (jx + 1.0j * jy) / np.sqrt(2.0)
-
-        figure, axis = pyplot.subplots(figsize=(9.2, 5.4))
-        axis.set_facecolor("#fbfaf7")
         right_mag = np.abs(current_right[mask])
         left_mag = np.abs(current_left[mask])
-        x_values = omega[mask]
-        xlabel = "ω (a.u.)"
-        if use_harmonic_order:
-            if fundamental_omega is None or fundamental_omega <= 0.0:
-                raise ValueError("fundamental_omega must be positive when use_harmonic_order=True.")
-            x_values = omega[mask] / float(fundamental_omega)
-            xlabel = "harmonic order"
-        if np.any(right_mag > 0.0):
-            axis.plot(
-                x_values,
-                right_mag,
-                linewidth=2.1,
-                color="#2f6db2",
-                label="|J_R(ω)|",
-            )
-        if np.any(left_mag > 0.0):
-            axis.plot(
-                x_values,
-                left_mag,
-                linewidth=2.1,
-                color="#c83a3a",
-                label="|J_L(ω)|",
-            )
-        if not axis.has_data():
-            raise ValueError("The circularly polarized currents are zero for the selected range.")
+        x_values, xlabel = HarmonicGraphics._build_spectral_xaxis(
+            omega[mask],
+            fundamental_omega=fundamental_omega,
+            use_harmonic_order=use_harmonic_order,
+        )
+        return HarmonicGraphics._plot_multi_series_spectrum(
+            x_values=x_values,
+            xlabel=xlabel,
+            series=[
+                (r"$|J_{\mathrm{R}}(\omega)|$", right_mag, "#0072B2"),
+                (r"$|J_{\mathrm{L}}(\omega)|$", left_mag, "#CC79A7"),
+            ],
+            output_path=output_path,
+            title="Current Spectrum",
+            ylabel=r"$|J_{\mathrm{R/L}}(\omega)|$",
+            use_harmonic_order=use_harmonic_order,
+            max_harmonic_order=max_harmonic_order,
+            log_scale=log_scale,
+            top_energy_scale_ev=None if fundamental_omega is None else float(fundamental_omega) * AU_TO_EV,
+            panel_tag="Circular basis",
+            context_note=HarmonicGraphics._format_orders_badge(orders),
+        )
 
-        axis.set_xlabel(xlabel)
-        axis.set_ylabel("|J_{R/L}(ω)|")
-        if orders:
-            orders_text = ", ".join(str(order) for order in orders)
-            axis.set_title(f"Circular current spectrum from sum of rho^(s), s = {orders_text}")
-        else:
-            axis.set_title("Circular current spectrum")
-        if use_harmonic_order and max_harmonic_order is not None:
-            axis.set_xlim(0.0, float(max_harmonic_order))
-            tick_max = int(np.floor(float(max_harmonic_order)))
-            axis.set_xticks(np.arange(0, tick_max + 1, 1, dtype=int))
-            for ho in range(1, tick_max + 1):
-                axis.axvline(float(ho), color="#d7d1c6", linewidth=0.9, linestyle="--", zorder=0)
-        if log_scale:
-            axis.set_yscale("log")
-        axis.grid(alpha=0.24, color="#b9b2a6")
-        axis.spines["top"].set_visible(False)
-        axis.spines["right"].set_visible(False)
-        axis.legend()
+    @staticmethod
+    def plot_current_overview_spectrum(
+        omega_axis: np.ndarray,
+        current_spectrum: np.ndarray,
+        total_magnitude: np.ndarray,
+        output_path: str | Path,
+        *,
+        orders: tuple[int, ...] | None = None,
+        directions: tuple[str, ...] = ("x", "y", "z"),
+        intraband_magnitude: np.ndarray | None = None,
+        interband_magnitude: np.ndarray | None = None,
+        positive_only: bool = True,
+        omega_min: float | None = None,
+        omega_max: float | None = None,
+        fundamental_omega: float | None = None,
+        use_harmonic_order: bool = False,
+        max_harmonic_order: float | None = None,
+        log_scale: bool = False,
+    ) -> Path:
+        pyplot = HarmonicGraphics._require_matplotlib()
+        omega = np.asarray(omega_axis, dtype=float)
+        spectrum = np.asarray(current_spectrum, dtype=np.complex128)
+        magnitude = np.asarray(total_magnitude, dtype=float)
+
+        if spectrum.ndim != 2 or spectrum.shape[1] != 3:
+            raise ValueError("current_spectrum must have shape (Nomega, 3).")
+        if spectrum.shape[0] != omega.size or magnitude.shape != omega.shape:
+            raise ValueError("omega_axis, current_spectrum and total_magnitude must match.")
+
+        mask = HarmonicGraphics._build_frequency_mask(
+            omega,
+            positive_only=positive_only,
+            omega_min=omega_min,
+            omega_max=omega_max,
+        )
+        x_values, xlabel = HarmonicGraphics._build_spectral_xaxis(
+            omega[mask],
+            fundamental_omega=fundamental_omega,
+            use_harmonic_order=use_harmonic_order,
+        )
+
+        component_colors = {"x": "#E69F00", "y": "#56B4E9", "z": "#009E73"}
+        components_series = [
+            (
+                rf"$|J_{{{direction}}}(\omega)|$",
+                np.abs(spectrum[mask, HarmonicGraphics._direction_axis(direction)]),
+                component_colors.get(direction, "#444444"),
+            )
+            for direction in directions
+        ]
+
+        jx = spectrum[:, 0]
+        jy = spectrum[:, 1]
+        circular_series = [
+            (r"$|J_{\mathrm{R}}(\omega)|$", np.abs(((jx - 1.0j * jy) / np.sqrt(2.0))[mask]), "#0072B2"),
+            (r"$|J_{\mathrm{L}}(\omega)|$", np.abs(((jx + 1.0j * jy) / np.sqrt(2.0))[mask]), "#CC79A7"),
+        ]
+
+        panels: list[tuple[str, str, list[tuple[str, np.ndarray, str]], str]] = [
+            ("A", "Total magnitude", [(r"$|J(\omega)|$", magnitude[mask], "#111827")], r"$|J(\omega)|$"),
+            ("B", "Cartesian components", components_series, r"$|J_i(\omega)|$"),
+            ("C", "Circular basis", circular_series, r"$|J_{\mathrm{R/L}}(\omega)|$"),
+        ]
+
+        if intraband_magnitude is not None and interband_magnitude is not None:
+            intraband = np.asarray(intraband_magnitude, dtype=float)
+            interband = np.asarray(interband_magnitude, dtype=float)
+            if intraband.shape != omega.shape or interband.shape != omega.shape:
+                raise ValueError("Decomposition magnitudes must match omega_axis.")
+            panels.insert(
+                2,
+                (
+                    "C",
+                    "Interband and intraband",
+                    [
+                        (r"$|J_{\mathrm{intra}}(\omega)|$", intraband[mask], "#0072B2"),
+                        (r"$|J_{\mathrm{inter}}(\omega)|$", interband[mask], "#D55E00"),
+                    ],
+                    r"$|J(\omega)|$",
+                ),
+            )
+            panels[-1] = ("D", panels[-1][1], panels[-1][2], panels[-1][3])
+
+        figure, axes = pyplot.subplots(2, 2, figsize=(12.8, 8.6), sharex=True)
+        figure.patch.set_facecolor("white")
+        flat_axes = list(axes.flat)
+        top_energy_scale_ev = None if fundamental_omega is None else float(fundamental_omega) * AU_TO_EV
+
+        for index, (axis, (panel_label, panel_tag, panel_series, ylabel)) in enumerate(zip(flat_axes, panels)):
+            HarmonicGraphics._draw_multi_series_spectrum(
+                axis,
+                x_values=x_values,
+                xlabel=xlabel,
+                series=panel_series,
+                title="Current Spectrum",
+                ylabel=ylabel,
+                use_harmonic_order=use_harmonic_order,
+                max_harmonic_order=max_harmonic_order,
+                log_scale=log_scale,
+                top_energy_scale_ev=top_energy_scale_ev,
+                panel_tag=None,
+                context_note=None,
+                show_top_axis=index < 2,
+                legend_ncol=1,
+            )
+
+        for axis in flat_axes[len(panels) :]:
+            axis.set_visible(False)
+
+        figure.tight_layout()
 
         output = Path(output_path)
         output.parent.mkdir(parents=True, exist_ok=True)
-        figure.tight_layout()
-        figure.savefig(output, dpi=160)
+        figure.savefig(output, dpi=320, facecolor=figure.get_facecolor())
         pyplot.close(figure)
         return output
 
@@ -477,6 +710,291 @@ class HarmonicGraphics:
             return mapping[direction.strip().lower()]
         except KeyError as exc:
             raise ValueError("direction must be one of 'x', 'y', or 'z'.") from exc
+
+    @staticmethod
+    def _build_frequency_mask(
+        omega: np.ndarray,
+        *,
+        positive_only: bool,
+        omega_min: float | None,
+        omega_max: float | None,
+    ) -> np.ndarray:
+        mask = np.ones_like(omega, dtype=bool)
+        if positive_only:
+            mask &= omega >= 0.0
+        if omega_min is not None:
+            mask &= omega >= float(omega_min)
+        if omega_max is not None:
+            mask &= omega <= float(omega_max)
+        if not np.any(mask):
+            raise ValueError("No frequency points remain after applying the requested filters.")
+        return mask
+
+    @staticmethod
+    def _build_spectral_xaxis(
+        omega: np.ndarray,
+        *,
+        fundamental_omega: float | None,
+        use_harmonic_order: bool,
+    ) -> tuple[np.ndarray, str]:
+        if not use_harmonic_order:
+            return np.asarray(omega, dtype=float), r"$\omega\;(\mathrm{a.u.})$"
+        if fundamental_omega is None or fundamental_omega <= 0.0:
+            raise ValueError("fundamental_omega must be positive when use_harmonic_order=True.")
+        return np.asarray(omega / float(fundamental_omega), dtype=float), "Harmonic order"
+
+    @staticmethod
+    def _plot_multi_series_spectrum(
+        *,
+        x_values: np.ndarray,
+        xlabel: str,
+        series: list[tuple[str, np.ndarray, str]],
+        output_path: str | Path,
+        title: str,
+        ylabel: str,
+        use_harmonic_order: bool,
+        max_harmonic_order: float | None,
+        log_scale: bool,
+        top_energy_scale_ev: float | None = None,
+        panel_tag: str | None = None,
+        context_note: str | None = None,
+    ) -> Path:
+        pyplot = HarmonicGraphics._require_matplotlib()
+        figure, axis = pyplot.subplots(figsize=(7.3, 4.9))
+        figure.patch.set_facecolor("white")
+        HarmonicGraphics._draw_multi_series_spectrum(
+            axis,
+            x_values=x_values,
+            xlabel=xlabel,
+            series=series,
+            title=title,
+            ylabel=ylabel,
+            use_harmonic_order=use_harmonic_order,
+            max_harmonic_order=max_harmonic_order,
+            log_scale=log_scale,
+            top_energy_scale_ev=top_energy_scale_ev,
+            panel_tag=panel_tag,
+            context_note=context_note,
+            show_top_axis=True,
+            legend_ncol=min(2, max(1, len(series))),
+        )
+
+        output = Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        figure.tight_layout()
+        figure.savefig(output, dpi=320, facecolor=figure.get_facecolor())
+        pyplot.close(figure)
+        return output
+
+    @staticmethod
+    def _draw_multi_series_spectrum(
+        axis: Any,
+        *,
+        x_values: np.ndarray,
+        xlabel: str,
+        series: list[tuple[str, np.ndarray, str]],
+        title: str,
+        ylabel: str,
+        use_harmonic_order: bool,
+        max_harmonic_order: float | None,
+        log_scale: bool,
+        top_energy_scale_ev: float | None,
+        panel_tag: str | None,
+        context_note: str | None,
+        show_top_axis: bool,
+        legend_ncol: int,
+    ) -> None:
+        axis.set_facecolor("white")
+
+        valid_series: list[tuple[str, np.ndarray, str]] = []
+        positive_minima: list[float] = []
+        y_peak = 0.0
+        for label, values, color in series:
+            y_values = np.asarray(values, dtype=float)
+            if y_values.shape != x_values.shape:
+                raise ValueError("Each spectral series must match the x-axis shape.")
+            if not np.any(y_values > 0.0):
+                continue
+            valid_series.append((label, y_values, color))
+            positives = y_values[np.isfinite(y_values) & (y_values > 0.0)]
+            if positives.size:
+                positive_minima.append(float(np.min(positives)))
+                y_peak = max(y_peak, float(np.max(positives)))
+
+        if not valid_series:
+            raise ValueError("The selected spectrum is zero over the requested range.")
+
+        baseline = 0.0
+        if log_scale:
+            min_positive = min(positive_minima) if positive_minima else 1.0e-12
+            baseline = max(min_positive * 0.35, 1.0e-16)
+            axis.set_yscale("log")
+            if y_peak > 0.0:
+                axis.set_ylim(bottom=baseline, top=y_peak * 2.2)
+            else:
+                axis.set_ylim(bottom=baseline)
+        else:
+            axis.set_ylim(bottom=baseline)
+
+        if use_harmonic_order and max_harmonic_order is not None:
+            limit = float(max_harmonic_order)
+            axis.set_xlim(0.5, limit)
+            tick_max = int(np.floor(limit))
+            axis.set_xticks(np.arange(1, tick_max + 1, 1, dtype=int))
+        else:
+            axis.set_xlim(float(np.min(x_values)), float(np.max(x_values)))
+
+        axis.yaxis.grid(True, which="major", color="#e5e7eb", linewidth=0.9, alpha=1.0)
+        axis.xaxis.grid(True, which="major", color="#d9dee7", linewidth=0.75, linestyle=(0, (2, 4)), alpha=0.95)
+        if log_scale and LogLocator is not None and NullFormatter is not None:
+            axis.yaxis.set_minor_locator(LogLocator(base=10.0, subs=(2.0, 5.0)))
+            axis.yaxis.set_minor_formatter(NullFormatter())
+            axis.yaxis.grid(True, which="minor", color="#f1f5f9", linewidth=0.7, alpha=1.0)
+
+        for label, y_values, color in valid_series:
+            HarmonicGraphics._add_gradient_fill(
+                axis,
+                x_values,
+                y_values,
+                color=color,
+                baseline=baseline,
+                log_scale=log_scale,
+            )
+            HarmonicGraphics._plot_series_line(axis, x_values, y_values, color=color, label=label)
+
+        axis.set_title(title, fontsize=12.5, fontweight="semibold", color="#111827", pad=12)
+        axis.set_xlabel(xlabel, fontsize=11.0, color="#111827")
+        axis.set_ylabel(ylabel, fontsize=11.0, color="#111827")
+        axis.spines["top"].set_visible(False)
+        axis.spines["right"].set_visible(False)
+        axis.spines["left"].set_color("#6b7280")
+        axis.spines["bottom"].set_color("#6b7280")
+        axis.spines["left"].set_linewidth(0.9)
+        axis.spines["bottom"].set_linewidth(0.9)
+        axis.tick_params(axis="both", which="major", labelsize=9, width=0.8, length=4, direction="out", colors="#111827")
+        axis.tick_params(axis="both", which="minor", width=0.6, length=2.5, direction="out", colors="#111827")
+        axis.margins(x=0.01)
+
+        legend = axis.legend(
+            frameon=True,
+            fancybox=True,
+            framealpha=0.94,
+            fontsize=8,
+            ncol=max(1, legend_ncol),
+            loc="upper right",
+            borderpad=0.45,
+            labelspacing=0.35,
+            handlelength=2.6,
+        )
+        legend.get_frame().set_facecolor("white")
+        legend.get_frame().set_edgecolor("#e5e7eb")
+        legend.get_frame().set_linewidth(0.8)
+
+        if show_top_axis and use_harmonic_order and top_energy_scale_ev is not None and top_energy_scale_ev > 0.0:
+            top_axis = axis.secondary_xaxis(
+                "top",
+                functions=(
+                    lambda harmonic_order: harmonic_order * top_energy_scale_ev,
+                    lambda energy_ev: energy_ev / top_energy_scale_ev,
+                ),
+            )
+            top_axis.set_xlabel(r"$\hbar\omega\;(\mathrm{eV})$", fontsize=10.5, color="#111827", labelpad=10)
+            top_axis.tick_params(axis="x", which="major", labelsize=8, width=0.8, length=4, direction="out", colors="#111827")
+            top_axis.spines["top"].set_linewidth(0.9)
+            top_axis.spines["top"].set_color("#6b7280")
+
+    @staticmethod
+    def _plot_series_line(
+        axis: Any,
+        x_values: np.ndarray,
+        y_values: np.ndarray,
+        *,
+        color: str,
+        label: str,
+    ) -> None:
+        line = axis.plot(
+            x_values,
+            y_values,
+            linewidth=2.3,
+            color=color,
+            label=label,
+            solid_joinstyle="round",
+            solid_capstyle="round",
+            zorder=3,
+        )[0]
+        if pe is not None:
+            line.set_path_effects(
+                [
+                    pe.Stroke(linewidth=4.4, foreground=(*mcolors.to_rgb(color), 0.10)),
+                    pe.Normal(),
+                ]
+            )
+
+    @staticmethod
+    def _add_gradient_fill(
+        axis: Any,
+        x_values: np.ndarray,
+        y_values: np.ndarray,
+        *,
+        color: str,
+        baseline: float,
+        log_scale: bool,
+        steps: int = 32,
+        max_alpha: float = 0.5,
+    ) -> None:
+        rgba = mcolors.to_rgba(color)
+        x_values = np.asarray(x_values, dtype=float)
+        y_values = np.asarray(y_values, dtype=float)
+        if log_scale:
+            valid = np.isfinite(y_values) & (y_values > baseline)
+            if not np.any(valid):
+                return
+            ratio = np.ones_like(y_values, dtype=float)
+            ratio[valid] = np.maximum(y_values[valid] / baseline, 1.0)
+            for index in range(steps):
+                lower_frac = index / steps
+                upper_frac = (index + 1) / steps
+                lower = np.full_like(y_values, baseline)
+                upper = np.full_like(y_values, baseline)
+                lower[valid] = baseline * np.power(ratio[valid], lower_frac)
+                upper[valid] = baseline * np.power(ratio[valid], upper_frac)
+                axis.fill_between(
+                    x_values,
+                    lower,
+                    upper,
+                    color=rgba,
+                    where=valid,
+                    alpha=max_alpha * (upper_frac ** 1.25),
+                    linewidth=0.0,
+                    zorder=1,
+                )
+            return
+
+        valid = np.isfinite(y_values)
+        if not np.any(valid):
+            return
+        for index in range(steps):
+            lower_frac = index / steps
+            upper_frac = (index + 1) / steps
+            lower = baseline + (y_values - baseline) * lower_frac
+            upper = baseline + (y_values - baseline) * upper_frac
+            axis.fill_between(
+                x_values,
+                lower,
+                upper,
+                color=rgba,
+                where=valid,
+                alpha=max_alpha * (upper_frac ** 1.25),
+                linewidth=0.0,
+                zorder=1,
+            )
+
+    @staticmethod
+    def _format_orders_badge(orders: tuple[int, ...] | None) -> str | None:
+        if not orders:
+            return None
+        orders_text = ", ".join(str(order) for order in orders)
+        return rf"$\sum_s \rho^{{(s)}}$, $s={orders_text}$"
 
     @staticmethod
     def _require_matplotlib() -> Any:

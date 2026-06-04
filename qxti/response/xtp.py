@@ -140,6 +140,47 @@ class XTP:
             name=f"current(order={order}, direction={direction})",
         )
 
+    def has_current_decomposition(self) -> bool:
+        """Return whether intraband/interband current separation is available."""
+
+        return self.band_gauge_frame is not None
+
+    def current_decomposition(self, order: int, direction: str) -> dict[str, RealArray]:
+        """Return intraband/interband current components for one order and direction."""
+
+        if self.band_gauge_frame is None:
+            raise ValueError(
+                "Current decomposition requires a band_gauge_frame so operators and rho share the same band basis."
+            )
+
+        rho_tensor = self._rho_tensor(order)
+        direction = self._normalize_direction(direction)
+        nk = self.kgrid.total_points
+        nt = rho_tensor.shape[1]
+        intraband_expectation = np.zeros((nk, nt), dtype=np.complex128)
+        current_operator = self.band_gauge_frame.current(direction)
+
+        for ik in range(nk):
+            diagonal_current = np.diag(current_operator[ik])
+            band_diagonal = np.diagonal(rho_tensor[ik], axis1=1, axis2=2)
+            intraband_expectation[ik] = np.einsum(
+                "n,tn->t",
+                diagonal_current,
+                band_diagonal,
+                optimize=True,
+            )
+
+        intraband = self._coerce_real_vector(
+            self._integrate_over_brillouin_zone(intraband_expectation),
+            name=f"intraband_current(order={order}, direction={direction})",
+        )
+        total = self.current(order, direction)
+        interband = np.asarray(total - intraband, dtype=np.float64)
+        return {
+            "intraband": intraband,
+            "interband": interband,
+        }
+
     def polarization_frequency_domain(self, order: int) -> tuple[RealArray, ComplexArray]:
         """Return ``(omega_axis, P(omega))`` for one perturbative order."""
 
@@ -182,6 +223,11 @@ class XTP:
 
         return omega_axis, np.asarray(chi, dtype=np.complex128)
 
+    def susceptibility(self, order: int) -> RealArray:
+        """Backward-compatible alias for the order-resolved polarization response."""
+
+        return self.polarization(order)
+
     def current_frequency_domain(
         self,
         order: int,
@@ -217,6 +263,26 @@ class XTP:
             for order in self.orders:
                 total[:, axis] += self.current(order, direction)
         return total
+
+    def total_current_decomposition(self) -> dict[str, RealArray]:
+        """Return intraband/interband current vectors summed over configured orders."""
+
+        if self.band_gauge_frame is None:
+            raise ValueError("total_current_decomposition requires band-basis data.")
+
+        nt = len(self.timegrid)
+        intraband = np.zeros((nt, 3), dtype=np.float64)
+        interband = np.zeros((nt, 3), dtype=np.float64)
+        for direction in self.directions:
+            axis = self._direction_axis(direction)
+            for order in self.orders:
+                parts = self.current_decomposition(order, direction)
+                intraband[:, axis] += parts["intraband"]
+                interband[:, axis] += parts["interband"]
+        return {
+            "intraband": intraband,
+            "interband": interband,
+        }
 
     def total_current_frequency_domain(self) -> tuple[RealArray, ComplexArray]:
         """Return ``(omega_axis, J_total(omega))`` for all configured directions."""
@@ -473,6 +539,7 @@ class XTP:
         if imag_max > atol:
             raise ValueError(f"{name} contains a non-negligible imaginary part ({imag_max:.3e}).")
         return np.asarray(np.real(values), dtype=np.float64)
+
 
     @classmethod
     def _coerce_real_matrix(cls, values: ComplexArray, *, name: str, atol: float = 1.0e-9) -> RealArray:
