@@ -608,6 +608,19 @@ def test_xtp_current_frequency_domain_matches_manual_fft_and_plot(tmp_path: Path
     np.testing.assert_allclose(harmonic_data["current_time_total"], current_time, atol=1.0e-12)
     np.testing.assert_allclose(harmonic_data["current_time"], induced_current, atol=1.0e-12)
     np.testing.assert_allclose(harmonic_data["current_spectrum"], induced_spectrum, atol=1.0e-10)
+    assert bool(harmonic_data["current_decomposition_available"]) is True
+    np.testing.assert_allclose(
+        np.asarray(harmonic_data["current_time_intraband"], dtype=float)
+        + np.asarray(harmonic_data["current_time_interband"], dtype=float),
+        induced_current,
+        atol=1.0e-10,
+    )
+    current_total_magnitude = np.asarray(harmonic_data["current_total_magnitude"], dtype=float)
+    np.testing.assert_allclose(
+        current_total_magnitude,
+        np.sqrt(np.sum(np.abs(induced_spectrum) ** 2, axis=1)),
+        atol=1.0e-10,
+    )
 
 
 def test_cmd_band_gauge_frame_builds_full_berry_connection_and_covariant_source() -> None:

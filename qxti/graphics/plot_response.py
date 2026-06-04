@@ -25,7 +25,7 @@ DEFAULT_RESPONSE_PLOT_CONFIG = {
             "fps": 10,
             "duration_seconds": 20.0,
             "frame_stride": 2,
-            "cmap": "qx_diverging_black",
+            "cmap": "qx_diverging_publication",
             "center_zero": True,
             "contrast_percentile": 98.5,
         },
@@ -35,7 +35,7 @@ DEFAULT_RESPONSE_PLOT_CONFIG = {
             "num_snapshots": 4,
             "snapshot_times": [],
             "snapshot_indices": [],
-            "cmap": "qx_diverging_black",
+            "cmap": "qx_diverging_publication",
             "center_zero": True,
             "contrast_percentile": 98.5,
         },
@@ -48,7 +48,7 @@ DEFAULT_RESPONSE_PLOT_CONFIG = {
             "fps": 10,
             "duration_seconds": 20.0,
             "frame_stride": 2,
-            "cmap": "qx_diverging_black",
+            "cmap": "qx_diverging_publication",
             "center_zero": True,
             "contrast_percentile": 98.5,
         },
@@ -58,7 +58,7 @@ DEFAULT_RESPONSE_PLOT_CONFIG = {
             "num_snapshots": 4,
             "snapshot_times": [],
             "snapshot_indices": [],
-            "cmap": "qx_diverging_black",
+            "cmap": "qx_diverging_publication",
             "center_zero": True,
             "contrast_percentile": 98.5,
         },
@@ -288,12 +288,17 @@ class ResponseGraphics:
             extent=extent,
             cmap=cmap,
         )
-        axis.set_title(title)
-        axis.set_xlabel("time (a.u.)")
+        figure.patch.set_facecolor("white")
+        axis.set_facecolor("white")
+        axis.set_title(title, fontsize=9)
+        axis.set_xlabel(r"$t\;(\mathrm{a.u.})$")
         axis.set_ylabel(ylabel)
         axis.set_yticks(np.arange(len(labels), dtype=int))
         axis.set_yticklabels(labels)
         figure.colorbar(image, ax=axis, label=colorbar_label)
+        axis.spines["top"].set_visible(False)
+        axis.spines["right"].set_visible(False)
+        axis.tick_params(axis="both", which="major", labelsize=7, width=0.5, length=3, direction="out")
         return ResponseGraphics._save(figure, output_path)
 
     @staticmethod
@@ -331,6 +336,7 @@ class ResponseGraphics:
             figsize=(6.6 * ncols, 5.3 * nrows),
             squeeze=False,
         )
+        figure.patch.set_facecolor("white")
         axes_flat = list(axes.flat)
         images = []
         extent = [float(kx_values[0]), float(kx_values[-1]), float(ky_values[0]), float(ky_values[-1])]
@@ -350,9 +356,13 @@ class ResponseGraphics:
                 extent=extent,
                 **image_kwargs,
             )
-            axis.set_xlabel("kx (a.u.)")
-            axis.set_ylabel("ky (a.u.)")
-            axis.set_title(label)
+            axis.set_facecolor("white")
+            axis.set_xlabel(r"$k_x\;(\mathrm{a.u.})$")
+            axis.set_ylabel(r"$k_y\;(\mathrm{a.u.})$")
+            axis.set_title(label, fontsize=9)
+            axis.spines["top"].set_visible(False)
+            axis.spines["right"].set_visible(False)
+            axis.tick_params(axis="both", which="major", labelsize=7, width=0.5, length=3, direction="out")
             figure.colorbar(image, ax=axis, label=colorbar_label, shrink=0.88)
             images.append(image)
 
@@ -360,15 +370,15 @@ class ResponseGraphics:
             axis.set_visible(False)
 
         suptitle = figure.suptitle(
-            f"{title_prefix} at t = {time_axis[frame_indices[0]]:.4f} a.u.",
-            fontsize=14,
+            rf"{title_prefix} at $t = {time_axis[frame_indices[0]]:.4f}\,\mathrm{{a.u.}}$",
+            fontsize=10,
         )
 
         def _update(frame_position: int):
             frame_index = frame_indices[frame_position]
             for entity_index, image in enumerate(images):
                 image.set_data(frames[frame_index, entity_index, :, :])
-            suptitle.set_text(f"{title_prefix} at t = {time_axis[frame_index]:.4f} a.u.")
+            suptitle.set_text(rf"{title_prefix} at $t = {time_axis[frame_index]:.4f}\,\mathrm{{a.u.}}$")
             return tuple(images) + (suptitle,)
 
         animation_obj = animation.FuncAnimation(
@@ -410,6 +420,7 @@ class ResponseGraphics:
             figsize=(4.8 * n_snapshots, 4.4 * n_entities),
             squeeze=False,
         )
+        figure.patch.set_facecolor("white")
         extent = [float(kx_values[0]), float(kx_values[-1]), float(ky_values[0]), float(ky_values[-1])]
         image_kwargs = ResponseGraphics._image_kwargs(
             frames,
@@ -428,12 +439,16 @@ class ResponseGraphics:
                     extent=extent,
                     **image_kwargs,
                 )
-                axis.set_xlabel("kx (a.u.)")
-                axis.set_ylabel("ky (a.u.)")
-                axis.set_title(f"{label}, t = {time_axis[frame_index]:.4f} a.u.")
+                axis.set_facecolor("white")
+                axis.set_xlabel(r"$k_x\;(\mathrm{a.u.})$")
+                axis.set_ylabel(r"$k_y\;(\mathrm{a.u.})$")
+                axis.set_title(rf"{label}, $t = {time_axis[frame_index]:.4f}\,\mathrm{{a.u.}}$", fontsize=9)
+                axis.spines["top"].set_visible(False)
+                axis.spines["right"].set_visible(False)
+                axis.tick_params(axis="both", which="major", labelsize=7, width=0.5, length=3, direction="out")
                 figure.colorbar(image, ax=axis, label=colorbar_label, shrink=0.82)
 
-        figure.suptitle(f"{title_prefix} snapshots", fontsize=14)
+        figure.suptitle(rf"{title_prefix} snapshots", fontsize=10)
         return ResponseGraphics._save(figure, output_path)
 
     @staticmethod
@@ -472,7 +487,7 @@ class ResponseGraphics:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         figure.tight_layout()
-        figure.savefig(output_path, dpi=160)
+        figure.savefig(output_path, dpi=300, facecolor=figure.get_facecolor())
         plt.close(figure)
         return output_path
 
@@ -505,6 +520,14 @@ class ResponseGraphics:
 
     @staticmethod
     def _resolve_cmap(cmap: str):
+        if cmap == "qx_diverging_publication":
+            return LinearSegmentedColormap.from_list(
+                "qx_diverging_publication",
+                ["#3B6FB6", "#F7F3E8", "#D98C00"],
+                N=256,
+            )
+        if cmap == "qx_sequential_publication":
+            return "cividis"
         if cmap != "qx_diverging_black":
             return cmap
         return LinearSegmentedColormap.from_list(

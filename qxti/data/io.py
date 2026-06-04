@@ -58,6 +58,7 @@ def load_rho_orders_from_npy(
     directory = Path(output_dir)
     pattern = re.compile(r"rho_order_(\d+)\.npy$")
     rho_orders: dict[int, np.ndarray] = {}
+
     for path in sorted(directory.glob("rho_order_*.npy")):
         match = pattern.match(path.name)
         if match is None:
