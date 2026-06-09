@@ -9,3 +9,7 @@ This directory documents the external Hamiltonian model files stored in
   [custom_hamiltonian.md](custom_hamiltonian.md).
 - `bi2se3_surface.py`: natural 2D surface Hamiltonian for Bi2Se3 loaded
   through `CustomHamiltonian`. See [bi2se3_surface.md](bi2se3_surface.md).
+- `graphene.py`: monolayer graphene tight-binding model on the honeycomb
+  lattice.
+- `graphene_bilayer.py`: AB-stacked bilayer graphene 4-band tight-binding
+  model with `gamma0`, `gamma1`, `gamma3`, `gamma4`, `delta_prime` and `u`.

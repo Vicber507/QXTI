@@ -267,6 +267,24 @@ def test_cmd_solve_time_domain_streams_without_cache(tmp_path: Path) -> None:
     assert np.max(np.abs(np.load(paths[2], mmap_mode="r"))) > 0.0
 
 
+def test_cmd_streaming_matches_in_memory_for_multi_k_grid(tmp_path: Path) -> None:
+    kgrid = KGrid(
+        kx_values=np.linspace(-0.2, 0.2, 3),
+        ky_values=np.linspace(-0.1, 0.1, 3),
+        kz_values=np.array([0.0]),
+        dimension=2,
+    )
+    cmd_streaming, _ = build_cmd_stack(max_order=2, kgrid=kgrid)
+    cmd_in_memory, _ = build_cmd_stack(max_order=2, kgrid=kgrid)
+
+    expected = cmd_in_memory.solve_time_domain_in_memory()
+    paths = cmd_streaming.solve_time_domain(tmp_path)
+
+    for order, expected_tensor in expected.items():
+        actual_tensor = np.load(paths[order], mmap_mode="r")
+        np.testing.assert_allclose(actual_tensor, expected_tensor, atol=1.0e-10)
+
+
 def test_response_population_heatmap_data_and_plot(tmp_path: Path) -> None:
     cmd, _ = build_cmd_stack(max_order=3)
     rho_orders = cmd.solve_time_domain_in_memory()
@@ -646,6 +664,34 @@ def test_cmd_band_gauge_frame_builds_full_berry_connection_and_covariant_source(
     np.testing.assert_allclose(connection_y, np.conjugate(np.swapaxes(connection_y, 1, 2)), atol=1.0e-8)
     assert np.max(np.abs(np.diagonal(connection_x, axis1=1, axis2=2))) > 0.0
     assert np.max(np.abs(source[:, :, 0])) > 0.0
+
+
+def test_cmd_local_driving_components_match_full_tensor_build() -> None:
+    cmd, _ = build_cmd_stack(
+        max_order=1,
+        kgrid=KGrid(
+            kx_values=np.linspace(-0.2, 0.2, 4),
+            ky_values=np.linspace(-0.15, 0.15, 3),
+            kz_values=np.array([0.0]),
+            dimension=2,
+        ),
+    )
+    rng = np.random.default_rng(1234)
+    rho = (
+        rng.normal(size=(cmd.kgrid.total_points, len(cmd.timegrid), 2, 2))
+        + 1.0j * rng.normal(size=(cmd.kgrid.total_points, len(cmd.timegrid), 2, 2))
+    ).astype(np.complex128)
+
+    full = cmd._build_driving_components(rho, cmd.kgrid.points())
+    mesh = rho.reshape(*cmd.kgrid.shape, len(cmd.timegrid), 2, 2)
+    connection_cache = tuple(
+        cmd.band_gauge_frame.connection(direction)
+        for direction in ("x", "y", "z")
+    )
+
+    for ik in range(cmd.kgrid.total_points):
+        local = cmd._driving_components_for_k_index(rho, mesh, connection_cache, ik)
+        np.testing.assert_allclose(local, full[ik], atol=1.0e-10)
 
 
 def test_xtp_current_uses_same_band_gauge_as_cmd() -> None:
