@@ -205,33 +205,35 @@ class CMD:
         total_order_solves = max(0, self.max_order * len(k_points))
         completed_solves = 0
         saved_paths: dict[int, Path] = {}
+        can_stream_saved_band_orders = self.basis == "band"
 
         self._emit_progress(
             f"CMD streaming start: {self.max_order} driven orders, {len(k_points)} k-points, "
             f"{total_order_solves} order/k-point solves total."
         )
 
-        previous_order_band = self._equilibrium_tensor_band(k_points, target_times)
+        equilibrium_band = self._equilibrium_tensor_band(k_points, target_times)
         saved_paths[0] = self._save_order_tensor(
             output_path,
             order=0,
-            tensor_band=previous_order_band,
+            tensor_band=equilibrium_band,
         )
         self._emit_progress(f"CMD saved order 0: '{saved_paths[0].name}'.")
+        if can_stream_saved_band_orders:
+            previous_order_band = np.load(saved_paths[0], mmap_mode="r")
+            del equilibrium_band
+        else:
+            previous_order_band = equilibrium_band
 
         for order in range(1, self.max_order + 1):
             self._emit_progress(
                 f"CMD order {order}/{self.max_order}: building source terms."
             )
-            driving_components = self._build_driving_components(
-                previous_order_band,
-                k_points,
-            )
             current_order_band, completed_solves = self._solve_single_order_band(
                 k_points,
                 target_times,
                 field_series,
-                driving_components,
+                previous_order_band,
                 order=order,
                 completed_solves=completed_solves,
                 total_order_solves=total_order_solves,
@@ -242,7 +244,11 @@ class CMD:
                 tensor_band=current_order_band,
             )
             self._emit_progress(f"CMD saved order {order}: '{saved_paths[order].name}'.")
-            previous_order_band = current_order_band
+            if can_stream_saved_band_orders:
+                previous_order_band = np.load(saved_paths[order], mmap_mode="r")
+                del current_order_band
+            else:
+                previous_order_band = current_order_band
 
         self._time_domain_cache = None
         self._frequency_domain_cache = None
@@ -289,15 +295,11 @@ class CMD:
             self._emit_progress(
                 f"CMD order {order}/{self.max_order}: building source terms."
             )
-            driving_components = self._build_driving_components(
-                orders_band[order - 1],
-                k_points,
-            )
             orders_band[order], completed_solves = self._solve_single_order_band(
                 k_points,
                 target_times,
                 field_series,
-                driving_components,
+                orders_band[order - 1],
                 order=order,
                 completed_solves=completed_solves,
                 total_order_solves=total_order_solves,
@@ -328,7 +330,7 @@ class CMD:
         k_points: FloatArray,
         target_times: FloatArray,
         field_series: FloatArray,
-        driving_components: ComplexArray,
+        previous_order_band: ComplexArray,
         *,
         order: int,
         completed_solves: int,
@@ -338,12 +340,28 @@ class CMD:
         nt = len(target_times)
         nb = self.hamiltonian.basis_size
         solved = np.empty((nk, nt, nb, nb), dtype=np.complex128)
+        previous_order_mesh = previous_order_band.reshape(
+            *self.kgrid.shape,
+            nt,
+            nb,
+            nb,
+        )
+        connection_cache = tuple(
+            self.band_gauge_frame.connection(direction)
+            for direction in ("x", "y", "z")
+        )
 
         for ik, k_point in enumerate(k_points):
             omega_matrix = self.band_gauge_frame.omega_matrix(ik)
+            source_components = self._driving_components_for_k_index(
+                previous_order_band,
+                previous_order_mesh,
+                connection_cache,
+                ik,
+            )
             source_series = self._field_weighted_source_series(
                 field_series,
-                driving_components[ik],
+                source_components,
             )
             solved[ik] = self._solve_linear_order_band_on_grid(
                 target_times,
@@ -473,6 +491,33 @@ class CMD:
 
         return components
 
+    def _driving_components_for_k_index(
+        self,
+        previous_order: ComplexArray,
+        previous_order_mesh: ComplexArray,
+        connection_cache: tuple[ComplexArray, ComplexArray, ComplexArray],
+        index: int,
+    ) -> ComplexArray:
+        nt = previous_order.shape[1]
+        nb = previous_order.shape[2]
+        components = np.zeros((nt, 3, nb, nb), dtype=np.complex128)
+
+        if self.include_intraband:
+            components += self._k_gradient_components_for_k_index(
+                previous_order_mesh,
+                index,
+            )
+
+        if self.include_interband:
+            rho_series = np.asarray(previous_order[index], dtype=np.complex128)
+            components += self._connection_commutator_components_for_k_index(
+                rho_series,
+                connection_cache,
+                index,
+            )
+
+        return components
+
     def _field_series(self, target_times: FloatArray) -> FloatArray:
         field = np.asarray(self.laser_system.electric_field(target_times), dtype=float)
         return np.atleast_2d(field)
@@ -518,6 +563,32 @@ class CMD:
 
         return gradients
 
+    def _k_gradient_components_for_k_index(
+        self,
+        tensor_mesh: ComplexArray,
+        index: int,
+    ) -> ComplexArray:
+        nt = tensor_mesh.shape[3]
+        nb = tensor_mesh.shape[4]
+        gradients = np.zeros((nt, 3, nb, nb), dtype=np.complex128)
+        multi_index = list(np.unravel_index(index, self.kgrid.shape))
+
+        for axis, grid_values in enumerate(
+            (self.kgrid.kx_values, self.kgrid.ky_values, self.kgrid.kz_values)
+        ):
+            if axis >= self.hamiltonian.dimension:
+                break
+            if len(grid_values) < 2:
+                continue
+            gradients[:, axis] = self._gradient_series_at_grid_index(
+                tensor_mesh,
+                multi_index,
+                axis,
+                np.asarray(grid_values, dtype=float),
+            )
+
+        return gradients
+
     def _connection_commutator_components(self, tensor: ComplexArray) -> ComplexArray:
         nk, nt, nb, _ = tensor.shape
         components = np.zeros((nk, nt, 3, nb, nb), dtype=np.complex128)
@@ -541,6 +612,88 @@ class CMD:
             components[:, :, axis] = -1.0j * (left - right)
 
         return np.asarray(components, dtype=np.complex128)
+
+    def _connection_commutator_components_for_k_index(
+        self,
+        rho_series: ComplexArray,
+        connection_cache: tuple[ComplexArray, ComplexArray, ComplexArray],
+        index: int,
+    ) -> ComplexArray:
+        nt = rho_series.shape[0]
+        nb = rho_series.shape[1]
+        components = np.zeros((nt, 3, nb, nb), dtype=np.complex128)
+
+        for axis in range(self.hamiltonian.dimension):
+            connection = connection_cache[axis][index]
+            left = np.matmul(connection[np.newaxis, :, :], rho_series)
+            right = np.matmul(rho_series, connection[np.newaxis, :, :])
+            components[:, axis] = -1.0j * (left - right)
+
+        return np.asarray(components, dtype=np.complex128)
+
+    @staticmethod
+    def _gradient_series_at_grid_index(
+        tensor_mesh: ComplexArray,
+        multi_index: list[int],
+        axis: int,
+        coordinates: FloatArray,
+    ) -> ComplexArray:
+        position = multi_index[axis]
+        if len(coordinates) < 2:
+            raise ValueError("coordinates must contain at least two points.")
+
+        def take(axis_position: int) -> ComplexArray:
+            local_index = list(multi_index)
+            local_index[axis] = axis_position
+            return np.asarray(tensor_mesh[tuple(local_index)], dtype=np.complex128)
+
+        if len(coordinates) == 2:
+            delta = float(coordinates[1] - coordinates[0])
+            if delta == 0.0:
+                raise ValueError("coordinates must be strictly monotonic.")
+            return np.asarray((take(1) - take(0)) / delta, dtype=np.complex128)
+
+        if position == 0:
+            step_1 = float(coordinates[1] - coordinates[0])
+            step_2 = float(coordinates[2] - coordinates[1])
+            if step_1 == 0.0 or step_2 == 0.0:
+                raise ValueError("coordinates must be strictly monotonic.")
+            coeff_0 = -(2.0 * step_1 + step_2) / (step_1 * (step_1 + step_2))
+            coeff_1 = (step_1 + step_2) / (step_1 * step_2)
+            coeff_2 = -step_1 / (step_2 * (step_1 + step_2))
+            return np.asarray(
+                coeff_0 * take(0) + coeff_1 * take(1) + coeff_2 * take(2),
+                dtype=np.complex128,
+            )
+
+        if position == len(coordinates) - 1:
+            step_1 = float(coordinates[-2] - coordinates[-3])
+            step_2 = float(coordinates[-1] - coordinates[-2])
+            if step_1 == 0.0 or step_2 == 0.0:
+                raise ValueError("coordinates must be strictly monotonic.")
+            coeff_0 = step_2 / (step_1 * (step_1 + step_2))
+            coeff_1 = -(step_1 + step_2) / (step_1 * step_2)
+            coeff_2 = (2.0 * step_2 + step_1) / (step_2 * (step_1 + step_2))
+            return np.asarray(
+                coeff_0 * take(len(coordinates) - 3)
+                + coeff_1 * take(len(coordinates) - 2)
+                + coeff_2 * take(len(coordinates) - 1),
+                dtype=np.complex128,
+            )
+
+        step_left = float(coordinates[position] - coordinates[position - 1])
+        step_right = float(coordinates[position + 1] - coordinates[position])
+        if step_left == 0.0 or step_right == 0.0:
+            raise ValueError("coordinates must be strictly monotonic.")
+        coeff_prev = -step_right / (step_left * (step_left + step_right))
+        coeff_curr = (step_right - step_left) / (step_left * step_right)
+        coeff_next = step_left / (step_right * (step_left + step_right))
+        return np.asarray(
+            coeff_prev * take(position - 1)
+            + coeff_curr * take(position)
+            + coeff_next * take(position + 1),
+            dtype=np.complex128,
+        )
 
     def _rho_equilibrium_band(self, index: int) -> ComplexArray:
         energies = self.band_gauge_frame.energies[index]
