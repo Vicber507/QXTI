@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import time
 from typing import Any
 
 import numpy as np
@@ -13,6 +14,8 @@ from qxti.grids import FrequencyGrid, KGrid, TimeGrid
 from qxti.physics import CustomHamiltonian, Hamiltonian, Laser, LaserSystem, OperatorFactory
 from qxti.response import CMD, XTP
 from qxti.solvers import AdamsBashforth2Solver, RKF45Solver, Solver
+from qxti.utils.io_utils import save_array_npy
+from qxti.utils.progress import ProgressTimer, format_bytes, format_duration
 
 
 ComplexArray = NDArray[np.complex128]
@@ -170,6 +173,7 @@ class QXTISimulation:
             include_intraband=ccfg.include_intraband,
             include_interband=ccfg.include_interband,
             include_dephasing=ccfg.include_dephasing,
+            rho_storage_dtype=ccfg.rho_storage_dtype,
         )
 
     def run(self) -> dict[str, Path]:
@@ -193,9 +197,11 @@ class QXTISimulation:
         requested_plots = plot_cfg.plots or DEFAULT_HAMILTONIAN_PLOTS
 
         total_plots = len(requested_plots)
+        step_timer = ProgressTimer(total=total_plots)
         for index, plot_name in enumerate(requested_plots, start=1):
             normalized = self._normalize_plot_name(plot_name)
-            self._emit_progress(f"Data {index}/{total_plots}: generating '{normalized}'.")
+            self._emit_step_started("Hamiltonian dataset", step_timer, f"generating '{normalized}'")
+            step_start = time.perf_counter()
             if normalized == "band_structure_2d":
                 data = data_builder.band_structure_2d_data(
                     path_type=plot_cfg.path_type,
@@ -275,6 +281,12 @@ class QXTISimulation:
                 outputs[f"{normalized}_data"] = dataset_path
             else:
                 raise ValueError(f"Unsupported Hamiltonian plot '{plot_name}'.")
+            self._emit_step_completed(
+                "Hamiltonian dataset",
+                step_timer,
+                f"saved '{normalized}.npz' ({format_bytes(dataset_path.stat().st_size)})",
+                step_seconds=time.perf_counter() - step_start,
+            )
 
         return outputs
 
@@ -322,11 +334,14 @@ class QXTISimulation:
         data_builder = ResponseData(cmd)
         output_dir = Path(self.config.cmd.output_dir) / "data"
         output_dir.mkdir(parents=True, exist_ok=True)
+        step_timer = ProgressTimer(total=4, min_completed_for_eta=2)
 
         all_orders = tuple(sorted(rho_orders))
 
         outputs: dict[str, Path] = {}
 
+        self._emit_step_started("CMD dataset", step_timer, "building population kx-ky dataset")
+        step_start = time.perf_counter()
         try:
             kmap_data = data_builder.population_kxky_animation_data(
                 orders=all_orders,
@@ -334,16 +349,38 @@ class QXTISimulation:
             )
         except ValueError as exc:
             self._emit_progress(f"CMD kx-ky population data skipped: {exc}")
+            kmap_data = None
+            self._emit_step_completed(
+                "CMD dataset",
+                step_timer,
+                "population kx-ky dataset skipped",
+                step_seconds=time.perf_counter() - step_start,
+            )
+            step_timer.advance()
         else:
+            self._emit_step_completed(
+                "CMD dataset",
+                step_timer,
+                "population kx-ky dataset built",
+                step_seconds=time.perf_counter() - step_start,
+            )
+            self._emit_step_started("CMD dataset", step_timer, "saving population kx-ky dataset")
+            step_start = time.perf_counter()
             animation_data_path = save_dataset_npz(
                 output_dir / "population_kx_ky_per_band.npz",
                 kmap_data,
             )
             outputs["rho_population_kxky_data"] = animation_data_path
-            self._emit_progress(
-                f"CMD kx-ky population data saved as '{animation_data_path.name}'."
+            self._emit_step_completed(
+                "CMD dataset",
+                step_timer,
+                f"population kx-ky dataset saved as '{animation_data_path.name}' "
+                f"({format_bytes(animation_data_path.stat().st_size)})",
+                step_seconds=time.perf_counter() - step_start,
             )
-
+            del kmap_data
+        self._emit_step_started("CMD dataset", step_timer, "building coherence kx-ky dataset")
+        step_start = time.perf_counter()
         try:
             coherence_kmap_data = data_builder.coherence_kxky_animation_data(
                 orders=all_orders,
@@ -352,16 +389,36 @@ class QXTISimulation:
             )
         except ValueError as exc:
             self._emit_progress(f"CMD kx-ky coherence data skipped: {exc}")
+            coherence_kmap_data = None
+            self._emit_step_completed(
+                "CMD dataset",
+                step_timer,
+                "coherence kx-ky dataset skipped",
+                step_seconds=time.perf_counter() - step_start,
+            )
+            step_timer.advance()
         else:
+            self._emit_step_completed(
+                "CMD dataset",
+                step_timer,
+                "coherence kx-ky dataset built",
+                step_seconds=time.perf_counter() - step_start,
+            )
+            self._emit_step_started("CMD dataset", step_timer, "saving coherence kx-ky dataset")
+            step_start = time.perf_counter()
             coherence_animation_data_path = save_dataset_npz(
                 output_dir / "coherence_kx_ky_per_pair.npz",
                 coherence_kmap_data,
             )
             outputs["rho_coherence_kxky_data"] = coherence_animation_data_path
-            self._emit_progress(
-                f"CMD kx-ky coherence data saved as '{coherence_animation_data_path.name}'."
+            self._emit_step_completed(
+                "CMD dataset",
+                step_timer,
+                f"coherence kx-ky dataset saved as '{coherence_animation_data_path.name}' "
+                f"({format_bytes(coherence_animation_data_path.stat().st_size)})",
+                step_seconds=time.perf_counter() - step_start,
             )
-
+            del coherence_kmap_data
         return outputs
 
     def generate_xtp_datasets(
@@ -370,6 +427,7 @@ class QXTISimulation:
         rho_orders: dict[int, ComplexArray],
     ) -> dict[str, Path]:
         self._emit_progress("XTP data products enabled: generating reusable current-spectrum dataset.")
+        step_timer = ProgressTimer(total=2)
         omega_axis = np.asarray(cmd.timegrid.frequency_axis(), dtype=float)
         omega_max = float(np.max(np.abs(omega_axis))) if omega_axis.size else 1.0
         frequencygrid = FrequencyGrid(
@@ -397,16 +455,31 @@ class QXTISimulation:
             cmd.laser_system.electric_field(cmd.timegrid.generate()),
             dtype=float,
         )
+        self._emit_step_started("XTP dataset", step_timer, "building current-spectrum dataset")
+        step_start = time.perf_counter()
         data_builder = HarmonicData(xtp, electric_field_time=electric_field_time)
         output_dir = Path(self.config.cmd.output_dir) / "data"
         output_dir.mkdir(parents=True, exist_ok=True)
+        current_spectrum_data = data_builder.current_spectrum_data()
+        self._emit_step_completed(
+            "XTP dataset",
+            step_timer,
+            "current-spectrum dataset built",
+            step_seconds=time.perf_counter() - step_start,
+        )
 
+        self._emit_step_started("XTP dataset", step_timer, "saving current-spectrum dataset")
+        step_start = time.perf_counter()
         current_spectrum_path = save_dataset_npz(
             output_dir / "current_spectrum.npz",
-            data_builder.current_spectrum_data(),
+            current_spectrum_data,
         )
-        self._emit_progress(
-            f"XTP current-spectrum data saved as '{current_spectrum_path.name}'."
+        self._emit_step_completed(
+            "XTP dataset",
+            step_timer,
+            f"current-spectrum dataset saved as '{current_spectrum_path.name}' "
+            f"({format_bytes(current_spectrum_path.stat().st_size)})",
+            step_seconds=time.perf_counter() - step_start,
         )
         return {"xtp_current_spectrum_data": current_spectrum_path}
 
@@ -450,24 +523,51 @@ class QXTISimulation:
         nfft = cmd.timegrid.Nt * cmd.timegrid.padding_factor if cmd.timegrid.zero_padding else cmd.timegrid.Nt
 
         saved_paths: dict[int, Path] = {}
+        progress_timer = ProgressTimer(total=len(rho_order_paths))
         for order, path in rho_order_paths.items():
+            start = time.perf_counter()
             tensor = np.load(path, mmap_mode="r")
             weighted = tensor * window[np.newaxis, :, np.newaxis, np.newaxis]
             transformed = np.asarray(np.fft.fft(weighted, n=nfft, axis=1), dtype=np.complex128)
             npy_path = output_dir / f"rho_frequency_order_{order}.npy"
-            np.save(npy_path, transformed)
+            save_array_npy(npy_path, transformed, dtype=cmd.rho_storage_dtype)
             saved_paths[order] = npy_path
+            progress_timer.advance()
+            QXTISimulation._emit_progress(
+                f"Frequency save {progress_timer.completed}/{progress_timer.total}: '{npy_path.name}' "
+                f"({format_bytes(npy_path.stat().st_size)}) "
+                f"in {format_duration(time.perf_counter() - start)} "
+                f"(elapsed {format_duration(progress_timer.elapsed_seconds)}, ETA {progress_timer.eta_text()})."
+            )
         return saved_paths
 
     @staticmethod
     def _load_saved_rho_order_paths(rho_order_paths: dict[int, Path]) -> dict[int, ComplexArray]:
         rho_orders: dict[int, ComplexArray] = {}
+        progress_timer = ProgressTimer(total=len(rho_order_paths))
         for order, path in rho_order_paths.items():
+            start = time.perf_counter()
             tensor = np.load(path, mmap_mode="r")
-            if tensor.dtype == np.complex128:
+            is_memmap = isinstance(tensor, np.memmap)
+            if np.issubdtype(tensor.dtype, np.complexfloating):
                 rho_orders[order] = tensor
             else:
                 rho_orders[order] = np.asarray(tensor, dtype=np.complex128)
+            progress_timer.advance()
+            if is_memmap:
+                QXTISimulation._emit_progress(
+                    f"Rho map {progress_timer.completed}/{progress_timer.total}: memory-mapped '{path.name}' "
+                    f"({format_bytes(path.stat().st_size)} on disk) "
+                    f"in {format_duration(time.perf_counter() - start)} "
+                    f"(elapsed {format_duration(progress_timer.elapsed_seconds)}, ETA {progress_timer.eta_text()})."
+                )
+            else:
+                QXTISimulation._emit_progress(
+                    f"Rho load {progress_timer.completed}/{progress_timer.total}: '{path.name}' "
+                    f"({format_bytes(path.stat().st_size)}) "
+                    f"in {format_duration(time.perf_counter() - start)} "
+                    f"(elapsed {format_duration(progress_timer.elapsed_seconds)}, ETA {progress_timer.eta_text()})."
+                )
         return rho_orders
 
     @staticmethod
@@ -514,6 +614,32 @@ class QXTISimulation:
         if dimension == 2:
             return ["x", "y"]
         return ["x", "y", "z"]
+
+    def _emit_step_started(
+        self,
+        label: str,
+        timer: ProgressTimer,
+        message: str,
+    ) -> None:
+        self._emit_progress(
+            f"{label} step {timer.completed + 1}/{timer.total}: {message} "
+            f"(elapsed {format_duration(timer.elapsed_seconds)}, ETA {timer.eta_text()})."
+        )
+
+    def _emit_step_completed(
+        self,
+        label: str,
+        timer: ProgressTimer,
+        message: str,
+        *,
+        step_seconds: float,
+    ) -> None:
+        timer.advance()
+        self._emit_progress(
+            f"{label} step {timer.completed}/{timer.total}: {message} "
+            f"in {format_duration(step_seconds)} "
+            f"(elapsed {format_duration(timer.elapsed_seconds)}, ETA {timer.eta_text()})."
+        )
 
     @staticmethod
     def _emit_progress(message: str) -> None:

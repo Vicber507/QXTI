@@ -111,7 +111,16 @@ class CustomHamiltonian(Hamiltonian):
 
         provider = getattr(self._module, "default_lattice", None)
         if callable(provider):
-            lattice = provider()
+            signature = inspect.signature(provider)
+            supports_params = False
+            try:
+                signature.bind(dict(self.params))
+            except TypeError:
+                supports_params = False
+            else:
+                supports_params = True
+
+            lattice = provider(dict(self.params)) if supports_params else provider()
             if not isinstance(lattice, dict):
                 raise TypeError("default_lattice() in the external model must return a dict.")
             return deepcopy(lattice)

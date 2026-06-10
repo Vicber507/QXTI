@@ -119,6 +119,7 @@ def write_config_file(tmp_path: Path, model_path: Path) -> Path:
             enabled = true
             output_dir = {tmp_path / "cmd"}
             max_order = 1
+            rho_storage_dtype = complex64
             population_time = 50.0
             coherence_time = 20.0
             temperature = 0.02
@@ -182,6 +183,7 @@ def test_qxti_config_parses_hamiltonian_and_plot_sections(tmp_path: Path) -> Non
     assert np.isclose(config.laser.alaser, 0.5)
     assert config.cmd.enabled is True
     assert config.cmd.max_order == 1
+    assert config.cmd.rho_storage_dtype == "complex64"
     assert config.cmd.solver == "rkf45"
     assert config.cmd.distribution == "fermi_dirac"
     assert np.isclose(config.cmd.population_time, 50.0)
@@ -308,8 +310,10 @@ def test_simulation_generates_requested_outputs(tmp_path: Path) -> None:
     assert harmonic_dataset["bz_mask"]["enabled"] is True
     assert np.isclose(float(harmonic_dataset["bz_mask"]["radius_percent"]), 80.0)
     assert np.isclose(float(harmonic_dataset["bz_mask"]["sigma"]), 0.75)
-
-
+    assert bool(harmonic_dataset["current_decomposition_available"]) is True
+    assert np.asarray(harmonic_dataset["current_total_magnitude"], dtype=float).ndim == 1
+    assert np.asarray(harmonic_dataset["current_total_magnitude_intraband"], dtype=float).ndim == 1
+    assert np.asarray(harmonic_dataset["current_total_magnitude_interband"], dtype=float).ndim == 1
 def test_graphics_runners_generate_outputs_from_config(tmp_path: Path) -> None:
     if importlib.util.find_spec("matplotlib") is None:
         pytest.skip("matplotlib is not available in this environment.")
@@ -333,9 +337,11 @@ def test_graphics_runners_generate_outputs_from_config(tmp_path: Path) -> None:
     assert "velocity_magnitude" in hamiltonian_outputs
     assert "rho_population_snapshots" in response_outputs
     assert "rho_coherence_snapshots" in response_outputs
-    assert "field_current_time" in harmonic_outputs
-    assert "current_spectrum" in harmonic_outputs
+    assert "current_total_spectrum" in harmonic_outputs
+    assert "current_components_spectrum" in harmonic_outputs
+    assert "current_inter_intra_spectrum" in harmonic_outputs
     assert "current_circular_spectrum" in harmonic_outputs
+    assert "current_overview_spectrum" in harmonic_outputs
     for path in (*hamiltonian_outputs.values(), *response_outputs.values(), *harmonic_outputs.values()):
         assert path.exists()
         assert path.stat().st_size > 0
