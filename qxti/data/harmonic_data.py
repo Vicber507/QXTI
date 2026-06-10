@@ -41,10 +41,12 @@ class HarmonicData:
         driven_polarization_time = self._polarization_time_for_orders(selected_orders)
         omega_axis, current_spectrum = self._fft_time_signal(driven_current_time)
         _, total_current_spectrum = self._fft_time_signal(current_time_total)
+        current_total_magnitude = np.sqrt(np.sum(np.abs(current_spectrum) ** 2, axis=1))
         data = {
             "omega_axis": np.asarray(omega_axis, dtype=float),
             "current_spectrum": np.asarray(current_spectrum, dtype=np.complex128),
             "current_magnitude": np.asarray(np.abs(current_spectrum), dtype=float),
+            "current_total_magnitude": np.asarray(current_total_magnitude, dtype=float),
             "current_time": np.asarray(driven_current_time, dtype=float),
             "polarization_time": np.asarray(driven_polarization_time, dtype=float),
             "current_time_total": np.asarray(current_time_total, dtype=float),
@@ -58,6 +60,29 @@ class HarmonicData:
             "equilibrium_subtracted": bool(0 in self.xtp.orders),
             "bz_mask": self.xtp.bz_mask_summary(),
         }
+        if self.xtp.has_current_decomposition():
+            intraband_time, interband_time = self._current_decomposition_for_orders(selected_orders)
+            _, intraband_spectrum = self._fft_time_signal(intraband_time)
+            _, interband_spectrum = self._fft_time_signal(interband_time)
+            data.update(
+                {
+                    "current_decomposition_available": True,
+                    "current_time_intraband": intraband_time,
+                    "current_time_interband": interband_time,
+                    "current_spectrum_intraband": np.asarray(intraband_spectrum, dtype=np.complex128),
+                    "current_spectrum_interband": np.asarray(interband_spectrum, dtype=np.complex128),
+                    "current_total_magnitude_intraband": np.asarray(
+                        np.sqrt(np.sum(np.abs(intraband_spectrum) ** 2, axis=1)),
+                        dtype=float,
+                    ),
+                    "current_total_magnitude_interband": np.asarray(
+                        np.sqrt(np.sum(np.abs(interband_spectrum) ** 2, axis=1)),
+                        dtype=float,
+                    ),
+                }
+            )
+        else:
+            data["current_decomposition_available"] = False
         if self.xtp.kgrid.dimension == 2:
             data.update(self.xtp.bz_mask_plot_data())
         if self.electric_field_time is not None:
@@ -92,6 +117,17 @@ class HarmonicData:
         for order in orders:
             polarization += np.asarray(self.xtp.polarization(order), dtype=float)
         return polarization
+
+    def _current_decomposition_for_orders(self, orders: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray]:
+        intraband = np.zeros((len(self.xtp.timegrid), 3), dtype=float)
+        interband = np.zeros((len(self.xtp.timegrid), 3), dtype=float)
+        for order in orders:
+            for direction in self.xtp.directions:
+                axis = self.xtp._direction_axis(direction)
+                parts = self.xtp.current_decomposition(order, direction)
+                intraband[:, axis] += np.asarray(parts["intraband"], dtype=float)
+                interband[:, axis] += np.asarray(parts["interband"], dtype=float)
+        return intraband, interband
 
     def _fft_time_signal(self, signal: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         values = np.asarray(signal, dtype=np.complex128)

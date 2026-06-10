@@ -213,6 +213,7 @@ class CMDConfig:
     enabled: bool = False
     output_dir: str = "outputs/cmd"
     max_order: int = 1
+    rho_storage_dtype: str = "complex128"
     population_time: float = math.inf
     coherence_time: float = math.inf
     temperature: float = 0.0
@@ -493,6 +494,7 @@ class QXTIConfig:
             enabled=section.getboolean("enabled", fallback=False),
             output_dir=section.get("output_dir", fallback="outputs/cmd").strip() or "outputs/cmd",
             max_order=section.getint("max_order", fallback=1),
+            rho_storage_dtype=section.get("rho_storage_dtype", fallback="complex128").strip() or "complex128",
             population_time=population_time,
             coherence_time=coherence_time,
             temperature=section.getfloat("temperature", fallback=0.0),

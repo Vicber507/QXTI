@@ -8,8 +8,13 @@ from typing import Any
 import numpy as np
 
 
-def save_dataset_npz(output_path: str | Path, data: dict[str, Any]) -> Path:
-    """Save one mixed metadata/array dataset into a compressed ``.npz`` file."""
+def save_dataset_npz(
+    output_path: str | Path,
+    data: dict[str, Any],
+    *,
+    compressed: bool = False,
+) -> Path:
+    """Save one mixed metadata/array dataset into one ``.npz`` file."""
 
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -23,7 +28,10 @@ def save_dataset_npz(output_path: str | Path, data: dict[str, Any]) -> Path:
             metadata[key] = _jsonify(value)
 
     arrays["__meta_json__"] = np.asarray(json.dumps(metadata), dtype=str)
-    np.savez_compressed(path, **arrays)
+    if compressed:
+        np.savez_compressed(path, **arrays)
+    else:
+        np.savez(path, **arrays)
     return path
 
 
@@ -58,12 +66,13 @@ def load_rho_orders_from_npy(
     directory = Path(output_dir)
     pattern = re.compile(r"rho_order_(\d+)\.npy$")
     rho_orders: dict[int, np.ndarray] = {}
+
     for path in sorted(directory.glob("rho_order_*.npy")):
         match = pattern.match(path.name)
         if match is None:
             continue
         tensor = np.load(path, mmap_mode=mmap_mode)
-        if tensor.dtype == np.complex128:
+        if np.issubdtype(tensor.dtype, np.complexfloating):
             rho_orders[int(match.group(1))] = tensor
         else:
             rho_orders[int(match.group(1))] = np.asarray(tensor, dtype=np.complex128)
