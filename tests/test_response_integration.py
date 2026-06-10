@@ -16,6 +16,7 @@ from qxti.graphics import HarmonicGraphics, ResponseGraphics
 from qxti.physics import Hamiltonian, Laser, LaserSystem, OperatorFactory
 from qxti.response import CMD, T1T2Relaxation, XTP, bose_einstein, fermi_dirac, full_occupation, maxwell_boltzmann, t1_t2_relaxation, valence_occupation
 from qxti.solvers import RKF45Solver
+from qxti.utils.io_utils import expand_rho_tensor_time_axis
 
 
 class ToyTwoBandHamiltonian(Hamiltonian):
@@ -262,8 +263,9 @@ def test_cmd_solve_time_domain_streams_without_cache(tmp_path: Path) -> None:
     assert cmd._time_domain_cache is None
     for order in (0, 1, 2):
         assert paths[order] == tmp_path / f"rho_order_{order}.npy"
-        tensor = np.load(paths[order], mmap_mode="r")
-        assert isinstance(tensor, np.memmap)
+        raw_tensor = np.load(paths[order], mmap_mode="r")
+        tensor = expand_rho_tensor_time_axis(raw_tensor, nt=cmd.timegrid.Nt)
+        assert isinstance(raw_tensor, np.memmap)
         assert tensor.shape == (1, 11, 2, 2)
     assert np.max(np.abs(np.load(paths[1], mmap_mode="r"))) > 0.0
     assert np.max(np.abs(np.load(paths[2], mmap_mode="r"))) > 0.0
@@ -283,7 +285,10 @@ def test_cmd_streaming_matches_in_memory_for_multi_k_grid(tmp_path: Path) -> Non
     paths = cmd_streaming.solve_time_domain(tmp_path)
 
     for order, expected_tensor in expected.items():
-        actual_tensor = np.load(paths[order], mmap_mode="r")
+        actual_tensor = expand_rho_tensor_time_axis(
+            np.load(paths[order], mmap_mode="r"),
+            nt=cmd_streaming.timegrid.Nt,
+        )
         np.testing.assert_allclose(actual_tensor, expected_tensor, atol=1.0e-10)
 
 
@@ -295,7 +300,10 @@ def test_cmd_streaming_supports_complex64_storage(tmp_path: Path) -> None:
     paths = cmd_streaming.solve_time_domain(tmp_path)
 
     for order, expected_tensor in expected.items():
-        actual_tensor = np.load(paths[order], mmap_mode="r")
+        actual_tensor = expand_rho_tensor_time_axis(
+            np.load(paths[order], mmap_mode="r"),
+            nt=cmd_streaming.timegrid.Nt,
+        )
         assert actual_tensor.dtype == np.complex64
         np.testing.assert_allclose(actual_tensor, expected_tensor, atol=5.0e-6, rtol=5.0e-6)
 

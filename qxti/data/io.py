@@ -6,6 +6,7 @@ import re
 from typing import Any
 
 import numpy as np
+from qxti.utils.io_utils import expand_rho_tensor_time_axis
 
 
 def save_dataset_npz(
@@ -56,6 +57,7 @@ def load_rho_orders_from_npy(
     output_dir: str | Path,
     *,
     mmap_mode: str | None = None,
+    nt: int | None = None,
 ) -> dict[int, np.ndarray]:
     """Load every available ``rho_order_*.npy`` tensor from one output directory.
 
@@ -72,6 +74,8 @@ def load_rho_orders_from_npy(
         if match is None:
             continue
         tensor = np.load(path, mmap_mode=mmap_mode)
+        if nt is not None:
+            tensor = expand_rho_tensor_time_axis(tensor, nt=nt)
         if np.issubdtype(tensor.dtype, np.complexfloating):
             rho_orders[int(match.group(1))] = tensor
         else:

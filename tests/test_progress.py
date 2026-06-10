@@ -34,7 +34,7 @@ def test_load_saved_rho_order_paths_reports_memmap(tmp_path: Path, capsys) -> No
     path = tmp_path / "rho_order_0.npy"
     np.save(path, np.zeros((2, 3, 2, 2), dtype=np.complex64))
 
-    loaded = QXTISimulation._load_saved_rho_order_paths({0: path})
+    loaded = QXTISimulation._load_saved_rho_order_paths({0: path}, nt=3)
     captured = capsys.readouterr().out
 
     assert 0 in loaded

@@ -14,7 +14,7 @@ from qxti.grids import FrequencyGrid, KGrid, TimeGrid
 from qxti.physics import CustomHamiltonian, Hamiltonian, Laser, LaserSystem, OperatorFactory
 from qxti.response import CMD, XTP
 from qxti.solvers import AdamsBashforth2Solver, RKF45Solver, Solver
-from qxti.utils.io_utils import save_array_npy
+from qxti.utils.io_utils import expand_rho_tensor_time_axis, save_array_npy
 from qxti.utils.progress import ProgressTimer, format_bytes, format_duration
 
 
@@ -320,7 +320,7 @@ class QXTISimulation:
                     f"CMD saved frequency order {order}: '{npy_path.name}'."
                 )
 
-        rho_orders = self._load_saved_rho_order_paths(rho_order_paths)
+        rho_orders = self._load_saved_rho_order_paths(rho_order_paths, nt=cmd.timegrid.Nt)
         outputs.update(self.generate_cmd_datasets(cmd, rho_orders))
         outputs.update(self.generate_xtp_datasets(cmd, rho_orders))
         return outputs
@@ -526,7 +526,10 @@ class QXTISimulation:
         progress_timer = ProgressTimer(total=len(rho_order_paths))
         for order, path in rho_order_paths.items():
             start = time.perf_counter()
-            tensor = np.load(path, mmap_mode="r")
+            tensor = expand_rho_tensor_time_axis(
+                np.load(path, mmap_mode="r"),
+                nt=cmd.timegrid.Nt,
+            )
             weighted = tensor * window[np.newaxis, :, np.newaxis, np.newaxis]
             transformed = np.asarray(np.fft.fft(weighted, n=nfft, axis=1), dtype=np.complex128)
             npy_path = output_dir / f"rho_frequency_order_{order}.npy"
@@ -542,13 +545,18 @@ class QXTISimulation:
         return saved_paths
 
     @staticmethod
-    def _load_saved_rho_order_paths(rho_order_paths: dict[int, Path]) -> dict[int, ComplexArray]:
+    def _load_saved_rho_order_paths(
+        rho_order_paths: dict[int, Path],
+        *,
+        nt: int,
+    ) -> dict[int, ComplexArray]:
         rho_orders: dict[int, ComplexArray] = {}
         progress_timer = ProgressTimer(total=len(rho_order_paths))
         for order, path in rho_order_paths.items():
             start = time.perf_counter()
-            tensor = np.load(path, mmap_mode="r")
-            is_memmap = isinstance(tensor, np.memmap)
+            raw_tensor = np.load(path, mmap_mode="r")
+            tensor = expand_rho_tensor_time_axis(raw_tensor, nt=nt)
+            is_memmap = isinstance(raw_tensor, np.memmap)
             if np.issubdtype(tensor.dtype, np.complexfloating):
                 rho_orders[order] = tensor
             else:
