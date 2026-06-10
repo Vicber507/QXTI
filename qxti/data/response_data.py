@@ -29,10 +29,8 @@ class ResponseData:
     ) -> dict[str, Any]:
         time_domain = self.cmd.solve_time_domain_in_memory() if rho_orders is None else rho_orders
         resolved_orders = self._resolve_orders(orders, time_domain)
-        total_rho = self._sum_orders(time_domain, resolved_orders)
-        populations = self._population_values(
-            total_rho,
-            rho_orders=time_domain,
+        populations = self._population_values_from_orders(
+            time_domain,
             resolved_orders=resolved_orders,
             value_mode=value_mode,
         )
@@ -62,10 +60,8 @@ class ResponseData:
     ) -> dict[str, Any]:
         time_domain = self.cmd.solve_time_domain_in_memory() if rho_orders is None else rho_orders
         resolved_orders = self._resolve_orders(orders, time_domain)
-        total_rho = self._sum_orders(time_domain, resolved_orders)
-        populations = self._population_values(
-            total_rho,
-            rho_orders=time_domain,
+        populations = self._population_values_from_orders(
+            time_domain,
             resolved_orders=resolved_orders,
             value_mode=value_mode,
         )
@@ -102,8 +98,11 @@ class ResponseData:
     ) -> dict[str, Any]:
         time_domain = self.cmd.solve_time_domain_in_memory() if rho_orders is None else rho_orders
         resolved_orders = self._resolve_orders(orders, time_domain)
-        total_rho = self._sum_orders(time_domain, resolved_orders)
-        coherence_values, pair_indices, pair_labels = self._coherence_series(total_rho, component=component)
+        coherence_values, pair_indices, pair_labels = self._coherence_series_from_orders(
+            time_domain,
+            resolved_orders=resolved_orders,
+            component=component,
+        )
         aggregation_mode, aggregation_label = self._normalize_k_aggregation(k_aggregation)
         aggregated = self._aggregate_populations(coherence_values, aggregation_mode)
 
@@ -131,8 +130,11 @@ class ResponseData:
     ) -> dict[str, Any]:
         time_domain = self.cmd.solve_time_domain_in_memory() if rho_orders is None else rho_orders
         resolved_orders = self._resolve_orders(orders, time_domain)
-        total_rho = self._sum_orders(time_domain, resolved_orders)
-        coherence_values, pair_indices, pair_labels = self._coherence_series(total_rho, component=component)
+        coherence_values, pair_indices, pair_labels = self._coherence_series_from_orders(
+            time_domain,
+            resolved_orders=resolved_orders,
+            component=component,
+        )
 
         if self.cmd.kgrid.dimension < 2:
             raise ValueError("A kx-ky coherence animation requires a 2D or 3D k-grid.")
@@ -226,10 +228,8 @@ class ResponseData:
         value_mode: str = "absolute",
     ) -> dict[str, Any]:
         resolved_orders = cls._resolve_orders(orders, rho_orders)
-        total_rho = cls._sum_orders(rho_orders, resolved_orders)
-        populations = cls._population_values(
-            total_rho,
-            rho_orders=rho_orders,
+        populations = cls._population_values_from_orders(
+            rho_orders,
             resolved_orders=resolved_orders,
             value_mode=value_mode,
         )
@@ -262,10 +262,8 @@ class ResponseData:
         value_mode: str = "absolute",
     ) -> dict[str, Any]:
         resolved_orders = cls._resolve_orders(orders, rho_orders)
-        total_rho = cls._sum_orders(rho_orders, resolved_orders)
-        populations = cls._population_values(
-            total_rho,
-            rho_orders=rho_orders,
+        populations = cls._population_values_from_orders(
+            rho_orders,
             resolved_orders=resolved_orders,
             value_mode=value_mode,
         )
@@ -320,6 +318,41 @@ class ResponseData:
             return populations
         return populations - reference
 
+    @classmethod
+    def _population_values_from_orders(
+        cls,
+        rho_orders: dict[int, ComplexArray],
+        *,
+        resolved_orders: tuple[int, ...],
+        value_mode: str,
+    ) -> FloatArray:
+        reference_tensor = cls._as_complex_tensor(rho_orders[resolved_orders[0]])
+        populations = np.zeros(
+            reference_tensor.shape[:2] + (reference_tensor.shape[2],),
+            dtype=np.float64,
+        )
+        for order in resolved_orders:
+            tensor = cls._as_complex_tensor(rho_orders[order])
+            populations += np.real(np.diagonal(tensor, axis1=2, axis2=3))
+
+        mode = cls._normalize_population_value_mode(value_mode)
+        if mode == "absolute":
+            return populations
+
+        if 0 in rho_orders:
+            reference = np.real(
+                np.diagonal(
+                    cls._as_complex_tensor(rho_orders[0]),
+                    axis1=2,
+                    axis2=3,
+                )
+            )
+        else:
+            reference = populations[:, :1, :]
+        if 0 not in resolved_orders and reference.shape == populations.shape:
+            return populations
+        return populations - reference
+
     @staticmethod
     def _normalize_population_value_mode(value_mode: str) -> str:
         key = value_mode.strip().lower()
@@ -346,8 +379,11 @@ class ResponseData:
         component: str = "magnitude",
     ) -> dict[str, Any]:
         resolved_orders = cls._resolve_orders(orders, rho_orders)
-        total_rho = cls._sum_orders(rho_orders, resolved_orders)
-        coherence_values, pair_indices, pair_labels = cls._coherence_series(total_rho, component=component)
+        coherence_values, pair_indices, pair_labels = cls._coherence_series_from_orders(
+            rho_orders,
+            resolved_orders=resolved_orders,
+            component=component,
+        )
         aggregation_mode, aggregation_label = cls._normalize_k_aggregation(k_aggregation)
         aggregated = cls._aggregate_populations(coherence_values, aggregation_mode)
         return {
@@ -378,8 +414,11 @@ class ResponseData:
         component: str = "magnitude",
     ) -> dict[str, Any]:
         resolved_orders = cls._resolve_orders(orders, rho_orders)
-        total_rho = cls._sum_orders(rho_orders, resolved_orders)
-        coherence_values, pair_indices, pair_labels = cls._coherence_series(total_rho, component=component)
+        coherence_values, pair_indices, pair_labels = cls._coherence_series_from_orders(
+            rho_orders,
+            resolved_orders=resolved_orders,
+            component=component,
+        )
 
         if len(ky_values) < 2:
             raise ValueError("A kx-ky coherence animation requires at least two ky points.")
@@ -428,6 +467,38 @@ class ResponseData:
         coherence_values = np.stack(extracted, axis=2)
         return coherence_values, pair_indices, pair_labels
 
+    @classmethod
+    def _coherence_series_from_orders(
+        cls,
+        rho_orders: dict[int, ComplexArray],
+        *,
+        resolved_orders: tuple[int, ...],
+        component: str,
+    ) -> tuple[FloatArray, list[tuple[int, int]], list[str]]:
+        reference_tensor = cls._as_complex_tensor(rho_orders[resolved_orders[0]])
+        num_bands = reference_tensor.shape[2]
+        pair_indices = cls._coherence_pairs(num_bands)
+        if not pair_indices:
+            raise ValueError("At least two bands are required to build coherence plots.")
+
+        rows = np.asarray([row for row, _ in pair_indices], dtype=int)
+        cols = np.asarray([col for _, col in pair_indices], dtype=int)
+        pair_labels = [f"{row}-{col}" for row, col in pair_indices]
+        coherence_accumulated = np.zeros(
+            reference_tensor.shape[:2] + (len(pair_indices),),
+            dtype=np.complex128,
+        )
+
+        for order in resolved_orders:
+            tensor = cls._as_complex_tensor(rho_orders[order])
+            coherence_accumulated += np.asarray(
+                tensor[:, :, rows, cols],
+                dtype=np.complex128,
+            )
+
+        coherence_values = cls._coherence_component(coherence_accumulated, component=component)
+        return coherence_values, pair_indices, pair_labels
+
     @staticmethod
     def _coherence_component(values: ComplexArray, *, component: str) -> FloatArray:
         key = component.strip().lower()
@@ -441,6 +512,6 @@ class ResponseData:
 
     @staticmethod
     def _as_complex_tensor(tensor: ComplexArray) -> ComplexArray:
-        if isinstance(tensor, np.ndarray) and tensor.dtype == np.complex128:
+        if isinstance(tensor, np.ndarray) and np.issubdtype(tensor.dtype, np.complexfloating):
             return tensor
         return np.asarray(tensor, dtype=np.complex128)
