@@ -36,3 +36,21 @@ def save_array_npy(
     writer[...] = values
     writer.flush()
     return Path(output_path)
+
+
+def expand_rho_tensor_time_axis(
+    tensor: np.ndarray,
+    *,
+    nt: int,
+) -> np.ndarray:
+    values = tensor
+    if values.ndim == 4:
+        if values.shape[1] == nt:
+            return values
+        if values.shape[1] == 1:
+            return np.broadcast_to(values, (values.shape[0], nt, values.shape[2], values.shape[3]))
+    if values.ndim == 3:
+        return np.broadcast_to(values[:, np.newaxis, :, :], (values.shape[0], nt, values.shape[1], values.shape[2]))
+    raise ValueError(
+        f"rho tensor must have shape (Nk, Nt, Nb, Nb) or compact (Nk, Nb, Nb)/(Nk, 1, Nb, Nb); got {values.shape}."
+    )

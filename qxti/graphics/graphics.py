@@ -452,14 +452,14 @@ def _load_response_fallback_data(
 ) -> tuple[dict[int, object], object, object, object, object, object]:
     config = QXTIConfig.from_file(config_path)
     output_dir = Path(config.cmd.output_dir)
+    from qxti.core import QXTISimulation
 
-    rho_orders = load_rho_orders_from_npy(output_dir)
+    simulation = QXTISimulation.from_file(config_path)
+    hamiltonian = simulation.build_hamiltonian()
+    cmd = simulation.build_cmd(hamiltonian)
+
+    rho_orders = load_rho_orders_from_npy(output_dir, nt=cmd.timegrid.Nt)
     if rho_orders:
-        from qxti.core import QXTISimulation
-
-        simulation = QXTISimulation.from_file(config_path)
-        hamiltonian = simulation.build_hamiltonian()
-        cmd = simulation.build_cmd(hamiltonian)
         return (
             rho_orders,
             np.asarray(cmd.timegrid.generate(), dtype=float),

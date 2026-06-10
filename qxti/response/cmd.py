@@ -9,7 +9,12 @@ from numpy.typing import NDArray
 from qxti.grids import KGrid, TimeGrid
 from qxti.physics import BandGaugeFrame, Hamiltonian, LaserSystem, OperatorFactory
 from qxti.solvers import Solver
-from qxti.utils.io_utils import normalize_complex_storage_dtype, open_array_npy, save_array_npy
+from qxti.utils.io_utils import (
+    expand_rho_tensor_time_axis,
+    normalize_complex_storage_dtype,
+    open_array_npy,
+    save_array_npy,
+)
 from qxti.utils.progress import ProgressTimer, format_bytes, format_duration
 
 from .distributions import T1T2Relaxation, bose_einstein, fermi_dirac, full_occupation, maxwell_boltzmann, valence_occupation
@@ -220,28 +225,22 @@ class CMD:
         )
 
         if can_stream_saved_band_orders:
-            order_shape = (
-                len(k_points),
-                len(target_times),
-                self.hamiltonian.basis_size,
-                self.hamiltonian.basis_size,
-            )
             order0_path = output_path / "rho_order_0.npy"
             order0_start = time.perf_counter()
             equilibrium_writer = open_array_npy(
                 order0_path,
-                shape=order_shape,
+                shape=(len(k_points), 1, self.hamiltonian.basis_size, self.hamiltonian.basis_size),
                 dtype=self.rho_storage_dtype,
             )
             for ik in range(len(k_points)):
                 rho0_band = self._rho_equilibrium_band(ik)
-                equilibrium_writer[ik] = np.broadcast_to(
-                    rho0_band,
-                    (len(target_times), self.hamiltonian.basis_size, self.hamiltonian.basis_size),
-                )
+                equilibrium_writer[ik, 0] = rho0_band
             equilibrium_writer.flush()
             saved_paths[0] = order0_path
-            previous_order_band = np.load(saved_paths[0], mmap_mode="r")
+            previous_order_band = expand_rho_tensor_time_axis(
+                np.load(saved_paths[0], mmap_mode="r"),
+                nt=len(target_times),
+            )
             self._emit_progress(
                 f"CMD saved order 0: '{saved_paths[0].name}' "
                 f"({format_bytes(saved_paths[0].stat().st_size)}, "
@@ -282,7 +281,10 @@ class CMD:
                     f"{format_duration(time.perf_counter() - order_start)}, "
                     f"ETA {progress_timer.eta_text()})."
                 )
-                previous_order_band = np.load(saved_paths[order], mmap_mode="r")
+                previous_order_band = expand_rho_tensor_time_axis(
+                    np.load(saved_paths[order], mmap_mode="r"),
+                    nt=len(target_times),
+                )
                 del current_order_band
             else:
                 current_order_band, completed_solves = self._solve_single_order_band(
