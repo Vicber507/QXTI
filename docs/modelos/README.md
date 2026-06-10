@@ -11,5 +11,7 @@ This directory documents the external Hamiltonian model files stored in
   through `CustomHamiltonian`. See [bi2se3_surface.md](bi2se3_surface.md).
 - `graphene.py`: monolayer graphene tight-binding model on the honeycomb
   lattice.
-- `graphene_bilayer.py`: AB-stacked bilayer graphene 4-band tight-binding
-  model with `gamma0`, `gamma1`, `gamma3`, `gamma4`, `delta_prime` and `u`.
+- `graphene_bilayer.py`: 4-band bilayer graphene model with `stacking = AB`,
+  `BA` or `AA`. The Bernal branches use `gamma0`, `gamma1`, `gamma3`,
+  `gamma4`, `delta_prime` and `u`; the `AA` branch uses the minimal
+  `gamma0`-`gamma1`-`u` form.

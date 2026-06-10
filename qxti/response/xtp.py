@@ -460,7 +460,7 @@ class XTP:
 
     @staticmethod
     def _as_complex_tensor(tensor: ComplexArray) -> ComplexArray:
-        if isinstance(tensor, np.ndarray) and tensor.dtype == np.complex128:
+        if isinstance(tensor, np.ndarray) and np.issubdtype(tensor.dtype, np.complexfloating):
             return tensor
         return np.asarray(tensor, dtype=np.complex128)
 

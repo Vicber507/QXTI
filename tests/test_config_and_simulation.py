@@ -119,6 +119,7 @@ def write_config_file(tmp_path: Path, model_path: Path) -> Path:
             enabled = true
             output_dir = {tmp_path / "cmd"}
             max_order = 1
+            rho_storage_dtype = complex64
             population_time = 50.0
             coherence_time = 20.0
             temperature = 0.02
@@ -182,6 +183,7 @@ def test_qxti_config_parses_hamiltonian_and_plot_sections(tmp_path: Path) -> Non
     assert np.isclose(config.laser.alaser, 0.5)
     assert config.cmd.enabled is True
     assert config.cmd.max_order == 1
+    assert config.cmd.rho_storage_dtype == "complex64"
     assert config.cmd.solver == "rkf45"
     assert config.cmd.distribution == "fermi_dirac"
     assert np.isclose(config.cmd.population_time, 50.0)

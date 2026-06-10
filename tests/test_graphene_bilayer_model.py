@@ -34,7 +34,7 @@ def test_graphene_bilayer_model_loads_metadata_and_is_hermitian() -> None:
     matrix = hamiltonian.H(0.07, -0.11, 0.0)
     direct = module.H(0.07, -0.11, 0.0, hamiltonian.params)
 
-    assert hamiltonian.model_name == "graphene-bilayer-ab"
+    assert hamiltonian.model_name == "graphene-bilayer"
     assert hamiltonian.basis_size == 4
     assert hamiltonian.dimension == 2
     assert hamiltonian.basis_type == "layer-sublattice"
@@ -49,6 +49,7 @@ def test_graphene_bilayer_model_loads_metadata_and_is_hermitian() -> None:
         "gamma4",
         "delta_prime",
         "u",
+        "stacking",
     }
     assert matrix.shape == (4, 4)
     assert np.iscomplexobj(matrix)
@@ -101,7 +102,7 @@ def test_graphene_bilayer_reduces_to_two_decoupled_graphene_layers_when_interlay
     np.testing.assert_allclose(values, expected, atol=1.0e-10)
 
 
-def test_graphene_bilayer_has_two_low_energy_bands_touching_at_k_when_unbiased() -> None:
+def test_graphene_bilayer_ab_has_two_low_energy_bands_touching_at_k_when_unbiased() -> None:
     hamiltonian = build_bilayer_model(
         params={
             "gamma3": 0.0,
@@ -122,3 +123,80 @@ def test_graphene_bilayer_has_two_low_energy_bands_touching_at_k_when_unbiased()
         np.array([-gamma1, 0.0, 0.0, gamma1], dtype=float),
         atol=1.0e-10,
     )
+
+
+def test_graphene_bilayer_ba_reuses_same_bernal_spectrum_and_updates_metadata() -> None:
+    hamiltonian = build_bilayer_model(
+        params={
+            "stacking": "BA",
+            "gamma3": 0.0,
+            "gamma4": 0.0,
+            "delta_prime": 0.0,
+            "u": 0.0,
+        }
+    )
+
+    assert hamiltonian.lattice["stacking"] == "BA/Bernal invertido"
+    a0 = float(hamiltonian.params["a0"])
+    kx = 4.0 * np.pi / (3.0 * np.sqrt(3.0) * a0)
+    ky = 0.0
+    values = np.sort(hamiltonian.eigenvalues(kx, ky, 0.0))
+    gamma1 = float(hamiltonian.params["gamma1"])
+
+    np.testing.assert_allclose(
+        values,
+        np.array([-gamma1, 0.0, 0.0, gamma1], dtype=float),
+        atol=1.0e-10,
+    )
+
+
+def test_graphene_bilayer_aa_has_two_dirac_cones_split_by_gamma1() -> None:
+    hamiltonian = build_bilayer_model(
+        params={
+            "stacking": "AA",
+            "gamma3": 0.0,
+            "gamma4": 0.0,
+            "delta_prime": 0.0,
+            "u": 0.0,
+        }
+    )
+
+    assert hamiltonian.lattice["stacking"] == "AA"
+
+    kx, ky = 0.12, -0.09
+    values = np.sort(hamiltonian.eigenvalues(kx, ky, 0.0))
+    a0 = float(hamiltonian.params["a0"])
+    gamma0 = float(hamiltonian.params["gamma0"])
+    gamma1 = float(hamiltonian.params["gamma1"])
+    deltas = np.array(
+        [
+            [0.0, a0],
+            [-np.sqrt(3.0) * 0.5 * a0, -0.5 * a0],
+            [np.sqrt(3.0) * 0.5 * a0, -0.5 * a0],
+        ],
+        dtype=float,
+    )
+    f = np.exp(1.0j * (deltas @ np.array([kx, ky], dtype=float))).sum()
+    monolayer_energy = gamma0 * abs(f)
+    expected = np.sort(
+        np.array(
+            [
+                -gamma1 - monolayer_energy,
+                -gamma1 + monolayer_energy,
+                gamma1 - monolayer_energy,
+                gamma1 + monolayer_energy,
+            ],
+            dtype=float,
+        )
+    )
+
+    np.testing.assert_allclose(values, expected, atol=1.0e-10)
+
+
+def test_graphene_bilayer_rejects_unknown_stacking() -> None:
+    try:
+        build_bilayer_model(params={"stacking": "ABC"})
+    except ValueError as exc:
+        assert "stacking" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for invalid stacking.")

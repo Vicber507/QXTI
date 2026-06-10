@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 
 import numpy as np
 from numpy.typing import NDArray
@@ -8,6 +9,8 @@ from numpy.typing import NDArray
 from qxti.grids import KGrid, TimeGrid
 from qxti.physics import BandGaugeFrame, Hamiltonian, LaserSystem, OperatorFactory
 from qxti.solvers import Solver
+from qxti.utils.io_utils import normalize_complex_storage_dtype, open_array_npy, save_array_npy
+from qxti.utils.progress import ProgressTimer, format_bytes, format_duration
 
 from .distributions import T1T2Relaxation, bose_einstein, fermi_dirac, full_occupation, maxwell_boltzmann, valence_occupation
 
@@ -52,6 +55,7 @@ class CMD:
         include_intraband: bool,
         include_interband: bool,
         include_dephasing: bool,
+        rho_storage_dtype: str | np.dtype = "complex128",
     ) -> None:
         self.hamiltonian = hamiltonian
         self.laser_system = laser_system
@@ -71,6 +75,7 @@ class CMD:
         self.include_intraband = bool(include_intraband)
         self.include_interband = bool(include_interband)
         self.include_dephasing = bool(include_dephasing)
+        self.rho_storage_dtype = normalize_complex_storage_dtype(rho_storage_dtype)
 
         if self.max_order < 0:
             raise ValueError("max_order must be non-negative.")
@@ -206,48 +211,101 @@ class CMD:
         completed_solves = 0
         saved_paths: dict[int, Path] = {}
         can_stream_saved_band_orders = self.basis == "band"
+        progress_timer = ProgressTimer(total=total_order_solves)
 
         self._emit_progress(
             f"CMD streaming start: {self.max_order} driven orders, {len(k_points)} k-points, "
-            f"{total_order_solves} order/k-point solves total."
+            f"{total_order_solves} order/k-point solves total. "
+            f"Output dtype on disk: {self.rho_storage_dtype.name}."
         )
 
-        equilibrium_band = self._equilibrium_tensor_band(k_points, target_times)
-        saved_paths[0] = self._save_order_tensor(
-            output_path,
-            order=0,
-            tensor_band=equilibrium_band,
-        )
-        self._emit_progress(f"CMD saved order 0: '{saved_paths[0].name}'.")
         if can_stream_saved_band_orders:
+            order_shape = (
+                len(k_points),
+                len(target_times),
+                self.hamiltonian.basis_size,
+                self.hamiltonian.basis_size,
+            )
+            order0_path = output_path / "rho_order_0.npy"
+            order0_start = time.perf_counter()
+            equilibrium_writer = open_array_npy(
+                order0_path,
+                shape=order_shape,
+                dtype=self.rho_storage_dtype,
+            )
+            for ik in range(len(k_points)):
+                rho0_band = self._rho_equilibrium_band(ik)
+                equilibrium_writer[ik] = np.broadcast_to(
+                    rho0_band,
+                    (len(target_times), self.hamiltonian.basis_size, self.hamiltonian.basis_size),
+                )
+            equilibrium_writer.flush()
+            saved_paths[0] = order0_path
             previous_order_band = np.load(saved_paths[0], mmap_mode="r")
-            del equilibrium_band
+            self._emit_progress(
+                f"CMD saved order 0: '{saved_paths[0].name}' "
+                f"({format_bytes(saved_paths[0].stat().st_size)}, "
+                f"{format_duration(time.perf_counter() - order0_start)})."
+            )
         else:
+            equilibrium_band = self._equilibrium_tensor_band(k_points, target_times)
+            saved_paths[0] = self._save_order_tensor(
+                output_path,
+                order=0,
+                tensor_band=equilibrium_band,
+            )
+            self._emit_progress(f"CMD saved order 0: '{saved_paths[0].name}'.")
             previous_order_band = equilibrium_band
 
         for order in range(1, self.max_order + 1):
             self._emit_progress(
                 f"CMD order {order}/{self.max_order}: building source terms."
             )
-            current_order_band, completed_solves = self._solve_single_order_band(
-                k_points,
-                target_times,
-                field_series,
-                previous_order_band,
-                order=order,
-                completed_solves=completed_solves,
-                total_order_solves=total_order_solves,
-            )
-            saved_paths[order] = self._save_order_tensor(
-                output_path,
-                order=order,
-                tensor_band=current_order_band,
-            )
-            self._emit_progress(f"CMD saved order {order}: '{saved_paths[order].name}'.")
+            order_start = time.perf_counter()
             if can_stream_saved_band_orders:
+                order_path = output_path / f"rho_order_{order}.npy"
+                current_order_band, completed_solves = self._solve_single_order_band(
+                    k_points,
+                    target_times,
+                    field_series,
+                    previous_order_band,
+                    order=order,
+                    completed_solves=completed_solves,
+                    total_order_solves=total_order_solves,
+                    progress_timer=progress_timer,
+                    output_path=order_path,
+                )
+                saved_paths[order] = order_path
+                self._emit_progress(
+                    f"CMD saved order {order}: '{saved_paths[order].name}' "
+                    f"({format_bytes(saved_paths[order].stat().st_size)}, "
+                    f"{format_duration(time.perf_counter() - order_start)}, "
+                    f"ETA {progress_timer.eta_text()})."
+                )
                 previous_order_band = np.load(saved_paths[order], mmap_mode="r")
                 del current_order_band
             else:
+                current_order_band, completed_solves = self._solve_single_order_band(
+                    k_points,
+                    target_times,
+                    field_series,
+                    previous_order_band,
+                    order=order,
+                    completed_solves=completed_solves,
+                    total_order_solves=total_order_solves,
+                    progress_timer=progress_timer,
+                )
+                saved_paths[order] = self._save_order_tensor(
+                    output_path,
+                    order=order,
+                    tensor_band=current_order_band,
+                )
+                self._emit_progress(
+                    f"CMD saved order {order}: '{saved_paths[order].name}' "
+                    f"({format_bytes(saved_paths[order].stat().st_size)}, "
+                    f"{format_duration(time.perf_counter() - order_start)}, "
+                    f"ETA {progress_timer.eta_text()})."
+                )
                 previous_order_band = current_order_band
 
         self._time_domain_cache = None
@@ -273,7 +331,7 @@ class CMD:
             self.solve_time_domain(output_path)
             return
         for order, tensor in self.solve_time_domain_in_memory().items():
-            np.save(output_path / f"rho_order_{order}.npy", tensor)
+            save_array_npy(output_path / f"rho_order_{order}.npy", tensor, dtype=self.rho_storage_dtype)
 
     def _solve_orders_in_band_basis(
         self,
@@ -285,6 +343,7 @@ class CMD:
         total_order_solves = max(0, self.max_order * len(k_points))
         completed_solves = 0
         field_series = self._field_series(target_times)
+        progress_timer = ProgressTimer(total=total_order_solves)
 
         self._emit_progress(
             f"CMD starting: {self.max_order} driven orders, {len(k_points)} k-points, "
@@ -303,6 +362,7 @@ class CMD:
                 order=order,
                 completed_solves=completed_solves,
                 total_order_solves=total_order_solves,
+                progress_timer=progress_timer,
             )
             self._emit_progress(
                 f"CMD order {order}/{self.max_order} completed."
@@ -335,11 +395,20 @@ class CMD:
         order: int,
         completed_solves: int,
         total_order_solves: int,
+        progress_timer: ProgressTimer | None = None,
+        output_path: Path | None = None,
     ) -> tuple[ComplexArray, int]:
         nk = len(k_points)
         nt = len(target_times)
         nb = self.hamiltonian.basis_size
-        solved = np.empty((nk, nt, nb, nb), dtype=np.complex128)
+        if output_path is None:
+            solved = np.empty((nk, nt, nb, nb), dtype=np.complex128)
+        else:
+            solved = open_array_npy(
+                output_path,
+                shape=(nk, nt, nb, nb),
+                dtype=self.rho_storage_dtype,
+            )
         previous_order_mesh = previous_order_band.reshape(
             *self.kgrid.shape,
             nt,
@@ -363,18 +432,25 @@ class CMD:
                 field_series,
                 source_components,
             )
-            solved[ik] = self._solve_linear_order_band_on_grid(
+            solved_series = self._solve_linear_order_band_on_grid(
                 target_times,
                 source_series,
                 omega_matrix,
             )
+            solved[ik] = solved_series
             completed_solves += 1
+            if progress_timer is not None:
+                progress_timer.advance()
             self._emit_progress(
                 f"CMD progress: order {order}/{self.max_order}, "
                 f"k-point {ik + 1}/{nk}, "
-                f"global {completed_solves}/{total_order_solves}."
+                f"global {completed_solves}/{total_order_solves}, "
+                f"elapsed {format_duration(progress_timer.elapsed_seconds) if progress_timer is not None else 'unknown'}, "
+                f"eta {progress_timer.eta_text() if progress_timer is not None else 'unknown'}."
             )
 
+        if isinstance(solved, np.memmap):
+            solved.flush()
         return solved, completed_solves
 
     def _solve_linear_order_band_on_grid(
@@ -737,7 +813,7 @@ class CMD:
             else self._transform_tensor_from_band_basis(tensor_band, self.kgrid.points())
         )
         path = output_dir / f"rho_order_{order}.npy"
-        np.save(path, np.asarray(tensor, dtype=np.complex128))
+        save_array_npy(path, np.asarray(tensor), dtype=self.rho_storage_dtype)
         return path
 
     @staticmethod

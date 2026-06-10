@@ -60,6 +60,7 @@ def build_cmd_stack(
     include_intraband: bool = True,
     include_interband: bool = True,
     kgrid: KGrid | None = None,
+    rho_storage_dtype: str = "complex128",
 ) -> tuple[CMD, OperatorFactory]:
     hamiltonian = ToyTwoBandHamiltonian(
         model_name="toy-response",
@@ -108,6 +109,7 @@ def build_cmd_stack(
         include_intraband=include_intraband,
         include_interband=include_interband,
         include_dephasing=True,
+        rho_storage_dtype=rho_storage_dtype,
     )
     return cmd, operator_factory
 
@@ -283,6 +285,19 @@ def test_cmd_streaming_matches_in_memory_for_multi_k_grid(tmp_path: Path) -> Non
     for order, expected_tensor in expected.items():
         actual_tensor = np.load(paths[order], mmap_mode="r")
         np.testing.assert_allclose(actual_tensor, expected_tensor, atol=1.0e-10)
+
+
+def test_cmd_streaming_supports_complex64_storage(tmp_path: Path) -> None:
+    cmd_streaming, _ = build_cmd_stack(max_order=2, rho_storage_dtype="complex64")
+    cmd_in_memory, _ = build_cmd_stack(max_order=2, rho_storage_dtype="complex128")
+
+    expected = cmd_in_memory.solve_time_domain_in_memory()
+    paths = cmd_streaming.solve_time_domain(tmp_path)
+
+    for order, expected_tensor in expected.items():
+        actual_tensor = np.load(paths[order], mmap_mode="r")
+        assert actual_tensor.dtype == np.complex64
+        np.testing.assert_allclose(actual_tensor, expected_tensor, atol=5.0e-6, rtol=5.0e-6)
 
 
 def test_response_population_heatmap_data_and_plot(tmp_path: Path) -> None:
