@@ -56,14 +56,18 @@ class ResponseData:
         *,
         orders: tuple[int, ...] | list[int] | None = None,
         value_mode: str = "absolute",
+        time_indices: NDArray[np.int_] | None = None,
         rho_orders: dict[int, ComplexArray] | None = None,
     ) -> dict[str, Any]:
         time_domain = self.cmd.solve_time_domain_in_memory() if rho_orders is None else rho_orders
         resolved_orders = self._resolve_orders(orders, time_domain)
+        full_time_axis = np.asarray(self.cmd.timegrid.generate(), dtype=float)
+        resolved_time_indices = self._resolve_time_indices(len(full_time_axis), time_indices)
         populations = self._population_values_from_orders(
             time_domain,
             resolved_orders=resolved_orders,
             value_mode=value_mode,
+            time_indices=resolved_time_indices,
         )
 
         if self.cmd.kgrid.dimension < 2:
@@ -81,11 +85,17 @@ class ResponseData:
         return {
             "orders": resolved_orders,
             "value_mode": self._normalize_population_value_mode(value_mode),
-            "time_axis": np.asarray(self.cmd.timegrid.generate(), dtype=float),
+            "time_axis": full_time_axis if resolved_time_indices is None else full_time_axis[resolved_time_indices],
             "band_indices": np.arange(nb, dtype=int),
             "kx_values": np.asarray(self.cmd.kgrid.kx_values, dtype=float),
             "ky_values": np.asarray(self.cmd.kgrid.ky_values, dtype=float),
             "population_frames": frames,
+            "equilibrium_population_frame": self._equilibrium_population_frame_from_saved_rho(
+                time_domain,
+                kx_values=np.asarray(self.cmd.kgrid.kx_values, dtype=float),
+                ky_values=np.asarray(self.cmd.kgrid.ky_values, dtype=float),
+                kz_values=np.asarray(self.cmd.kgrid.kz_values, dtype=float),
+            ),
         }
 
     def coherence_heatmap_data(
@@ -126,14 +136,18 @@ class ResponseData:
         *,
         orders: tuple[int, ...] | list[int] | None = None,
         component: str = "magnitude",
+        time_indices: NDArray[np.int_] | None = None,
         rho_orders: dict[int, ComplexArray] | None = None,
     ) -> dict[str, Any]:
         time_domain = self.cmd.solve_time_domain_in_memory() if rho_orders is None else rho_orders
         resolved_orders = self._resolve_orders(orders, time_domain)
+        full_time_axis = np.asarray(self.cmd.timegrid.generate(), dtype=float)
+        resolved_time_indices = self._resolve_time_indices(len(full_time_axis), time_indices)
         coherence_values, pair_indices, pair_labels = self._coherence_series_from_orders(
             time_domain,
             resolved_orders=resolved_orders,
             component=component,
+            time_indices=resolved_time_indices,
         )
 
         if self.cmd.kgrid.dimension < 2:
@@ -150,7 +164,7 @@ class ResponseData:
 
         return {
             "orders": resolved_orders,
-            "time_axis": np.asarray(self.cmd.timegrid.generate(), dtype=float),
+            "time_axis": full_time_axis if resolved_time_indices is None else full_time_axis[resolved_time_indices],
             "pair_indices": np.asarray(pair_indices, dtype=int),
             "pair_labels": list(pair_labels),
             "kx_values": np.asarray(self.cmd.kgrid.kx_values, dtype=float),
@@ -174,6 +188,22 @@ class ResponseData:
             raise ValueError(
                 f"Requested CMD orders {missing} are not available. "
                 f"Available orders are {available}."
+            )
+        return resolved
+
+    @staticmethod
+    def _resolve_time_indices(
+        num_times: int,
+        time_indices: NDArray[np.int_] | None,
+    ) -> NDArray[np.int_] | None:
+        if time_indices is None:
+            return None
+        resolved = np.asarray(time_indices, dtype=int).reshape(-1)
+        if resolved.size == 0:
+            raise ValueError("time_indices cannot be empty when provided.")
+        if np.any(resolved < 0) or np.any(resolved >= num_times):
+            raise ValueError(
+                f"time_indices must stay within [0, {num_times - 1}] for the selected time grid."
             )
         return resolved
 
@@ -288,6 +318,12 @@ class ResponseData:
             "kx_values": np.asarray(kx_values, dtype=float),
             "ky_values": np.asarray(ky_values, dtype=float),
             "population_frames": frames,
+            "equilibrium_population_frame": cls._equilibrium_population_frame_from_saved_rho(
+                rho_orders,
+                kx_values=kx_values,
+                ky_values=ky_values,
+                kz_values=kz_values,
+            ),
         }
 
     @classmethod
@@ -325,14 +361,19 @@ class ResponseData:
         *,
         resolved_orders: tuple[int, ...],
         value_mode: str,
+        time_indices: NDArray[np.int_] | None = None,
     ) -> FloatArray:
         reference_tensor = cls._as_complex_tensor(rho_orders[resolved_orders[0]])
+        if time_indices is not None:
+            reference_tensor = np.take(reference_tensor, time_indices, axis=1)
         populations = np.zeros(
             reference_tensor.shape[:2] + (reference_tensor.shape[2],),
             dtype=np.float64,
         )
         for order in resolved_orders:
             tensor = cls._as_complex_tensor(rho_orders[order])
+            if time_indices is not None:
+                tensor = np.take(tensor, time_indices, axis=1)
             populations += np.real(np.diagonal(tensor, axis1=2, axis2=3))
 
         mode = cls._normalize_population_value_mode(value_mode)
@@ -340,9 +381,12 @@ class ResponseData:
             return populations
 
         if 0 in rho_orders:
+            reference_tensor = cls._as_complex_tensor(rho_orders[0])
+            if time_indices is not None:
+                reference_tensor = np.take(reference_tensor, time_indices, axis=1)
             reference = np.real(
                 np.diagonal(
-                    cls._as_complex_tensor(rho_orders[0]),
+                    reference_tensor,
                     axis1=2,
                     axis2=3,
                 )
@@ -366,6 +410,27 @@ class ResponseData:
         if key not in aliases:
             raise ValueError("population value_mode must be one of: delta, absolute.")
         return aliases[key]
+
+    @classmethod
+    def _equilibrium_population_frame_from_saved_rho(
+        cls,
+        rho_orders: dict[int, ComplexArray],
+        *,
+        kx_values: FloatArray,
+        ky_values: FloatArray,
+        kz_values: FloatArray,
+    ) -> FloatArray | None:
+        if 0 not in rho_orders:
+            return None
+        tensor = cls._as_complex_tensor(rho_orders[0])
+        if tensor.shape[1] == 0:
+            return None
+        diagonal = np.real(np.diagonal(tensor[:, 0], axis1=1, axis2=2))
+        nkx = len(kx_values)
+        nky = len(ky_values)
+        nkz = len(kz_values)
+        frame = diagonal.reshape(nkx, nky, nkz, diagonal.shape[1])
+        return np.transpose(frame[:, :, 0, :], (2, 1, 0))
 
     @classmethod
     def coherence_heatmap_data_from_saved_rho(
@@ -474,8 +539,11 @@ class ResponseData:
         *,
         resolved_orders: tuple[int, ...],
         component: str,
+        time_indices: NDArray[np.int_] | None = None,
     ) -> tuple[FloatArray, list[tuple[int, int]], list[str]]:
         reference_tensor = cls._as_complex_tensor(rho_orders[resolved_orders[0]])
+        if time_indices is not None:
+            reference_tensor = np.take(reference_tensor, time_indices, axis=1)
         num_bands = reference_tensor.shape[2]
         pair_indices = cls._coherence_pairs(num_bands)
         if not pair_indices:
@@ -491,6 +559,8 @@ class ResponseData:
 
         for order in resolved_orders:
             tensor = cls._as_complex_tensor(rho_orders[order])
+            if time_indices is not None:
+                tensor = np.take(tensor, time_indices, axis=1)
             coherence_accumulated += np.asarray(
                 tensor[:, :, rows, cols],
                 dtype=np.complex128,
@@ -502,13 +572,15 @@ class ResponseData:
     @staticmethod
     def _coherence_component(values: ComplexArray, *, component: str) -> FloatArray:
         key = component.strip().lower()
+        if key == "complex":
+            return np.asarray(values, dtype=np.complex128)
         if key == "magnitude":
             return np.abs(values)
         if key == "real":
             return np.real(values)
         if key == "imag":
             return np.imag(values)
-        raise ValueError("component must be one of: magnitude, real, imag.")
+        raise ValueError("component must be one of: complex, magnitude, real, imag.")
 
     @staticmethod
     def _as_complex_tensor(tensor: ComplexArray) -> ComplexArray:

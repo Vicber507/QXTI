@@ -11,6 +11,7 @@ class FakeXTP:
         self.chi_column = chi_column
         self.field_vector = field_vector
         self.p2_vector = p2_vector
+        self.hamiltonian = type("HamiltonianStub", (), {"dimension": 3})()
 
     def linear_susceptibility(self, *, input_direction: str, eps: float = 1.0e-14):
         return self.omega_axis, self.chi_column
@@ -79,7 +80,8 @@ def test_chi1_reconstructs_tensor_columns():
 def test_chi2_reconstructs_known_tensor():
     omega_axis = np.array([1.0, 2.0], dtype=float)
 
-    true_chi2 = np.arange(27, dtype=float).reshape(3, 3, 3).astype(np.complex128)
+    seed = np.arange(27, dtype=float).reshape(3, 3, 3).astype(np.complex128)
+    true_chi2 = 0.5 * (seed + np.swapaxes(seed, 1, 2))
 
     field_vectors = {
         "x": np.array([1.0, 0.0, 0.0]),

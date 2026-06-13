@@ -186,25 +186,30 @@ class XTP:
 
         polarization = self.polarization(order)
         return self._fft_time_signal(polarization)
-    
-    def electric_field_frequency_domain(self) -> tuple[RealArray, ComplexArray]: # Necesario para tensores X
+
+    def electric_field_frequency_domain(self) -> tuple[RealArray, ComplexArray]:
         """Return ``(omega_axis, E(omega))`` for the total applied electric field."""
 
         if self.laser_system is None:
             raise ValueError(
-            "laser_system is required to compute electric-field spectra and susceptibilities."
-        )
+                "laser_system is required to compute electric-field spectra and susceptibilities."
+            )
 
         times = self.timegrid.generate()
         electric_field_t = self.laser_system.electric_field(times)
         return self._fft_time_signal(electric_field_t)
-    
-    def linear_susceptibility(self,*, input_direction: str, eps: float = 1.0e-14,) -> tuple[RealArray, ComplexArray]:
+
+    def linear_susceptibility(
+        self,
+        *,
+        input_direction: str,
+        eps: float = 1.0e-14,
+    ) -> tuple[RealArray, ComplexArray]:
         """Return chi_ij^(1)(omega) for one input direction j.
 
-    Output shape:
-        (Nomega, dimension)
-    """
+        Output shape:
+            ``(Nomega, dimension)``
+        """
 
         input_direction = self._normalize_direction(input_direction)
         input_axis = self._direction_axis(input_direction)
@@ -214,14 +219,225 @@ class XTP:
 
         denominator = electric_field_w[:, input_axis]
         safe_denominator = np.where(
-        np.abs(denominator) > eps,
-        denominator,
-        np.nan + 0.0j,)
-    
+            np.abs(denominator) > eps,
+            denominator,
+            np.nan + 0.0j,
+        )
+
         active_dimension = self.hamiltonian.dimension
-        chi = polarization_w[:, :active_dimension] / safe_denominator[:, np.newaxis]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            chi = polarization_w[:, :active_dimension] / safe_denominator[:, np.newaxis]
 
         return omega_axis, np.asarray(chi, dtype=np.complex128)
+
+    def effective_susceptibility_spectrum(
+        self,
+        *,
+        order: int,
+        input_direction: str = "auto",
+        input_omega: float | None = None,
+        eps: float = 1.0e-14,
+    ) -> tuple[RealArray, ComplexArray, dict[str, Any]]:
+        r"""Return one effective ``chi^(order)(omega)`` spectrum for a repeated input axis.
+
+        For ``order > 1`` this is defined as
+
+        .. math::
+
+            \chi^{(s)}_{i j \ldots j}(\omega)
+            \equiv
+            \frac{P^{(s)}_i(\omega)}{E_j(\omega_\mathrm{in})^s},
+
+        where ``j`` is the selected input direction and ``omega_in`` defaults to
+        the lowest positive carrier frequency present in the configured laser
+        system.
+        """
+
+        if order < 1:
+            raise ValueError("order must be >= 1.")
+
+        resolved_direction = self.resolve_input_direction(
+            requested_direction=input_direction,
+            input_omega=input_omega,
+        )
+        resolved_input_omega = self.reference_input_omega() if input_omega is None else float(input_omega)
+        input_axis = self._direction_axis(resolved_direction)
+
+        omega_axis, polarization_w = self.polarization_frequency_domain(order=order)
+        _, electric_field_w = self.electric_field_frequency_domain()
+        input_index = self._nearest_frequency_index(
+            omega_axis,
+            resolved_input_omega,
+            prefer_positive=True,
+        )
+
+        denominator = electric_field_w[input_index, input_axis]
+        if np.abs(denominator) <= eps:
+            raise ValueError(
+                f"Electric-field component E_{resolved_direction}(omega={resolved_input_omega}) "
+                "is too small to normalize the susceptibility spectrum."
+            )
+
+        active_dimension = self.hamiltonian.dimension
+        chi = polarization_w[:, :active_dimension] / denominator**order
+        component_magnitudes = np.abs(electric_field_w[input_index, :active_dimension])
+
+        metadata = {
+            "input_direction": resolved_direction,
+            "input_axis": input_axis,
+            "input_omega": resolved_input_omega,
+            "input_frequency_index": input_index,
+            "normalization_mode": "fixed_input_frequency_component",
+            "single_component_drive": self._is_single_component_drive(component_magnitudes),
+            "input_component_magnitudes": np.asarray(component_magnitudes, dtype=np.float64),
+            "field_normalization": np.asarray([denominator], dtype=np.complex128),
+        }
+        return omega_axis, np.asarray(chi, dtype=np.complex128), metadata
+
+    def susceptibility_tensor_spectrum(
+        self,
+        *,
+        order: int,
+        input_direction: str = "auto",
+        input_omega: float | None = None,
+        eps: float = 1.0e-14,
+    ) -> dict[str, Any]:
+        """Return one sparse susceptibility tensor spectrum for a single XTP run.
+
+        A single simulation can only determine the tensor components aligned with
+        the driven Cartesian axis. The returned tensor therefore stores the
+        available column for ``order == 1`` and the repeated-input-axis slice
+        ``chi_{i j ... j}^{(order)}`` for higher orders, leaving all unavailable
+        components as ``NaN``.
+        """
+
+        if order < 1:
+            raise ValueError("order must be >= 1.")
+        if order not in self.rho_orders:
+            raise ValueError(f"rho_orders does not contain order {order}.")
+
+        active_dimension = self.hamiltonian.dimension
+        resolved_direction = self.resolve_input_direction(
+            requested_direction=input_direction,
+            input_omega=input_omega,
+        )
+        input_axis = self._direction_axis(resolved_direction)
+
+        if order == 1:
+            omega_axis, chi_column = self.linear_susceptibility(
+                input_direction=resolved_direction,
+                eps=eps,
+            )
+            tensor = np.full(
+                (len(omega_axis),) + (active_dimension,) * 2,
+                np.nan + 1.0j * np.nan,
+                dtype=np.complex128,
+            )
+            tensor[:, :, input_axis] = chi_column[:, :active_dimension]
+            reference_omega = self.reference_input_omega()
+            input_index = self._nearest_frequency_index(
+                omega_axis,
+                reference_omega,
+                prefer_positive=True,
+            )
+            _, electric_field_w = self.electric_field_frequency_domain()
+            component_magnitudes = np.abs(electric_field_w[input_index, :active_dimension])
+            field_normalization = np.empty(0, dtype=np.complex128)
+            normalization_mode = "pointwise_field_component"
+            resolved_input_omega = reference_omega
+        else:
+            omega_axis, chi_column, metadata = self.effective_susceptibility_spectrum(
+                order=order,
+                input_direction=resolved_direction,
+                input_omega=input_omega,
+                eps=eps,
+            )
+            tensor = np.full(
+                (len(omega_axis),) + (active_dimension,) * (order + 1),
+                np.nan + 1.0j * np.nan,
+                dtype=np.complex128,
+            )
+            repeated_input = (input_axis,) * order
+            tensor[(slice(None), slice(None)) + repeated_input] = chi_column[:, :active_dimension]
+            component_magnitudes = np.asarray(metadata["input_component_magnitudes"], dtype=np.float64)
+            field_normalization = np.asarray(metadata["field_normalization"], dtype=np.complex128)
+            normalization_mode = str(metadata["normalization_mode"])
+            resolved_input_omega = float(metadata["input_omega"])
+            input_index = int(metadata["input_frequency_index"])
+
+        available_indices = [
+            (output_axis,) + (input_axis,) * order
+            for output_axis in range(active_dimension)
+        ]
+        component_labels = [
+            self._tensor_component_label(indices)
+            for indices in available_indices
+        ]
+
+        return {
+            "omega_axis": np.asarray(omega_axis, dtype=np.float64),
+            "tensor": np.asarray(tensor, dtype=np.complex128),
+            "available_indices": np.asarray(available_indices, dtype=np.int16),
+            "component_labels": component_labels,
+            "direction_labels": self._direction_labels(active_dimension),
+            "order": int(order),
+            "input_direction": resolved_direction,
+            "input_axis": int(input_axis),
+            "input_omega": float(resolved_input_omega),
+            "input_frequency_index": int(input_index),
+            "normalization_mode": normalization_mode,
+            "single_component_drive": self._is_single_component_drive(component_magnitudes),
+            "input_component_magnitudes": np.asarray(component_magnitudes, dtype=np.float64),
+            "field_normalization": np.asarray(field_normalization, dtype=np.complex128),
+        }
+
+    def reference_input_omega(self) -> float:
+        """Return the lowest positive drive frequency used to normalize susceptibilities."""
+
+        if self.laser_system is not None and self.laser_system.lasers:
+            positive_omegas = [
+                float(laser.omega)
+                for laser in self.laser_system.lasers
+                if float(laser.omega) > 0.0
+            ]
+            if positive_omegas:
+                return float(min(positive_omegas))
+
+        omega_axis, electric_field_w = self.electric_field_frequency_domain()
+        active_dimension = self.hamiltonian.dimension
+        positive_mask = omega_axis > 0.0
+        if np.any(positive_mask):
+            positive_indices = np.flatnonzero(positive_mask)
+            magnitudes = np.linalg.norm(
+                electric_field_w[positive_indices, :active_dimension],
+                axis=1,
+            )
+            return float(omega_axis[positive_indices[int(np.argmax(magnitudes))]])
+        return float(omega_axis[int(np.argmax(np.linalg.norm(electric_field_w[:, :active_dimension], axis=1)))])
+
+    def resolve_input_direction(
+        self,
+        *,
+        requested_direction: str = "auto",
+        input_omega: float | None = None,
+    ) -> str:
+        """Resolve the active input direction used for susceptibility normalization."""
+
+        key = requested_direction.strip().lower()
+        if key != "auto":
+            return self._normalize_direction(key)
+
+        resolved_input_omega = self.reference_input_omega() if input_omega is None else float(input_omega)
+        omega_axis, electric_field_w = self.electric_field_frequency_domain()
+        input_index = self._nearest_frequency_index(
+            omega_axis,
+            resolved_input_omega,
+            prefer_positive=True,
+        )
+        active_dimension = self.hamiltonian.dimension
+        component_magnitudes = np.abs(electric_field_w[input_index, :active_dimension])
+        axis = int(np.argmax(component_magnitudes))
+        return self._direction_labels(active_dimension)[axis]
 
     def susceptibility(self, order: int) -> RealArray:
         """Backward-compatible alias for the order-resolved polarization response."""
@@ -459,10 +675,52 @@ class XTP:
             raise ValueError(f"rho_orders does not contain order {order}.") from exc
 
     @staticmethod
+    def _nearest_frequency_index(
+        omega_axis: RealArray,
+        target_omega: float,
+        *,
+        prefer_positive: bool = False,
+    ) -> int:
+        omega = np.asarray(omega_axis, dtype=np.float64)
+        if not prefer_positive:
+            return int(np.argmin(np.abs(omega - float(target_omega))))
+
+        positive_indices = np.flatnonzero(omega >= 0.0)
+        if positive_indices.size == 0:
+            return int(np.argmin(np.abs(omega - float(target_omega))))
+        local_index = int(np.argmin(np.abs(omega[positive_indices] - float(target_omega))))
+        return int(positive_indices[local_index])
+
+    @staticmethod
     def _as_complex_tensor(tensor: ComplexArray) -> ComplexArray:
         if isinstance(tensor, np.ndarray) and np.issubdtype(tensor.dtype, np.complexfloating):
             return tensor
         return np.asarray(tensor, dtype=np.complex128)
+
+    @classmethod
+    def _direction_labels(cls, dimension: int) -> tuple[str, ...]:
+        labels = tuple(cls._DIRECTION_TO_AXIS.keys())
+        return labels[:dimension]
+
+    @classmethod
+    def _tensor_component_label(cls, indices: tuple[int, ...]) -> str:
+        labels = cls._direction_labels(max(indices) + 1 if indices else 1)
+        return "".join(labels[index] for index in indices)
+
+    @staticmethod
+    def _is_single_component_drive(
+        component_magnitudes: NDArray[np.float64],
+        *,
+        relative_threshold: float = 1.0e-3,
+    ) -> bool:
+        magnitudes = np.asarray(component_magnitudes, dtype=np.float64)
+        if magnitudes.size == 0:
+            return True
+        reference = float(np.max(magnitudes))
+        if reference <= 1.0e-30:
+            return True
+        active_components = np.count_nonzero(magnitudes >= relative_threshold * reference)
+        return bool(active_components <= 1)
 
     def _fft_time_signal(
         self,

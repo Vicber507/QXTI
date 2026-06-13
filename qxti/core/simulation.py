@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event, Thread
 import time
 from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
 
-from qxti.core.config import QXTIConfig
+from qxti.core.config import CMDConfig, LaserConfig, QXTIConfig
 from qxti.data import HarmonicData, HamiltonianData, ResponseData, save_dataset_npz
 from qxti.grids import FrequencyGrid, KGrid, TimeGrid
 from qxti.physics import CustomHamiltonian, Hamiltonian, Laser, LaserSystem, OperatorFactory
@@ -33,6 +35,7 @@ class QXTISimulation:
     """Orchestrator for Hamiltonian plots and CMD density-matrix runs."""
 
     config: QXTIConfig
+    _STEP_HEARTBEAT_SECONDS = 15.0
 
     @classmethod
     def from_file(cls, config_path: str | Path) -> QXTISimulation:
@@ -128,8 +131,8 @@ class QXTISimulation:
             padding_factor=tcfg.padding_factor,
         )
 
-    def build_laser_system(self) -> LaserSystem:
-        lcfg = self.config.laser
+    def build_laser_system(self, laser_config: LaserConfig | None = None) -> LaserSystem:
+        lcfg = self.config.laser if laser_config is None else laser_config
         if lcfg.pulses:
             lasers = [self._build_laser_from_mapping(spec) for spec in lcfg.pulses]
         else:
@@ -150,9 +153,16 @@ class QXTISimulation:
             ]
         return LaserSystem(lasers, blaser=lcfg.blaser, alaser=lcfg.alaser)
 
-    def build_cmd(self, hamiltonian: Hamiltonian) -> CMD:
-        ccfg = self.config.cmd
-        laser_system = self.build_laser_system()
+    def build_cmd(
+        self,
+        hamiltonian: Hamiltonian,
+        *,
+        cmd_config: CMDConfig | None = None,
+        laser_system: LaserSystem | None = None,
+        max_order: int | None = None,
+    ) -> CMD:
+        ccfg = self.config.cmd if cmd_config is None else cmd_config
+        laser_system = self.build_laser_system() if laser_system is None else laser_system
         timegrid = self.build_timegrid(laser_system)
         operator_factory = OperatorFactory(hamiltonian=hamiltonian, basis=ccfg.basis)
         return CMD(
@@ -162,7 +172,7 @@ class QXTISimulation:
             timegrid=timegrid,
             operator_factory=operator_factory,
             solver=self._build_solver(timegrid),
-            max_order=ccfg.max_order,
+            max_order=ccfg.max_order if max_order is None else int(max_order),
             population_time=ccfg.population_time,
             coherence_time=ccfg.coherence_time,
             temperature=ccfg.temperature,
@@ -174,6 +184,36 @@ class QXTISimulation:
             include_interband=ccfg.include_interband,
             include_dephasing=ccfg.include_dephasing,
             rho_storage_dtype=ccfg.rho_storage_dtype,
+        )
+
+    def build_xtp(
+        self,
+        cmd: CMD,
+        rho_orders: dict[int, ComplexArray],
+    ) -> XTP:
+        omega_axis = np.asarray(cmd.timegrid.frequency_axis(), dtype=float)
+        omega_max = float(np.max(np.abs(omega_axis))) if omega_axis.size else 1.0
+        frequencygrid = FrequencyGrid(
+            0.0,
+            omega_max if omega_max > 0.0 else 1.0,
+            len(omega_axis) if omega_axis.size else 1,
+        )
+
+        return XTP(
+            hamiltonian=cmd.hamiltonian,
+            rho_orders=rho_orders,
+            kgrid=cmd.kgrid,
+            timegrid=cmd.timegrid,
+            frequencygrid=frequencygrid,
+            operator_factory=cmd.operator_factory,
+            directions=self._active_directions(cmd.hamiltonian.dimension),
+            orders=sorted(rho_orders),
+            band_gauge_frame=cmd.band_gauge_frame if cmd.basis == "band" else None,
+            laser_system=cmd.laser_system,
+            bz_mask_enabled=self.config.xtp.bz_mask_enabled,
+            bz_mask_radius_percent=self.config.xtp.bz_mask_radius_percent,
+            bz_mask_sigma=self.config.xtp.bz_mask_sigma,
+            bz_mask_sigma_percent_legacy=self.config.xtp.bz_mask_sigma_percent_legacy,
         )
 
     def run(self) -> dict[str, Path]:
@@ -303,26 +343,44 @@ class QXTISimulation:
         )
 
         outputs: dict[str, Path] = {}
-        rho_order_paths = cmd.solve_time_domain(output_dir)
-        for order, npy_path in rho_order_paths.items():
-            outputs[f"rho_order_{order}"] = npy_path
+        scratch_dir = output_dir if cmd_cfg.keep_rho_orders else (output_dir / ".scratch_rho")
+        if not cmd_cfg.keep_rho_orders:
+            scratch_dir.mkdir(parents=True, exist_ok=True)
+            self._emit_progress(
+                "CMD rho retention disabled: large rho_order_*.npy files will be used as temporary scratch and deleted after datasets are saved."
+            )
 
-        if cmd_cfg.save_frequency_domain:
-            frequency_dir = output_dir / "frequency"
-            frequency_dir.mkdir(parents=True, exist_ok=True)
-            for order, npy_path in self._save_frequency_domain_from_saved_orders(
-                cmd,
-                rho_order_paths,
-                frequency_dir,
-            ).items():
-                outputs[f"rho_frequency_order_{order}"] = npy_path
+        rho_order_paths = cmd.solve_time_domain(scratch_dir)
+        if cmd_cfg.keep_rho_orders:
+            for order, npy_path in rho_order_paths.items():
+                outputs[f"rho_order_{order}"] = npy_path
+
+        try:
+            if cmd_cfg.save_frequency_domain:
+                frequency_dir = output_dir / "frequency"
+                frequency_dir.mkdir(parents=True, exist_ok=True)
+                for order, npy_path in self._save_frequency_domain_from_saved_orders(
+                    cmd,
+                    rho_order_paths,
+                    frequency_dir,
+                ).items():
+                    outputs[f"rho_frequency_order_{order}"] = npy_path
+                    self._emit_progress(
+                        f"CMD saved frequency order {order}: '{npy_path.name}'."
+                    )
+
+            if self._needs_saved_rho_postprocessing():
+                rho_orders = self._load_saved_rho_order_paths(rho_order_paths, nt=cmd.timegrid.Nt)
+                outputs.update(self.generate_cmd_datasets(cmd, rho_orders))
+                outputs.update(self.generate_xtp_datasets(cmd, rho_orders))
+            else:
                 self._emit_progress(
-                    f"CMD saved frequency order {order}: '{npy_path.name}'."
+                    "CMD saved-rho postprocessing disabled by config: skipping response/XTP dataset generation."
                 )
-
-        rho_orders = self._load_saved_rho_order_paths(rho_order_paths, nt=cmd.timegrid.Nt)
-        outputs.update(self.generate_cmd_datasets(cmd, rho_orders))
-        outputs.update(self.generate_xtp_datasets(cmd, rho_orders))
+        finally:
+            if not cmd_cfg.keep_rho_orders:
+                self._cleanup_rho_order_paths(rho_order_paths)
+                self._cleanup_directory_if_empty(scratch_dir)
         return outputs
 
     def generate_cmd_datasets(
@@ -330,137 +388,194 @@ class QXTISimulation:
         cmd: CMD,
         rho_orders: dict[int, ComplexArray],
     ) -> dict[str, Path]:
+        cmd_cfg = self.config.cmd
+        population_enabled = bool(cmd_cfg.save_population_dataset)
+        coherence_enabled = bool(cmd_cfg.save_coherence_dataset)
+        if not population_enabled and not coherence_enabled:
+            self._emit_progress(
+                "CMD response datasets disabled by config: skipping population/coherence kx-ky datasets."
+            )
+            return {}
+
         self._emit_progress("CMD data products enabled: generating reusable kx-ky datasets.")
         data_builder = ResponseData(cmd)
         output_dir = Path(self.config.cmd.output_dir) / "data"
         output_dir.mkdir(parents=True, exist_ok=True)
-        step_timer = ProgressTimer(total=4, min_completed_for_eta=2)
+        step_timer = ProgressTimer(
+            total=2 * int(population_enabled) + 2 * int(coherence_enabled),
+            min_completed_for_eta=2,
+        )
 
         all_orders = tuple(sorted(rho_orders))
+        dataset_time_indices = self._cmd_dataset_time_indices(cmd.timegrid.Nt)
+        frame_note = self._cmd_dataset_frame_note(cmd.timegrid.Nt, dataset_time_indices)
 
         outputs: dict[str, Path] = {}
 
-        self._emit_step_started("CMD dataset", step_timer, "building population kx-ky dataset")
-        step_start = time.perf_counter()
-        try:
-            kmap_data = data_builder.population_kxky_animation_data(
-                orders=all_orders,
-                rho_orders=rho_orders,
-            )
-        except ValueError as exc:
-            self._emit_progress(f"CMD kx-ky population data skipped: {exc}")
-            kmap_data = None
-            self._emit_step_completed(
-                "CMD dataset",
-                step_timer,
-                "population kx-ky dataset skipped",
-                step_seconds=time.perf_counter() - step_start,
-            )
-            step_timer.advance()
-        else:
-            self._emit_step_completed(
-                "CMD dataset",
-                step_timer,
-                "population kx-ky dataset built",
-                step_seconds=time.perf_counter() - step_start,
-            )
-            self._emit_step_started("CMD dataset", step_timer, "saving population kx-ky dataset")
+        if population_enabled:
             step_start = time.perf_counter()
-            animation_data_path = save_dataset_npz(
-                output_dir / "population_kx_ky_per_band.npz",
-                kmap_data,
-            )
-            outputs["rho_population_kxky_data"] = animation_data_path
-            self._emit_step_completed(
+            with self._step_progress_monitor(
                 "CMD dataset",
                 step_timer,
-                f"population kx-ky dataset saved as '{animation_data_path.name}' "
-                f"({format_bytes(animation_data_path.stat().st_size)})",
-                step_seconds=time.perf_counter() - step_start,
-            )
-            del kmap_data
-        self._emit_step_started("CMD dataset", step_timer, "building coherence kx-ky dataset")
-        step_start = time.perf_counter()
-        try:
-            coherence_kmap_data = data_builder.coherence_kxky_animation_data(
-                orders=all_orders,
-                component="magnitude",
-                rho_orders=rho_orders,
-            )
-        except ValueError as exc:
-            self._emit_progress(f"CMD kx-ky coherence data skipped: {exc}")
-            coherence_kmap_data = None
-            self._emit_step_completed(
-                "CMD dataset",
-                step_timer,
-                "coherence kx-ky dataset skipped",
-                step_seconds=time.perf_counter() - step_start,
-            )
-            step_timer.advance()
+                f"building population kx-ky dataset{frame_note}",
+            ):
+                try:
+                    kmap_data = data_builder.population_kxky_animation_data(
+                        orders=all_orders,
+                        time_indices=dataset_time_indices,
+                        rho_orders=rho_orders,
+                    )
+                except ValueError as exc:
+                    self._emit_progress(f"CMD kx-ky population data skipped: {exc}")
+                    kmap_data = None
+                    self._emit_step_completed(
+                        "CMD dataset",
+                        step_timer,
+                        "population kx-ky dataset skipped",
+                        step_seconds=time.perf_counter() - step_start,
+                    )
+                else:
+                    kmap_data["population_frames"] = np.asarray(kmap_data["population_frames"], dtype=np.float32)
+                    if kmap_data.get("equilibrium_population_frame") is not None:
+                        kmap_data["equilibrium_population_frame"] = np.asarray(
+                            kmap_data["equilibrium_population_frame"],
+                            dtype=np.float32,
+                        )
+                    self._emit_step_completed(
+                        "CMD dataset",
+                        step_timer,
+                        "population kx-ky dataset built",
+                        step_seconds=time.perf_counter() - step_start,
+                    )
+            if kmap_data is not None:
+                step_start = time.perf_counter()
+                with self._step_progress_monitor(
+                    "CMD dataset",
+                    step_timer,
+                    "saving population kx-ky dataset",
+                ):
+                    animation_data_path = save_dataset_npz(
+                        output_dir / "population_kx_ky_per_band.npz",
+                        kmap_data,
+                    )
+                outputs["rho_population_kxky_data"] = animation_data_path
+                self._emit_step_completed(
+                    "CMD dataset",
+                    step_timer,
+                    f"population kx-ky dataset saved as '{animation_data_path.name}' "
+                    f"({format_bytes(animation_data_path.stat().st_size)})",
+                    step_seconds=time.perf_counter() - step_start,
+                )
+                del kmap_data
         else:
-            self._emit_step_completed(
-                "CMD dataset",
-                step_timer,
-                "coherence kx-ky dataset built",
-                step_seconds=time.perf_counter() - step_start,
-            )
-            self._emit_step_started("CMD dataset", step_timer, "saving coherence kx-ky dataset")
+            self._emit_progress("CMD population dataset disabled by config: skipping population kx-ky dataset.")
+
+        if coherence_enabled:
             step_start = time.perf_counter()
-            coherence_animation_data_path = save_dataset_npz(
-                output_dir / "coherence_kx_ky_per_pair.npz",
-                coherence_kmap_data,
-            )
-            outputs["rho_coherence_kxky_data"] = coherence_animation_data_path
-            self._emit_step_completed(
+            with self._step_progress_monitor(
                 "CMD dataset",
                 step_timer,
-                f"coherence kx-ky dataset saved as '{coherence_animation_data_path.name}' "
-                f"({format_bytes(coherence_animation_data_path.stat().st_size)})",
-                step_seconds=time.perf_counter() - step_start,
-            )
-            del coherence_kmap_data
+                f"building coherence kx-ky dataset{frame_note}",
+            ):
+                try:
+                    coherence_kmap_data = data_builder.coherence_kxky_animation_data(
+                        orders=all_orders,
+                        component="complex",
+                        time_indices=dataset_time_indices,
+                        rho_orders=rho_orders,
+                    )
+                except ValueError as exc:
+                    self._emit_progress(f"CMD kx-ky coherence data skipped: {exc}")
+                    coherence_kmap_data = None
+                    self._emit_step_completed(
+                        "CMD dataset",
+                        step_timer,
+                        "coherence kx-ky dataset skipped",
+                        step_seconds=time.perf_counter() - step_start,
+                    )
+                else:
+                    if "coherence_frames" in coherence_kmap_data:
+                        coherence_kmap_data["coherence_frames_complex"] = np.asarray(
+                            coherence_kmap_data.pop("coherence_frames"),
+                            dtype=np.complex64,
+                        )
+                    self._emit_step_completed(
+                        "CMD dataset",
+                        step_timer,
+                        "coherence kx-ky dataset built",
+                        step_seconds=time.perf_counter() - step_start,
+                    )
+            if coherence_kmap_data is not None:
+                step_start = time.perf_counter()
+                with self._step_progress_monitor(
+                    "CMD dataset",
+                    step_timer,
+                    "saving coherence kx-ky dataset",
+                ):
+                    coherence_animation_data_path = save_dataset_npz(
+                        output_dir / "coherence_kx_ky_per_pair.npz",
+                        coherence_kmap_data,
+                    )
+                outputs["rho_coherence_kxky_data"] = coherence_animation_data_path
+                self._emit_step_completed(
+                    "CMD dataset",
+                    step_timer,
+                    f"coherence kx-ky dataset saved as '{coherence_animation_data_path.name}' "
+                    f"({format_bytes(coherence_animation_data_path.stat().st_size)})",
+                    step_seconds=time.perf_counter() - step_start,
+                )
+                del coherence_kmap_data
+        else:
+            self._emit_progress("CMD coherence dataset disabled by config: skipping coherence kx-ky dataset.")
         return outputs
+
+    def _cmd_dataset_time_indices(self, nt: int) -> NDArray[np.int_] | None:
+        stride = max(1, int(self.config.cmd.dataset_time_stride))
+        if stride <= 1 or nt <= 1:
+            return None
+        indices = np.arange(0, nt, stride, dtype=int)
+        if indices[-1] != nt - 1:
+            indices = np.concatenate([indices, np.array([nt - 1], dtype=int)])
+        return indices
+
+    @staticmethod
+    def _cmd_dataset_frame_note(
+        nt: int,
+        dataset_time_indices: NDArray[np.int_] | None,
+    ) -> str:
+        if dataset_time_indices is None:
+            return ""
+        return f" using {len(dataset_time_indices)}/{nt} time frames"
 
     def generate_xtp_datasets(
         self,
         cmd: CMD,
         rho_orders: dict[int, ComplexArray],
     ) -> dict[str, Path]:
-        self._emit_progress("XTP data products enabled: generating reusable current-spectrum dataset.")
-        step_timer = ProgressTimer(total=2)
-        omega_axis = np.asarray(cmd.timegrid.frequency_axis(), dtype=float)
-        omega_max = float(np.max(np.abs(omega_axis))) if omega_axis.size else 1.0
-        frequencygrid = FrequencyGrid(
-            0.0,
-            omega_max if omega_max > 0.0 else 1.0,
-            len(omega_axis) if omega_axis.size else 1,
-        )
+        current_spectrum_enabled = bool(self.config.cmd.save_xtp_dataset)
+        if not current_spectrum_enabled:
+            self._emit_progress(
+                "XTP datasets disabled by config: skipping current-spectrum dataset."
+            )
+            return {}
 
-        xtp = XTP(
-            hamiltonian=cmd.hamiltonian,
-            rho_orders=rho_orders,
-            kgrid=cmd.kgrid,
-            timegrid=cmd.timegrid,
-            frequencygrid=frequencygrid,
-            operator_factory=cmd.operator_factory,
-            directions=self._active_directions(cmd.hamiltonian.dimension),
-            orders=sorted(rho_orders),
-            band_gauge_frame=cmd.band_gauge_frame if cmd.basis == "band" else None,
-            bz_mask_enabled=self.config.xtp.bz_mask_enabled,
-            bz_mask_radius_percent=self.config.xtp.bz_mask_radius_percent,
-            bz_mask_sigma=self.config.xtp.bz_mask_sigma,
-            bz_mask_sigma_percent_legacy=self.config.xtp.bz_mask_sigma_percent_legacy,
+        self._emit_progress(
+            "XTP data products enabled: generating reusable current-spectrum dataset."
         )
+        step_timer = ProgressTimer(total=2)
+        xtp = self.build_xtp(cmd, rho_orders)
         electric_field_time = np.asarray(
             cmd.laser_system.electric_field(cmd.timegrid.generate()),
             dtype=float,
         )
-        self._emit_step_started("XTP dataset", step_timer, "building current-spectrum dataset")
         step_start = time.perf_counter()
-        data_builder = HarmonicData(xtp, electric_field_time=electric_field_time)
         output_dir = Path(self.config.cmd.output_dir) / "data"
         output_dir.mkdir(parents=True, exist_ok=True)
-        current_spectrum_data = data_builder.current_spectrum_data()
+        outputs: dict[str, Path] = {}
+
+        with self._step_progress_monitor("XTP dataset", step_timer, "building current-spectrum dataset"):
+            data_builder = HarmonicData(xtp, electric_field_time=electric_field_time)
+            current_spectrum_data = data_builder.current_spectrum_data()
         self._emit_step_completed(
             "XTP dataset",
             step_timer,
@@ -468,12 +583,12 @@ class QXTISimulation:
             step_seconds=time.perf_counter() - step_start,
         )
 
-        self._emit_step_started("XTP dataset", step_timer, "saving current-spectrum dataset")
         step_start = time.perf_counter()
-        current_spectrum_path = save_dataset_npz(
-            output_dir / "current_spectrum.npz",
-            current_spectrum_data,
-        )
+        with self._step_progress_monitor("XTP dataset", step_timer, "saving current-spectrum dataset"):
+            current_spectrum_path = save_dataset_npz(
+                output_dir / "current_spectrum.npz",
+                current_spectrum_data,
+            )
         self._emit_step_completed(
             "XTP dataset",
             step_timer,
@@ -481,7 +596,17 @@ class QXTISimulation:
             f"({format_bytes(current_spectrum_path.stat().st_size)})",
             step_seconds=time.perf_counter() - step_start,
         )
-        return {"xtp_current_spectrum_data": current_spectrum_path}
+        outputs["xtp_current_spectrum_data"] = current_spectrum_path
+
+        return outputs
+
+    def _needs_saved_rho_postprocessing(self) -> bool:
+        cmd_cfg = self.config.cmd
+        return bool(
+            cmd_cfg.save_population_dataset
+            or cmd_cfg.save_coherence_dataset
+            or cmd_cfg.save_xtp_dataset
+        )
 
     def _build_solver(self, timegrid: TimeGrid) -> Solver:
         cmd_cfg = self.config.cmd
@@ -579,6 +704,21 @@ class QXTISimulation:
         return rho_orders
 
     @staticmethod
+    def _cleanup_rho_order_paths(rho_order_paths: dict[int, Path]) -> None:
+        for path in rho_order_paths.values():
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                continue
+
+    @staticmethod
+    def _cleanup_directory_if_empty(directory: Path) -> None:
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+
+    @staticmethod
     def _build_laser_from_mapping(spec: dict[str, Any]) -> Laser:
         payload = dict(spec)
         if "w0" in payload and "omega" not in payload:
@@ -629,10 +769,16 @@ class QXTISimulation:
         timer: ProgressTimer,
         message: str,
     ) -> None:
-        self._emit_progress(
-            f"{label} step {timer.completed + 1}/{timer.total}: {message} "
-            f"(elapsed {format_duration(timer.elapsed_seconds)}, ETA {timer.eta_text()})."
-        )
+        self._emit_progress(f"{label} step {timer.completed + 1}/{timer.total}: {message}.")
+
+    def _emit_step_running(
+        self,
+        label: str,
+        timer: ProgressTimer,
+        message: str,
+    ) -> None:
+        suffix = self._step_runtime_suffix(timer)
+        self._emit_progress(f"{label} step {timer.completed + 1}/{timer.total}: {message} ({suffix}).")
 
     def _emit_step_completed(
         self,
@@ -643,11 +789,58 @@ class QXTISimulation:
         step_seconds: float,
     ) -> None:
         timer.advance()
+        suffix = self._step_runtime_suffix(timer)
         self._emit_progress(
             f"{label} step {timer.completed}/{timer.total}: {message} "
             f"in {format_duration(step_seconds)} "
-            f"(elapsed {format_duration(timer.elapsed_seconds)}, ETA {timer.eta_text()})."
+            f"({suffix})."
         )
+
+    @staticmethod
+    def _step_runtime_suffix(timer: ProgressTimer) -> str:
+        elapsed = format_duration(timer.elapsed_seconds)
+        eta = timer.eta_text()
+        if eta == "unknown":
+            return f"elapsed {elapsed}"
+        return f"elapsed {elapsed}, ETA {eta}"
+
+    @contextmanager
+    def _step_progress_monitor(
+        self,
+        label: str,
+        timer: ProgressTimer,
+        message: str,
+        *,
+        interval_seconds: float | None = None,
+    ):
+        self._emit_step_started(label, timer, message)
+        stop_event = Event()
+        heartbeat_thread: Thread | None = None
+        heartbeat_interval = self._STEP_HEARTBEAT_SECONDS if interval_seconds is None else float(interval_seconds)
+        if heartbeat_interval > 0.0:
+            heartbeat_thread = Thread(
+                target=self._step_progress_heartbeat,
+                args=(label, timer, message, stop_event, heartbeat_interval),
+                daemon=True,
+            )
+            heartbeat_thread.start()
+        try:
+            yield
+        finally:
+            stop_event.set()
+            if heartbeat_thread is not None:
+                heartbeat_thread.join(timeout=0.2)
+
+    def _step_progress_heartbeat(
+        self,
+        label: str,
+        timer: ProgressTimer,
+        message: str,
+        stop_event: Event,
+        interval_seconds: float,
+    ) -> None:
+        while not stop_event.wait(interval_seconds):
+            self._emit_step_running(label, timer, message)
 
     @staticmethod
     def _emit_progress(message: str) -> None:

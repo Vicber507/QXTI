@@ -25,6 +25,10 @@ from qxti.data import (
 from qxti.graphics.plot_harmonics import HarmonicGraphics, resolve_harmonic_plot_config
 from qxti.graphics.plot_hamiltonian import HamiltonianGraphics
 from qxti.graphics.plot_response import ResponseGraphics, resolve_response_plot_config
+from qxti.graphics.plot_susceptibility_tensor import (
+    SusceptibilityTensorPlotter,
+    resolve_susceptibility_plot_config,
+)
 
 
 DEFAULT_HAMILTONIAN_PLOTS = (
@@ -97,51 +101,86 @@ def plot_response_graphics_from_saved_data(
 ) -> dict[str, Path]:
     config = QXTIConfig.from_file(config_path)
     output_dir = Path(config.cmd.output_dir)
+    data_dir = output_dir / "data"
     resolved_plot_config = resolve_response_plot_config(plot_config)
     outputs: dict[str, Path] = {}
-
-    rho_orders, time_axis, k_points, kx_values, ky_values, kz_values = _load_response_fallback_data(
-        config_path
-    )
-    if not rho_orders:
-        raise FileNotFoundError(
-            "Missing response datasets and no saved rho_order_*.npy files were found. "
-            "Legacy rho_order_*.dat files are still supported if they already exist. "
-            "Run `python main.py inputParams.cfg` first."
-        )
-    print("[graphics] plotting response graphics from saved rho_order tensors.")
 
     requested_orders = _resolve_requested_orders(resolved_plot_config.get("orders"))
     population_cfg = resolved_plot_config["population"]
     coherence_cfg = resolved_plot_config["coherence"]
+    population_enabled = bool(config.cmd.save_population_dataset)
+    coherence_enabled = bool(config.cmd.save_coherence_dataset)
 
-    try:
-        population_kmap_data = ResponseData.population_kxky_animation_data_from_saved_rho(
-            rho_orders,
-            time_axis=time_axis,
-            kx_values=kx_values,
-            ky_values=ky_values,
-            kz_values=kz_values,
-            orders=requested_orders,
+    if not population_enabled and not coherence_enabled:
+        print("[graphics] response population/coherence datasets are disabled by config; skipping response graphics.")
+        return {}
+
+    population_dataset_path = data_dir / "population_kx_ky_per_band.npz"
+    coherence_dataset_path = data_dir / "coherence_kx_ky_per_pair.npz"
+    population_kmap_data: dict[str, object] | None = None
+    coherence_kmap_data: dict[str, object] | None = None
+    need_population_from_rho = population_enabled and not population_dataset_path.exists()
+    need_coherence_from_rho = coherence_enabled and not coherence_dataset_path.exists()
+
+    if population_enabled and population_dataset_path.exists():
+        print("[graphics] plotting population response graphics from compact saved dataset.")
+        population_kmap_data = _load_population_response_dataset(
+            population_dataset_path,
             value_mode=str(population_cfg.get("value_mode", "delta")),
         )
-    except ValueError as exc:
-        population_kmap_data = None
-        print(f"[graphics] skipped population kx-ky data: {exc}")
+    elif not population_enabled:
+        print("[graphics] population response dataset disabled by config; skipping population graphics.")
 
-    try:
-        coherence_kmap_data = ResponseData.coherence_kxky_animation_data_from_saved_rho(
-            rho_orders,
-            time_axis=time_axis,
-            kx_values=kx_values,
-            ky_values=ky_values,
-            kz_values=kz_values,
-            orders=requested_orders,
+    if coherence_enabled and coherence_dataset_path.exists():
+        print("[graphics] plotting coherence response graphics from compact saved dataset.")
+        coherence_kmap_data = _load_coherence_response_dataset(
+            coherence_dataset_path,
             component=str(coherence_cfg["component"]),
         )
-    except ValueError as exc:
-        coherence_kmap_data = None
-        print(f"[graphics] skipped coherence kx-ky data: {exc}")
+    elif not coherence_enabled:
+        print("[graphics] coherence response dataset disabled by config; skipping coherence graphics.")
+
+    if need_population_from_rho or need_coherence_from_rho:
+        rho_orders, time_axis, k_points, kx_values, ky_values, kz_values = _load_response_fallback_data(
+            config_path
+        )
+        if not rho_orders:
+            raise FileNotFoundError(
+                "Missing response datasets and no saved rho_order_*.npy files were found. "
+                "Legacy rho_order_*.dat files are still supported if they already exist. "
+                "Run `python main.py inputParams.cfg` first."
+            )
+        print("[graphics] plotting response graphics from saved rho_order tensors.")
+
+        if need_population_from_rho:
+            try:
+                population_kmap_data = ResponseData.population_kxky_animation_data_from_saved_rho(
+                    rho_orders,
+                    time_axis=time_axis,
+                    kx_values=kx_values,
+                    ky_values=ky_values,
+                    kz_values=kz_values,
+                    orders=requested_orders,
+                    value_mode=str(population_cfg.get("value_mode", "delta")),
+                )
+            except ValueError as exc:
+                population_kmap_data = None
+                print(f"[graphics] skipped population kx-ky data: {exc}")
+
+        if need_coherence_from_rho:
+            try:
+                coherence_kmap_data = ResponseData.coherence_kxky_animation_data_from_saved_rho(
+                    rho_orders,
+                    time_axis=time_axis,
+                    kx_values=kx_values,
+                    ky_values=ky_values,
+                    kz_values=kz_values,
+                    orders=requested_orders,
+                    component=str(coherence_cfg["component"]),
+                )
+            except ValueError as exc:
+                coherence_kmap_data = None
+                print(f"[graphics] skipped coherence kx-ky data: {exc}")
 
     if population_kmap_data is not None and bool(population_cfg["snapshots"]["enabled"]):
         population_snapshot_indices = ResponseGraphics.resolve_snapshot_indices(
@@ -210,6 +249,50 @@ def plot_response_graphics_from_saved_data(
     return outputs
 
 
+def _load_population_response_dataset(
+    dataset_path: Path,
+    *,
+    value_mode: str,
+) -> dict[str, object]:
+    data = load_dataset_npz(dataset_path)
+    dataset = dict(data)
+    dataset["value_mode"] = value_mode
+    frames = np.asarray(dataset["population_frames"], dtype=float)
+    if value_mode.strip().lower() == "delta" and dataset.get("equilibrium_population_frame") is not None:
+        equilibrium = np.asarray(dataset["equilibrium_population_frame"], dtype=float)
+        dataset["population_frames"] = frames - equilibrium[np.newaxis, :, :, :]
+    else:
+        dataset["population_frames"] = frames
+    return dataset
+
+
+def _load_coherence_response_dataset(
+    dataset_path: Path,
+    *,
+    component: str,
+) -> dict[str, object]:
+    data = load_dataset_npz(dataset_path)
+    dataset = dict(data)
+    dataset["component"] = component
+    frames = dataset.get("coherence_frames_complex", dataset.get("coherence_frames"))
+    if frames is None:
+        raise KeyError("Missing coherence frames in saved dataset.")
+    values = np.asarray(frames)
+    key = component.strip().lower()
+    if np.iscomplexobj(values):
+        if key == "magnitude":
+            dataset["coherence_frames"] = np.abs(values)
+        elif key == "real":
+            dataset["coherence_frames"] = np.real(values)
+        elif key == "imag":
+            dataset["coherence_frames"] = np.imag(values)
+        else:
+            raise ValueError("coherence component must be one of: magnitude, real, imag.")
+    else:
+        dataset["coherence_frames"] = np.asarray(values, dtype=float)
+    return dataset
+
+
 def plot_harmonic_graphics_from_saved_data(
     config_path: str | Path,
     *,
@@ -220,6 +303,12 @@ def plot_harmonic_graphics_from_saved_data(
     data_dir = output_dir / "data"
     resolved_plot_config = resolve_harmonic_plot_config(plot_config)
     outputs: dict[str, Path] = {}
+
+    if not bool(config.cmd.save_xtp_dataset):
+        dataset_path = data_dir / "current_spectrum.npz"
+        if not dataset_path.exists():
+            print("[graphics] XTP dataset disabled by config and no saved current_spectrum.npz was found; skipping harmonic graphics.")
+            return outputs
 
     dataset_name = None
     for section_name in (
@@ -358,12 +447,182 @@ def plot_harmonic_graphics_from_saved_data(
     return outputs
 
 
+def plot_susceptibility_graphics_from_saved_data(
+    config_path: str | Path,
+    *,
+    plot_config: dict[str, object] | None = None,
+) -> dict[str, Path]:
+    config = QXTIConfig.from_file(config_path)
+    output_dir = _susceptibility_plot_output_dir(config)
+    data_dir = Path(config.xtp.susceptibility_output_dir) / "data"
+    resolved_plot_config = _resolve_susceptibility_plot_config_from_xtp(config, plot_config)
+    dataset_path = _resolve_susceptibility_dataset_path(
+        data_dir=data_dir,
+        dataset_file=str(resolved_plot_config["dataset_file"]),
+    )
+    outputs: dict[str, Path] = {}
+
+    if not bool(config.xtp.susceptibility_plot_enabled):
+        print("[graphics] susceptibility plots disabled in [xtp]; skipping susceptibility graphics.")
+        return outputs
+    if not dataset_path.exists():
+        raise FileNotFoundError(
+            f"Missing susceptibility dataset '{dataset_path}'. "
+            f"Run `python main.py {Path(config_path).name}` first."
+        )
+
+    data = load_dataset_npz(dataset_path)
+    print(f"[graphics] plotting susceptibility dataset '{dataset_path.name}'.")
+
+    saved_orders = tuple(int(order) for order in data.get("orders", ()))
+    requested_orders = _resolve_requested_orders(resolved_plot_config.get("orders"))
+    if requested_orders is None:
+        selected_orders = saved_orders
+    else:
+        selected_orders = tuple(order for order in saved_orders if order in requested_orders)
+    if not selected_orders:
+        print("[graphics] no susceptibility orders matched the requested configuration; skipping susceptibility graphics.")
+        return outputs
+
+    omega_axis_full = np.asarray(
+        data.get("laser_omega_axis", data.get("omega_axis", np.empty(0, dtype=float))),
+        dtype=float,
+    )
+    mask = _select_frequency_mask(
+        omega_axis_full,
+        positive_only=bool(resolved_plot_config["positive_only"]),
+        omega_min=None if resolved_plot_config["omega_min"] is None else float(resolved_plot_config["omega_min"]),
+        omega_max=None if resolved_plot_config["omega_max"] is None else float(resolved_plot_config["omega_max"]),
+    )
+    direction_labels = tuple(str(label) for label in data.get("direction_labels", ("x", "y", "z")))
+    dpi = int(resolved_plot_config["dpi"])
+    include_ev_axis = bool(resolved_plot_config.get("include_ev_axis", True))
+
+    for order in selected_orders:
+        tensor_key = f"chi_order_{order}_tensor"
+        indices_key = f"chi_order_{order}_available_indices"
+        if tensor_key not in data:
+            print(f"[graphics] missing susceptibility tensor for order {order}; skipping.")
+            continue
+
+        tensor = np.asarray(data[tensor_key], dtype=np.complex128)
+        omega_axis = omega_axis_full[mask]
+        tensor = tensor[mask]
+        available_indices_array = np.asarray(data.get(indices_key, np.empty((0, order + 1), dtype=int)), dtype=int)
+        available_components = [
+            tuple(int(index) for index in row)
+            for row in np.atleast_2d(available_indices_array)
+            if available_indices_array.size > 0
+        ]
+        order_dir = output_dir / f"order_{order}"
+        plotter = SusceptibilityTensorPlotter(
+            x_axis=omega_axis,
+            tensor=tensor,
+            output_dir=order_dir,
+            x_label=r"$\omega_\mathrm{laser}\;(\mathrm{a.u.})$",
+            argument_label=r"\omega_\mathrm{laser}",
+            tensor_name=f"chi{order}",
+            direction_labels=direction_labels,
+            available_components=available_components or None,
+            dpi=dpi,
+            include_ev_axis=include_ev_axis,
+        )
+
+        overview_cfg = resolved_plot_config["overview"]
+        if bool(overview_cfg["enabled"]):
+            overview_path = plotter.plot_overview(
+                output_path=order_dir / str(overview_cfg["output_file_template"]).format(order=order),
+            )
+            outputs[f"susceptibility_order_{order}_overview"] = overview_path
+
+        grid_cfg = resolved_plot_config["grid"]
+        if bool(grid_cfg["enabled"]):
+            grid_path = plotter.plot_grid(
+                output_path=order_dir / str(grid_cfg["output_file_template"]).format(order=order),
+            )
+            outputs[f"susceptibility_order_{order}_grid"] = grid_path
+
+        components_cfg = resolved_plot_config["components"]
+        if bool(components_cfg["enabled"]):
+            component_indices = list(plotter.component_indices())
+            for component in component_indices:
+                label = "".join(direction_labels[index] for index in component)
+                output_path = order_dir / str(components_cfg["output_file_template"]).format(
+                    order=order,
+                    label=label,
+                )
+                path = plotter.plot_component(component, output_path=output_path)
+                outputs[f"susceptibility_order_{order}_{label}"] = path
+
+    return outputs
+
+
+def _susceptibility_plot_output_dir(config: QXTIConfig) -> Path:
+    raw = config.xtp.susceptibility_plot_output_dir.strip()
+    if raw:
+        return Path(raw)
+    return Path(config.xtp.susceptibility_output_dir) / "xtp_susceptibility"
+
+
+def _resolve_susceptibility_dataset_path(*, data_dir: Path, dataset_file: str) -> Path:
+    requested_path = data_dir / dataset_file
+    if requested_path.exists():
+        return requested_path
+    if dataset_file == "xtp_susceptibility.npz":
+        legacy_path = data_dir / "susceptibility_scan.npz"
+        if legacy_path.exists():
+            return legacy_path
+    return requested_path
+
+
+def _resolve_susceptibility_plot_config_from_xtp(
+    config: QXTIConfig,
+    overrides: dict[str, object] | None = None,
+) -> dict[str, object]:
+    xtp = config.xtp
+    base = {
+        "dataset_file": xtp.susceptibility_plot_dataset_file,
+        "orders": "all" if xtp.susceptibility_plot_orders is None else xtp.susceptibility_plot_orders,
+        "positive_only": bool(xtp.susceptibility_plot_positive_only),
+        "omega_min": xtp.susceptibility_plot_omega_min,
+        "omega_max": xtp.susceptibility_plot_omega_max,
+        "dpi": int(xtp.susceptibility_plot_dpi),
+        "include_ev_axis": bool(xtp.susceptibility_plot_ev_axis),
+        "overview": {
+            "enabled": bool(xtp.susceptibility_plot_overview_enabled),
+            "output_file_template": "chi{order}_overview.png",
+        },
+        "grid": {
+            "enabled": bool(xtp.susceptibility_plot_grid_enabled),
+            "output_file_template": "chi{order}_grid.png",
+        },
+        "components": {
+            "enabled": bool(xtp.susceptibility_plot_components_enabled),
+            "output_file_template": "chi{order}_{label}.png",
+        },
+    }
+    resolved = resolve_susceptibility_plot_config()
+    _deep_update_local(resolved, base)
+    if overrides:
+        _deep_update_local(resolved, overrides)
+    return resolved
+
+
+def _deep_update_local(target: dict[str, object], updates: dict[str, object]) -> None:
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            _deep_update_local(target[key], value)  # type: ignore[index]
+        else:
+            target[key] = value
+
+
 def plot_all_graphics_from_saved_data(
     config_path: str | Path,
 ) -> dict[str, Path]:
     outputs: dict[str, Path] = {}
     outputs.update(plot_hamiltonian_graphics_from_saved_data(config_path))
     outputs.update(plot_harmonic_graphics_from_saved_data(config_path))
+    outputs.update(plot_susceptibility_graphics_from_saved_data(config_path))
     outputs.update(plot_response_graphics_from_saved_data(config_path))
     return outputs
 
@@ -380,7 +639,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--family",
-        choices=("all", "hamiltonian", "response", "harmonics"),
+        choices=("all", "hamiltonian", "response", "harmonics", "susceptibility"),
         default="all",
         help="Choose which graphics family to generate from saved data.",
     )
@@ -397,6 +656,8 @@ def main() -> int:
         outputs = plot_hamiltonian_graphics_from_saved_data(args.config)
     elif args.family == "harmonics":
         outputs = plot_harmonic_graphics_from_saved_data(args.config)
+    elif args.family == "susceptibility":
+        outputs = plot_susceptibility_graphics_from_saved_data(args.config)
     else:
         outputs = plot_response_graphics_from_saved_data(args.config)
 
@@ -496,7 +757,27 @@ def _resolve_requested_orders(config_value: object) -> tuple[int, ...] | None:
         return (int(config_value),)
     if isinstance(config_value, (list, tuple)):
         return tuple(int(item) for item in config_value)
-    raise ValueError("response plot config 'orders' must be 'all' or a list/tuple of ints.")
+    raise ValueError("plot config 'orders' must be 'all' or a list/tuple of ints.")
+
+
+def _select_frequency_mask(
+    omega_axis: np.ndarray,
+    *,
+    positive_only: bool,
+    omega_min: float | None,
+    omega_max: float | None,
+) -> np.ndarray:
+    omega = np.asarray(omega_axis, dtype=float)
+    mask = np.ones_like(omega, dtype=bool)
+    if positive_only:
+        mask &= omega >= 0.0
+    if omega_min is not None:
+        mask &= omega >= float(omega_min)
+    if omega_max is not None:
+        mask &= omega <= float(omega_max)
+    if not np.any(mask):
+        raise ValueError("The selected susceptibility frequency window is empty.")
+    return mask
 
 
 if __name__ == "__main__":

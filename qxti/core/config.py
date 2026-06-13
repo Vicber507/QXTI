@@ -3,7 +3,7 @@ from __future__ import annotations
 import ast
 import configparser
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -214,6 +214,11 @@ class CMDConfig:
     output_dir: str = "outputs/cmd"
     max_order: int = 1
     rho_storage_dtype: str = "complex128"
+    keep_rho_orders: bool = True
+    dataset_time_stride: int = 1
+    save_population_dataset: bool = True
+    save_coherence_dataset: bool = True
+    save_xtp_dataset: bool = True
     population_time: float = math.inf
     coherence_time: float = math.inf
     temperature: float = 0.0
@@ -254,7 +259,26 @@ class XTPConfig:
     bz_mask_radius_percent: float = 100.0
     bz_mask_sigma: float | None = None
     bz_mask_sigma_percent_legacy: float | None = None
-
+    susceptibility_enabled: bool = False
+    susceptibility_output_dir: str = "outputs/susceptibility"
+    susceptibility_orders: tuple[int, ...] = (1,)
+    susceptibility_omega_min: float = 0.05
+    susceptibility_omega_max: float = 0.15
+    susceptibility_num_frequencies: int = 11
+    susceptibility_omega_values: tuple[float, ...] = field(default_factory=tuple)
+    susceptibility_eps: float = 1.0e-14
+    susceptibility_plot_enabled: bool = False
+    susceptibility_plot_output_dir: str = ""
+    susceptibility_plot_dataset_file: str = "xtp_susceptibility.npz"
+    susceptibility_plot_orders: tuple[int, ...] | None = None
+    susceptibility_plot_positive_only: bool = False
+    susceptibility_plot_omega_min: float | None = None
+    susceptibility_plot_omega_max: float | None = None
+    susceptibility_plot_dpi: int = 300
+    susceptibility_plot_overview_enabled: bool = True
+    susceptibility_plot_grid_enabled: bool = True
+    susceptibility_plot_components_enabled: bool = True
+    susceptibility_plot_ev_axis: bool = True
 
 @dataclass(slots=True)
 class QXTIConfig:
@@ -266,6 +290,7 @@ class QXTIConfig:
     cmd: CMDConfig = field(default_factory=CMDConfig)
     cmd_plots: CMDPlotsConfig = field(default_factory=CMDPlotsConfig)
     xtp: XTPConfig = field(default_factory=XTPConfig)
+    susceptibility_solver: CMDConfig = field(default_factory=CMDConfig)
     source_path: Path | None = None
 
     @classmethod
@@ -287,6 +312,16 @@ class QXTIConfig:
         cmd = cls._parse_cmd_section(parser["cmd"]) if "cmd" in parser else CMDConfig()
         cmd_plots = cls._parse_cmd_plots_section(parser["cmd_plots"]) if "cmd_plots" in parser else CMDPlotsConfig()
         xtp = cls._parse_xtp_section(parser["xtp"]) if "xtp" in parser else XTPConfig()
+        if "susceptibility_scan" in parser:
+            xtp = replace(
+                xtp,
+                **cls._parse_legacy_susceptibility_scan_section(parser["susceptibility_scan"]),
+            )
+        susceptibility_solver = (
+            cls._parse_cmd_section(parser["susceptibility_solver"])
+            if "susceptibility_solver" in parser
+            else CMDConfig()
+        )
         return cls(
             hamiltonian=hamiltonian,
             hamiltonian_plots=hamiltonian_plots,
@@ -296,6 +331,7 @@ class QXTIConfig:
             cmd=cmd,
             cmd_plots=cmd_plots,
             xtp=xtp,
+            susceptibility_solver=susceptibility_solver,
             source_path=path.resolve(),
         )
 
@@ -495,6 +531,11 @@ class QXTIConfig:
             output_dir=section.get("output_dir", fallback="outputs/cmd").strip() or "outputs/cmd",
             max_order=section.getint("max_order", fallback=1),
             rho_storage_dtype=section.get("rho_storage_dtype", fallback="complex128").strip() or "complex128",
+            keep_rho_orders=section.getboolean("keep_rho_orders", fallback=True),
+            dataset_time_stride=max(1, section.getint("dataset_time_stride", fallback=1)),
+            save_population_dataset=section.getboolean("save_population_dataset", fallback=True),
+            save_coherence_dataset=section.getboolean("save_coherence_dataset", fallback=True),
+            save_xtp_dataset=section.getboolean("save_xtp_dataset", fallback=True),
             population_time=population_time,
             coherence_time=coherence_time,
             temperature=section.getfloat("temperature", fallback=0.0),
@@ -536,6 +577,10 @@ class QXTIConfig:
     def _parse_xtp_section(section: configparser.SectionProxy) -> XTPConfig:
         sigma_raw = section.get("bz_mask_sigma", fallback="").strip()
         sigma_percent_legacy_raw = section.get("bz_mask_sigma_percent", fallback="").strip()
+        susceptibility_omega_min_raw = section.get("susceptibility_omega_min", fallback="").strip()
+        susceptibility_omega_max_raw = section.get("susceptibility_omega_max", fallback="").strip()
+        susceptibility_plot_omega_min_raw = section.get("susceptibility_plot_omega_min", fallback="").strip()
+        susceptibility_plot_omega_max_raw = section.get("susceptibility_plot_omega_max", fallback="").strip()
         return XTPConfig(
             bz_mask_enabled=section.getboolean("bz_mask_enabled", fallback=False),
             bz_mask_radius_percent=section.getfloat("bz_mask_radius_percent", fallback=100.0),
@@ -543,4 +588,83 @@ class QXTIConfig:
             bz_mask_sigma_percent_legacy=None
             if not sigma_percent_legacy_raw
             else float(_parse_scalar(sigma_percent_legacy_raw)),
+            susceptibility_enabled=section.getboolean("susceptibility_enabled", fallback=False),
+            susceptibility_output_dir=section.get(
+                "susceptibility_output_dir",
+                fallback="outputs/susceptibility",
+            ).strip()
+            or "outputs/susceptibility",
+            susceptibility_orders=_parse_int_tuple(
+                section.get("susceptibility_orders", fallback="1"),
+                default=(1,),
+            ),
+            susceptibility_omega_min=0.05
+            if not susceptibility_omega_min_raw
+            else float(_parse_scalar(susceptibility_omega_min_raw)),
+            susceptibility_omega_max=0.15
+            if not susceptibility_omega_max_raw
+            else float(_parse_scalar(susceptibility_omega_max_raw)),
+            susceptibility_num_frequencies=section.getint("susceptibility_num_frequencies", fallback=11),
+            susceptibility_omega_values=tuple(
+                _parse_float_list(section.get("susceptibility_omega_values", fallback=""), default=[])
+            ),
+            susceptibility_eps=section.getfloat("susceptibility_eps", fallback=1.0e-14),
+            susceptibility_plot_enabled=section.getboolean("susceptibility_plot_enabled", fallback=False),
+            susceptibility_plot_output_dir=section.get("susceptibility_plot_output_dir", fallback="").strip(),
+            susceptibility_plot_dataset_file=section.get(
+                "susceptibility_plot_dataset_file",
+                fallback="xtp_susceptibility.npz",
+            ).strip()
+            or "xtp_susceptibility.npz",
+            susceptibility_plot_orders=_parse_int_tuple_or_none(
+                section.get("susceptibility_plot_orders", fallback="")
+            ),
+            susceptibility_plot_positive_only=section.getboolean(
+                "susceptibility_plot_positive_only",
+                fallback=False,
+            ),
+            susceptibility_plot_omega_min=None
+            if not susceptibility_plot_omega_min_raw
+            else float(_parse_scalar(susceptibility_plot_omega_min_raw)),
+            susceptibility_plot_omega_max=None
+            if not susceptibility_plot_omega_max_raw
+            else float(_parse_scalar(susceptibility_plot_omega_max_raw)),
+            susceptibility_plot_dpi=section.getint("susceptibility_plot_dpi", fallback=300),
+            susceptibility_plot_overview_enabled=section.getboolean(
+                "susceptibility_plot_overview_enabled",
+                fallback=True,
+            ),
+            susceptibility_plot_grid_enabled=section.getboolean(
+                "susceptibility_plot_grid_enabled",
+                fallback=True,
+            ),
+            susceptibility_plot_components_enabled=section.getboolean(
+                "susceptibility_plot_components_enabled",
+                fallback=True,
+            ),
+            susceptibility_plot_ev_axis=section.getboolean(
+                "susceptibility_plot_ev_axis",
+                fallback=True,
+            ),
         )
+
+    @staticmethod
+    def _parse_legacy_susceptibility_scan_section(
+        section: configparser.SectionProxy,
+    ) -> dict[str, Any]:
+        return {
+            "susceptibility_enabled": section.getboolean("enabled", fallback=False),
+            "susceptibility_output_dir": section.get(
+                "output_dir",
+                fallback="outputs/susceptibility",
+            ).strip()
+            or "outputs/susceptibility",
+            "susceptibility_orders": _parse_int_tuple(section.get("orders", fallback="1"), default=(1,)),
+            "susceptibility_omega_min": section.getfloat("omega_min", fallback=0.05),
+            "susceptibility_omega_max": section.getfloat("omega_max", fallback=0.15),
+            "susceptibility_num_frequencies": section.getint("num_frequencies", fallback=11),
+            "susceptibility_omega_values": tuple(
+                _parse_float_list(section.get("omega_values", fallback=""), default=[])
+            ),
+            "susceptibility_eps": section.getfloat("eps", fallback=1.0e-14),
+        }
