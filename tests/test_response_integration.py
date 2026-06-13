@@ -11,7 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from qxti.grids import FrequencyGrid, KGrid, TimeGrid
-from qxti.data import HarmonicData, ResponseData
+from qxti.data import HarmonicData, ResponseData, SusceptibilityData
 from qxti.graphics import HarmonicGraphics, ResponseGraphics
 from qxti.physics import Hamiltonian, Laser, LaserSystem, OperatorFactory
 from qxti.response import CMD, T1T2Relaxation, XTP, bose_einstein, fermi_dirac, full_occupation, maxwell_boltzmann, t1_t2_relaxation, valence_occupation
@@ -395,6 +395,21 @@ def test_response_population_kxky_animation_data_and_plot(tmp_path: Path) -> Non
     )
     assert coherence_data["coherence_frames"].shape == (11, 1, 2, 3)
 
+    subsampled_population = response_data.population_kxky_animation_data(
+        orders=(0, 1),
+        time_indices=np.array([0, 5, 10]),
+        rho_orders=rho_orders,
+    )
+    assert subsampled_population["population_frames"].shape == (3, 2, 2, 3)
+
+    subsampled_coherence = response_data.coherence_kxky_animation_data(
+        orders=(0, 1),
+        component="magnitude",
+        time_indices=np.array([0, 5, 10]),
+        rho_orders=rho_orders,
+    )
+    assert subsampled_coherence["coherence_frames"].shape == (3, 1, 2, 3)
+
     coherence_snapshot_indices = ResponseGraphics.resolve_snapshot_indices(
         np.asarray(coherence_data["time_axis"], dtype=float),
         num_snapshots=3,
@@ -485,6 +500,68 @@ def test_xtp_basic_observables_run_with_cmd_output() -> None:
     assert susceptibility.shape == (len(cmd.timegrid), 3)
     assert np.all(np.isfinite(polarization))
     assert np.all(np.isfinite(current))
+
+
+def test_xtp_susceptibility_tensor_spectrum_builds_sparse_available_components() -> None:
+    cmd, operator_factory = build_cmd_stack(max_order=2)
+    rho_orders = cmd.compute_all_orders()
+    xtp = XTP(
+        hamiltonian=cmd.hamiltonian,
+        rho_orders=rho_orders,
+        kgrid=cmd.kgrid,
+        timegrid=cmd.timegrid,
+        frequencygrid=FrequencyGrid(0.0, 5.0, 32),
+        operator_factory=operator_factory,
+        directions=["x", "y"],
+        orders=[0, 1, 2],
+        band_gauge_frame=cmd.band_gauge_frame,
+        laser_system=cmd.laser_system,
+    )
+
+    chi1 = xtp.susceptibility_tensor_spectrum(order=1, input_direction="auto")
+    tensor1 = np.asarray(chi1["tensor"], dtype=np.complex128)
+    available1 = np.asarray(chi1["available_indices"], dtype=int)
+    assert tensor1.shape == (len(cmd.timegrid.frequency_axis()), 2, 2)
+    np.testing.assert_array_equal(available1, np.array([[0, 0], [1, 0]], dtype=int))
+    assert chi1["input_direction"] == "x"
+    assert np.any(np.isfinite(tensor1[:, 0, 0]))
+    assert np.all(np.isnan(tensor1[:, :, 1]))
+
+    chi2 = xtp.susceptibility_tensor_spectrum(order=2, input_direction="auto")
+    tensor2 = np.asarray(chi2["tensor"], dtype=np.complex128)
+    available2 = np.asarray(chi2["available_indices"], dtype=int)
+    assert tensor2.shape == (len(cmd.timegrid.frequency_axis()), 2, 2, 2)
+    np.testing.assert_array_equal(available2, np.array([[0, 0, 0], [1, 0, 0]], dtype=int))
+    assert chi2["normalization_mode"] == "fixed_input_frequency_component"
+    assert np.any(np.isfinite(tensor2[:, 0, 0, 0]))
+    assert np.all(np.isnan(tensor2[:, :, 0, 1]))
+    assert np.all(np.isnan(tensor2[:, :, 1, 0]))
+    assert np.all(np.isnan(tensor2[:, :, 1, 1]))
+
+
+def test_susceptibility_data_serializes_xtp_tensor_spectra() -> None:
+    cmd, operator_factory = build_cmd_stack(max_order=2)
+    rho_orders = cmd.compute_all_orders()
+    xtp = XTP(
+        hamiltonian=cmd.hamiltonian,
+        rho_orders=rho_orders,
+        kgrid=cmd.kgrid,
+        timegrid=cmd.timegrid,
+        frequencygrid=FrequencyGrid(0.0, 5.0, 32),
+        operator_factory=operator_factory,
+        directions=["x", "y"],
+        orders=[0, 1, 2],
+        band_gauge_frame=cmd.band_gauge_frame,
+        laser_system=cmd.laser_system,
+    )
+
+    dataset = SusceptibilityData(xtp).tensor_spectrum_data()
+
+    assert tuple(dataset["orders"]) == (1, 2)
+    assert tuple(dataset["direction_labels"]) == ("x", "y")
+    assert np.asarray(dataset["omega_axis"], dtype=float).shape == (len(cmd.timegrid.frequency_axis()),)
+    assert np.asarray(dataset["chi_order_1_tensor"], dtype=np.complex128).shape == (22, 2, 2)
+    assert np.asarray(dataset["chi_order_2_tensor"], dtype=np.complex128).shape == (22, 2, 2, 2)
 
 
 def test_xtp_first_order_polarization_matches_manual_bz_dipole_integral() -> None:

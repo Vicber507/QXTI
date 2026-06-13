@@ -12,7 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from qxti.core import QXTIConfig, QXTISimulation
+from qxti.core import QXTIConfig, QXTISimulation, SusceptibilityScanRunner
 from qxti.data import load_dataset_npz
 
 
@@ -63,9 +63,32 @@ def write_model_file(tmp_path: Path) -> Path:
     return model_path
 
 
-def write_config_file(tmp_path: Path, model_path: Path) -> Path:
+def write_config_file(
+    tmp_path: Path,
+    model_path: Path,
+    *,
+    keep_rho_orders: bool = True,
+    dataset_time_stride: int = 1,
+    save_population_dataset: bool = True,
+    save_coherence_dataset: bool = True,
+    save_xtp_dataset: bool = True,
+    xtp_susceptibility_enabled: bool = False,
+    xtp_susceptibility_orders: str = "[1]",
+    xtp_susceptibility_num_frequencies: int = 2,
+    xtp_susceptibility_plot_enabled: bool = False,
+) -> Path:
     num_cycles = 2.0 * 0.8 / (2.0 * np.pi)
     config_path = tmp_path / "inputParams.cfg"
+    susceptibility_sweep_block = ""
+    if xtp_susceptibility_enabled:
+        susceptibility_sweep_block = f"""
+            susceptibility_output_dir = {tmp_path / "susceptibility"}
+            susceptibility_orders = {xtp_susceptibility_orders}
+            susceptibility_omega_min = 0.7
+            susceptibility_omega_max = 0.9
+            susceptibility_num_frequencies = {xtp_susceptibility_num_frequencies}
+            susceptibility_eps = 1.0e-14
+"""
     config_path.write_text(
         dedent(
             f"""
@@ -120,6 +143,11 @@ def write_config_file(tmp_path: Path, model_path: Path) -> Path:
             output_dir = {tmp_path / "cmd"}
             max_order = 1
             rho_storage_dtype = complex64
+            keep_rho_orders = {"true" if keep_rho_orders else "false"}
+            dataset_time_stride = {dataset_time_stride}
+            save_population_dataset = {"true" if save_population_dataset else "false"}
+            save_coherence_dataset = {"true" if save_coherence_dataset else "false"}
+            save_xtp_dataset = {"true" if save_xtp_dataset else "false"}
             population_time = 50.0
             coherence_time = 20.0
             temperature = 0.02
@@ -145,6 +173,12 @@ def write_config_file(tmp_path: Path, model_path: Path) -> Path:
             bz_mask_enabled = true
             bz_mask_radius_percent = 80.0
             bz_mask_sigma = 0.75
+            susceptibility_enabled = {"true" if xtp_susceptibility_enabled else "false"}
+            {susceptibility_sweep_block.rstrip()}
+            susceptibility_plot_enabled = {"true" if xtp_susceptibility_plot_enabled else "false"}
+            susceptibility_plot_overview_enabled = true
+            susceptibility_plot_grid_enabled = true
+            susceptibility_plot_components_enabled = true
             """
         )
     )
@@ -184,6 +218,10 @@ def test_qxti_config_parses_hamiltonian_and_plot_sections(tmp_path: Path) -> Non
     assert config.cmd.enabled is True
     assert config.cmd.max_order == 1
     assert config.cmd.rho_storage_dtype == "complex64"
+    assert config.cmd.dataset_time_stride == 1
+    assert config.cmd.save_population_dataset is True
+    assert config.cmd.save_coherence_dataset is True
+    assert config.cmd.save_xtp_dataset is True
     assert config.cmd.solver == "rkf45"
     assert config.cmd.distribution == "fermi_dirac"
     assert np.isclose(config.cmd.population_time, 50.0)
@@ -194,6 +232,14 @@ def test_qxti_config_parses_hamiltonian_and_plot_sections(tmp_path: Path) -> Non
     assert config.xtp.bz_mask_enabled is True
     assert np.isclose(config.xtp.bz_mask_radius_percent, 80.0)
     assert np.isclose(config.xtp.bz_mask_sigma, 0.75)
+    assert config.xtp.susceptibility_enabled is False
+    assert config.xtp.susceptibility_output_dir == "outputs/susceptibility"
+    assert config.xtp.susceptibility_orders == (1,)
+    assert np.isclose(config.xtp.susceptibility_omega_min, 0.05)
+    assert np.isclose(config.xtp.susceptibility_omega_max, 0.15)
+    assert config.xtp.susceptibility_num_frequencies == 11
+    assert np.isclose(config.xtp.susceptibility_eps, 1.0e-14)
+    assert config.xtp.susceptibility_plot_enabled is False
 
 
 def test_simulation_builds_custom_hamiltonian_from_config(tmp_path: Path) -> None:
@@ -314,6 +360,68 @@ def test_simulation_generates_requested_outputs(tmp_path: Path) -> None:
     assert np.asarray(harmonic_dataset["current_total_magnitude"], dtype=float).ndim == 1
     assert np.asarray(harmonic_dataset["current_total_magnitude_intraband"], dtype=float).ndim == 1
     assert np.asarray(harmonic_dataset["current_total_magnitude_interband"], dtype=float).ndim == 1
+
+
+def test_simulation_can_drop_rho_orders_after_generating_compact_datasets(tmp_path: Path) -> None:
+    model_path = write_model_file(tmp_path)
+    config_path = write_config_file(tmp_path, model_path, keep_rho_orders=False)
+    simulation = QXTISimulation.from_file(config_path)
+
+    outputs = simulation.run()
+
+    assert "rho_order_0" not in outputs
+    assert "rho_order_1" not in outputs
+    assert "rho_population_kxky_data" in outputs
+    assert "rho_coherence_kxky_data" in outputs
+    assert "xtp_current_spectrum_data" in outputs
+    assert not any((tmp_path / "cmd").glob("rho_order_*.npy"))
+    assert not (tmp_path / "cmd" / ".scratch_rho").exists()
+
+    population_dataset = load_dataset_npz(outputs["rho_population_kxky_data"])
+    coherence_dataset = load_dataset_npz(outputs["rho_coherence_kxky_data"])
+    assert "equilibrium_population_frame" in population_dataset
+    assert "coherence_frames_complex" in coherence_dataset
+    assert np.iscomplexobj(np.asarray(coherence_dataset["coherence_frames_complex"]))
+
+
+def test_simulation_cmd_datasets_can_subsample_time_axis(tmp_path: Path) -> None:
+    model_path = write_model_file(tmp_path)
+    config_path = write_config_file(tmp_path, model_path, keep_rho_orders=False, dataset_time_stride=3)
+    simulation = QXTISimulation.from_file(config_path)
+
+    outputs = simulation.run()
+
+    population_dataset = load_dataset_npz(outputs["rho_population_kxky_data"])
+    coherence_dataset = load_dataset_npz(outputs["rho_coherence_kxky_data"])
+    population_frames = np.asarray(population_dataset["population_frames"])
+    coherence_frames = np.asarray(coherence_dataset["coherence_frames_complex"])
+    time_axis = np.asarray(population_dataset["time_axis"], dtype=float)
+
+    assert len(time_axis) < simulation.build_cmd(simulation.build_hamiltonian()).timegrid.Nt
+    assert population_frames.shape[0] == len(time_axis)
+    assert coherence_frames.shape[0] == len(time_axis)
+
+
+def test_simulation_can_skip_response_datasets_by_config(tmp_path: Path) -> None:
+    model_path = write_model_file(tmp_path)
+    config_path = write_config_file(
+        tmp_path,
+        model_path,
+        keep_rho_orders=False,
+        save_population_dataset=False,
+        save_coherence_dataset=False,
+    )
+    simulation = QXTISimulation.from_file(config_path)
+
+    outputs = simulation.run()
+
+    assert "rho_population_kxky_data" not in outputs
+    assert "rho_coherence_kxky_data" not in outputs
+    assert "xtp_current_spectrum_data" in outputs
+    assert not (tmp_path / "cmd" / "data" / "population_kx_ky_per_band.npz").exists()
+    assert not (tmp_path / "cmd" / "data" / "coherence_kx_ky_per_pair.npz").exists()
+
+
 def test_graphics_runners_generate_outputs_from_config(tmp_path: Path) -> None:
     if importlib.util.find_spec("matplotlib") is None:
         pytest.skip("matplotlib is not available in this environment.")
@@ -345,3 +453,250 @@ def test_graphics_runners_generate_outputs_from_config(tmp_path: Path) -> None:
     for path in (*hamiltonian_outputs.values(), *response_outputs.values(), *harmonic_outputs.values()):
         assert path.exists()
         assert path.stat().st_size > 0
+
+
+def test_response_graphics_can_run_from_compact_saved_datasets_without_rho(tmp_path: Path) -> None:
+    if importlib.util.find_spec("matplotlib") is None:
+        pytest.skip("matplotlib is not available in this environment.")
+
+    from qxti.graphics.graphics import plot_response_graphics_from_saved_data
+
+    model_path = write_model_file(tmp_path)
+    config_path = write_config_file(tmp_path, model_path, keep_rho_orders=False)
+    simulation = QXTISimulation.from_file(config_path)
+    simulation.run()
+
+    response_outputs = plot_response_graphics_from_saved_data(config_path)
+
+    assert "rho_population_snapshots" in response_outputs
+    assert "rho_coherence_snapshots" in response_outputs
+    for path in response_outputs.values():
+        assert path.exists()
+        assert path.stat().st_size > 0
+
+
+def test_response_graphics_skip_disabled_response_datasets(tmp_path: Path) -> None:
+    if importlib.util.find_spec("matplotlib") is None:
+        pytest.skip("matplotlib is not available in this environment.")
+
+    from qxti.graphics.graphics import plot_response_graphics_from_saved_data
+
+    model_path = write_model_file(tmp_path)
+    config_path = write_config_file(
+        tmp_path,
+        model_path,
+        keep_rho_orders=False,
+        save_population_dataset=False,
+        save_coherence_dataset=False,
+    )
+    simulation = QXTISimulation.from_file(config_path)
+    simulation.run()
+
+    response_outputs = plot_response_graphics_from_saved_data(config_path)
+
+    assert response_outputs == {}
+
+
+def test_susceptibility_graphics_generate_outputs_from_saved_dataset(tmp_path: Path) -> None:
+    if importlib.util.find_spec("matplotlib") is None:
+        pytest.skip("matplotlib is not available in this environment.")
+
+    from qxti.graphics.graphics import plot_susceptibility_graphics_from_saved_data
+
+    model_path = write_model_file(tmp_path)
+    config_path = write_config_file(
+        tmp_path,
+        model_path,
+        xtp_susceptibility_enabled=True,
+        xtp_susceptibility_orders="[1]",
+        xtp_susceptibility_num_frequencies=2,
+        xtp_susceptibility_plot_enabled=True,
+    )
+    SusceptibilityScanRunner.from_file(config_path).run()
+
+    outputs = plot_susceptibility_graphics_from_saved_data(config_path)
+
+    assert "susceptibility_order_1_grid" in outputs
+    assert "susceptibility_order_1_xx" in outputs
+    assert "susceptibility_order_1_yx" in outputs
+    for path in outputs.values():
+        assert path.exists()
+        assert path.stat().st_size > 0
+
+
+def test_simulation_can_skip_xtp_dataset_by_config(tmp_path: Path) -> None:
+    model_path = write_model_file(tmp_path)
+    config_path = write_config_file(
+        tmp_path,
+        model_path,
+        keep_rho_orders=False,
+        save_xtp_dataset=False,
+    )
+    simulation = QXTISimulation.from_file(config_path)
+
+    outputs = simulation.run()
+
+    assert "xtp_current_spectrum_data" not in outputs
+    assert not (tmp_path / "cmd" / "data" / "current_spectrum.npz").exists()
+
+
+def test_susceptibility_scan_runner_generates_dataset(tmp_path: Path) -> None:
+    model_path = write_model_file(tmp_path)
+    config_path = write_config_file(
+        tmp_path,
+        model_path,
+        xtp_susceptibility_enabled=True,
+        xtp_susceptibility_orders="[1, 2]",
+        xtp_susceptibility_num_frequencies=2,
+    )
+    outputs = SusceptibilityScanRunner.from_file(config_path).run()
+
+    assert "xtp_susceptibility_data" in outputs
+    assert not (tmp_path / "cmd").exists()
+    assert not (tmp_path / "cmd" / "data").exists()
+    dataset = load_dataset_npz(outputs["xtp_susceptibility_data"])
+    assert tuple(int(order) for order in dataset["orders"]) == (1, 2)
+    assert np.asarray(dataset["laser_omega_axis"], dtype=float).shape == (2,)
+    tensor1 = np.asarray(dataset["chi_order_1_tensor"], dtype=np.complex128)
+    tensor2 = np.asarray(dataset["chi_order_2_tensor"], dtype=np.complex128)
+    assert tensor1.shape == (2, 2, 2)
+    assert tensor2.shape == (2, 2, 2, 2)
+    available1 = np.asarray(dataset["chi_order_1_available_indices"], dtype=int)
+    available2 = np.asarray(dataset["chi_order_2_available_indices"], dtype=int)
+    np.testing.assert_array_equal(
+        available1,
+        np.array([[0, 0], [0, 1], [1, 0], [1, 1]], dtype=int),
+    )
+    np.testing.assert_array_equal(
+        available2,
+        np.array([[0, 0, 0], [0, 1, 1], [1, 0, 0], [1, 1, 1]], dtype=int),
+    )
+    assert np.any(np.isfinite(tensor1))
+    assert np.any(np.isfinite(tensor2[:, :, 0, 0]))
+
+
+def test_susceptibility_scan_runner_accepts_special_solver_section_without_cmd(tmp_path: Path) -> None:
+    if importlib.util.find_spec("matplotlib") is None:
+        pytest.skip("matplotlib is not available in this environment.")
+
+    model_path = write_model_file(tmp_path)
+    config_path = tmp_path / "inputParams_susceptibility_only.cfg"
+    config_path.write_text(
+        dedent(
+            f"""
+            [hamiltonian]
+            source_file = {model_path}
+            function_name = H
+            basis_size = 2
+            dimension = 2
+            basis_type = spin
+
+            [kgrid]
+            dimension = 2
+            k_points = [3, 3]
+
+            [timegrid]
+            dt = 0.2
+            zero_padding = true
+            padding_factor = 2
+
+            [laser]
+            omega = 0.8
+            E0 = 0.05
+            ellip = 0.0
+            ncycles = 1.0
+            envname = gauss
+            cep = 0.0
+            t0 = 2.0
+            phix = 0.0
+            thetaz = 0.0
+            phiz = 0.0
+            blaser = 0.5
+            alaser = 0.5
+
+            [xtp]
+            bz_mask_enabled = true
+            bz_mask_radius_percent = 80.0
+            bz_mask_sigma = 0.75
+            susceptibility_enabled = true
+            susceptibility_output_dir = {tmp_path / "susceptibility"}
+            susceptibility_orders = [1]
+            susceptibility_omega_values = [0.7, 0.9]
+            susceptibility_eps = 1.0e-14
+            susceptibility_plot_enabled = true
+
+            [susceptibility_solver]
+            max_order = 1
+            population_time = 50.0
+            coherence_time = 20.0
+            temperature = 0.02
+            fermi_level = 0.0
+            distribution = fermi_dirac
+            basis = band
+            gauge = length
+            include_intraband = true
+            include_interband = true
+            include_dephasing = true
+            solver = rkf45
+            solver_tolerance = 1.0e-4
+            solver_max_iterations = 100000
+
+            """
+        )
+    )
+
+    config = QXTIConfig.from_file(config_path)
+    assert config.cmd == type(config.cmd)()
+    assert config.susceptibility_solver.max_order == 1
+    assert config.xtp.susceptibility_enabled is True
+    assert config.xtp.susceptibility_plot_enabled is True
+
+    outputs = SusceptibilityScanRunner.from_file(config_path).run()
+
+    assert "xtp_susceptibility_data" in outputs
+    assert "susceptibility_order_1_overview" in outputs
+    assert not (tmp_path / "cmd").exists()
+    dataset = load_dataset_npz(outputs["xtp_susceptibility_data"])
+    assert tuple(int(order) for order in dataset["orders"]) == (1,)
+    assert np.asarray(dataset["laser_omega_axis"], dtype=float).shape == (2,)
+
+
+def test_simulation_can_skip_all_saved_rho_postprocessing_by_config(tmp_path: Path) -> None:
+    model_path = write_model_file(tmp_path)
+    config_path = write_config_file(
+        tmp_path,
+        model_path,
+        keep_rho_orders=False,
+        save_population_dataset=False,
+        save_coherence_dataset=False,
+        save_xtp_dataset=False,
+    )
+    simulation = QXTISimulation.from_file(config_path)
+
+    outputs = simulation.run()
+
+    assert "rho_population_kxky_data" not in outputs
+    assert "rho_coherence_kxky_data" not in outputs
+    assert "xtp_current_spectrum_data" not in outputs
+    assert not (tmp_path / "cmd" / "data").exists()
+
+
+def test_harmonic_graphics_skip_when_xtp_dataset_disabled_and_missing(tmp_path: Path) -> None:
+    if importlib.util.find_spec("matplotlib") is None:
+        pytest.skip("matplotlib is not available in this environment.")
+
+    from qxti.graphics.graphics import plot_harmonic_graphics_from_saved_data
+
+    model_path = write_model_file(tmp_path)
+    config_path = write_config_file(
+        tmp_path,
+        model_path,
+        keep_rho_orders=False,
+        save_xtp_dataset=False,
+    )
+    simulation = QXTISimulation.from_file(config_path)
+    simulation.run()
+
+    harmonic_outputs = plot_harmonic_graphics_from_saved_data(config_path)
+
+    assert harmonic_outputs == {}

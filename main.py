@@ -8,12 +8,16 @@ from pathlib import Path
 os.environ.setdefault("MPLCONFIGDIR", "/private/tmp")
 os.environ.setdefault("XDG_CACHE_HOME", "/private/tmp")
 
-from qxti.core import QXTISimulation
+from qxti.core import QXTIConfig, QXTISimulation, SusceptibilityScanRunner
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run QXTI physics calculations from an inputParams.cfg file and save reusable data products only."
+        description=(
+            "Run QXTI physics calculations from an input file. "
+            "If [xtp] susceptibility_enabled = true, main.py automatically runs the "
+            "dedicated susceptibility workflow."
+        )
     )
     parser.add_argument(
         "config",
@@ -24,12 +28,27 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def run_from_config_path(config_path: str | Path) -> dict[str, Path]:
+    resolved_path = Path(config_path).expanduser()
+    config = QXTIConfig.from_file(resolved_path)
+
+    if config.xtp.susceptibility_enabled:
+        print(
+            "[main] Detected [xtp] susceptibility_enabled = true in the input. "
+            "Running the dedicated susceptibility workflow "
+            "(no rho_order files or CMD datasets will be written)."
+        )
+        return SusceptibilityScanRunner(config=config).run()
+
+    return QXTISimulation(config=config).run()
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
     config_path = Path(args.config).expanduser()
-    outputs = QXTISimulation.from_file(config_path).run()
+    outputs = run_from_config_path(config_path)
 
     if not outputs:
         print(f"No outputs were generated for {config_path}.")
