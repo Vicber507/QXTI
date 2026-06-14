@@ -43,12 +43,25 @@ class SusceptibilityData:
                 input_omega=input_omega,
                 eps=eps,
             )
+            conductivity_data = self.xtp.conductivity_tensor_spectrum(
+                order=order,
+                input_direction=input_direction,
+                input_omega=input_omega,
+                eps=eps,
+            )
             omega_axis = np.asarray(order_data["omega_axis"], dtype=np.float64)
             if reference_omega_axis is None:
                 reference_omega_axis = omega_axis
                 data["omega_axis"] = omega_axis
             elif reference_omega_axis.shape != omega_axis.shape or not np.allclose(reference_omega_axis, omega_axis):
                 raise ValueError("All susceptibility orders must share the same frequency axis.")
+
+            conductivity_omega_axis = np.asarray(conductivity_data["omega_axis"], dtype=np.float64)
+            if reference_omega_axis.shape != conductivity_omega_axis.shape or not np.allclose(
+                reference_omega_axis,
+                conductivity_omega_axis,
+            ):
+                raise ValueError("Conductivity and susceptibility orders must share the same frequency axis.")
 
             base = f"chi_order_{order}"
             data[f"{base}_tensor"] = np.asarray(order_data["tensor"], dtype=np.complex128)
@@ -66,6 +79,28 @@ class SusceptibilityData:
             data[f"{base}_single_component_drive"] = bool(order_data["single_component_drive"])
             data[f"{base}_input_component_magnitudes"] = np.asarray(
                 order_data["input_component_magnitudes"],
+                dtype=np.float64,
+            )
+
+            conductivity_base = f"sigma_order_{order}"
+            data[f"{conductivity_base}_tensor"] = np.asarray(conductivity_data["tensor"], dtype=np.complex128)
+            data[f"{conductivity_base}_available_indices"] = np.asarray(
+                conductivity_data["available_indices"],
+                dtype=np.int16,
+            )
+            data[f"{conductivity_base}_field_normalization"] = np.asarray(
+                conductivity_data["field_normalization"],
+                dtype=np.complex128,
+            )
+            data[f"{conductivity_base}_component_labels"] = list(conductivity_data["component_labels"])
+            data[f"{conductivity_base}_input_direction"] = str(conductivity_data["input_direction"])
+            data[f"{conductivity_base}_input_axis"] = int(conductivity_data["input_axis"])
+            data[f"{conductivity_base}_input_omega"] = float(conductivity_data["input_omega"])
+            data[f"{conductivity_base}_input_frequency_index"] = int(conductivity_data["input_frequency_index"])
+            data[f"{conductivity_base}_normalization_mode"] = str(conductivity_data["normalization_mode"])
+            data[f"{conductivity_base}_single_component_drive"] = bool(conductivity_data["single_component_drive"])
+            data[f"{conductivity_base}_input_component_magnitudes"] = np.asarray(
+                conductivity_data["input_component_magnitudes"],
                 dtype=np.float64,
             )
 
