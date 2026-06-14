@@ -234,7 +234,16 @@ class SusceptibilityScanRunner:
                 nan_value,
                 dtype=np.complex128,
             )
+            data[f"sigma_order_{order}_tensor"] = np.full(
+                tensor_shape,
+                nan_value,
+                dtype=np.complex128,
+            )
             data[f"chi_order_{order}_available_indices"] = np.asarray(
+                self._available_indices(order=order, dimension=dimension),
+                dtype=np.int16,
+            )
+            data[f"sigma_order_{order}_available_indices"] = np.asarray(
                 self._available_indices(order=order, dimension=dimension),
                 dtype=np.int16,
             )
@@ -242,7 +251,13 @@ class SusceptibilityScanRunner:
                 XTP._tensor_component_label(indices)
                 for indices in self._available_indices(order=order, dimension=dimension)
             ]
+            data[f"sigma_order_{order}_component_labels"] = list(data[f"chi_order_{order}_component_labels"])
             data[f"chi_order_{order}_sampled_fft_omega"] = np.full(
+                num_frequencies,
+                np.nan,
+                dtype=np.float64,
+            )
+            data[f"sigma_order_{order}_sampled_fft_omega"] = np.full(
                 num_frequencies,
                 np.nan,
                 dtype=np.float64,
@@ -251,10 +266,19 @@ class SusceptibilityScanRunner:
                 laser_omega_axis,
                 dtype=np.float64,
             )
+            data[f"sigma_order_{order}_target_output_omega"] = np.asarray(
+                data[f"chi_order_{order}_target_output_omega"],
+                dtype=np.float64,
+            )
             data[f"chi_order_{order}_normalization_mode"] = (
                 "sampled_linear_response"
                 if order == 1
                 else "sampled_repeated_axis_effective_response"
+            )
+            data[f"sigma_order_{order}_normalization_mode"] = (
+                "sampled_linear_current_response"
+                if order == 1
+                else "sampled_repeated_axis_effective_current_response"
             )
         return data
 
@@ -283,12 +307,33 @@ class SusceptibilityScanRunner:
             tensor[index] = np.asarray(chi_tensor[omega_index, :dimension, :dimension], dtype=np.complex128)
             dataset["chi_order_1_sampled_fft_omega"][index] = float(omega_axis[omega_index])
 
+            sigma_tensor = np.asarray(dataset["sigma_order_1_tensor"], dtype=np.complex128)
+            sigma_sampled_omega = np.asarray(dataset["sigma_order_1_sampled_fft_omega"], dtype=np.float64)
+            for input_axis, direction in enumerate(direction_labels):
+                xtp = xtp_by_direction[direction]
+                sigma_omega_axis, sigma_column = xtp.linear_conductivity(
+                    input_direction=direction,
+                    eps=eps,
+                )
+                sigma_omega_index = XTP._nearest_frequency_index(
+                    np.asarray(sigma_omega_axis, dtype=np.float64),
+                    float(input_omega),
+                    prefer_positive=True,
+                )
+                sigma_tensor[index, :, input_axis] = np.asarray(
+                    sigma_column[sigma_omega_index, :dimension],
+                    dtype=np.complex128,
+                )
+                sigma_sampled_omega[index] = float(sigma_omega_axis[sigma_omega_index])
+
         for order in orders:
             if order == 1:
                 continue
 
-            tensor = np.asarray(dataset[f"chi_order_{order}_tensor"], dtype=np.complex128)
-            sampled_omega = np.asarray(dataset[f"chi_order_{order}_sampled_fft_omega"], dtype=np.float64)
+            chi_tensor = np.asarray(dataset[f"chi_order_{order}_tensor"], dtype=np.complex128)
+            chi_sampled_omega = np.asarray(dataset[f"chi_order_{order}_sampled_fft_omega"], dtype=np.float64)
+            sigma_tensor = np.asarray(dataset[f"sigma_order_{order}_tensor"], dtype=np.complex128)
+            sigma_sampled_omega = np.asarray(dataset[f"sigma_order_{order}_sampled_fft_omega"], dtype=np.float64)
             target_output_omega = float(order * input_omega)
 
             for input_axis, direction in enumerate(direction_labels):
@@ -304,11 +349,28 @@ class SusceptibilityScanRunner:
                     target_output_omega,
                     prefer_positive=True,
                 )
-                tensor[(index, slice(None)) + (input_axis,) * order] = np.asarray(
+                chi_tensor[(index, slice(None)) + (input_axis,) * order] = np.asarray(
                     chi_column[omega_index, :dimension],
                     dtype=np.complex128,
                 )
-                sampled_omega[index] = float(omega_axis[omega_index])
+                chi_sampled_omega[index] = float(omega_axis[omega_index])
+
+                sigma_omega_axis, sigma_column, _metadata = xtp.effective_conductivity_spectrum(
+                    order=order,
+                    input_direction=direction,
+                    input_omega=input_omega,
+                    eps=eps,
+                )
+                sigma_omega_index = XTP._nearest_frequency_index(
+                    np.asarray(sigma_omega_axis, dtype=np.float64),
+                    target_output_omega,
+                    prefer_positive=True,
+                )
+                sigma_tensor[(index, slice(None)) + (input_axis,) * order] = np.asarray(
+                    sigma_column[sigma_omega_index, :dimension],
+                    dtype=np.complex128,
+                )
+                sigma_sampled_omega[index] = float(sigma_omega_axis[sigma_omega_index])
 
     @staticmethod
     def _available_indices(order: int, *, dimension: int) -> list[tuple[int, ...]]:

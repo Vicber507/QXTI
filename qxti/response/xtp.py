@@ -230,6 +230,61 @@ class XTP:
 
         return omega_axis, np.asarray(chi, dtype=np.complex128)
 
+    def order_current_frequency_domain(
+        self,
+        order: int,
+    ) -> tuple[RealArray, ComplexArray]:
+        """Return ``(omega_axis, J^(order)(omega))`` for all active Cartesian outputs."""
+
+        active_dimension = self.hamiltonian.dimension
+        direction_labels = self._direction_labels(active_dimension)
+        reference_omega_axis: RealArray | None = None
+        spectra: ComplexArray | None = None
+
+        for axis, direction in enumerate(direction_labels):
+            omega_axis, spectrum = self.current_frequency_domain(order, direction)
+            if reference_omega_axis is None:
+                reference_omega_axis = np.asarray(omega_axis, dtype=np.float64)
+                spectra = np.zeros((len(omega_axis), active_dimension), dtype=np.complex128)
+            elif (
+                reference_omega_axis.shape != omega_axis.shape
+                or not np.allclose(reference_omega_axis, omega_axis)
+            ):
+                raise ValueError("Current spectra for different output directions must share the same frequency axis.")
+
+            spectra[:, axis] = np.asarray(spectrum, dtype=np.complex128)
+
+        if reference_omega_axis is None or spectra is None:
+            raise ValueError("No active Cartesian current directions are available.")
+
+        return reference_omega_axis, np.asarray(spectra, dtype=np.complex128)
+
+    def linear_conductivity(
+        self,
+        *,
+        input_direction: str,
+        eps: float = 1.0e-14,
+    ) -> tuple[RealArray, ComplexArray]:
+        """Return ``sigma_ij^(1)(omega) = J_i^(1)(omega) / E_j(omega)`` for one input direction."""
+
+        input_direction = self._normalize_direction(input_direction)
+        input_axis = self._direction_axis(input_direction)
+
+        omega_axis, current_w = self.order_current_frequency_domain(order=1)
+        _, electric_field_w = self.electric_field_frequency_domain()
+
+        denominator = electric_field_w[:, input_axis]
+        safe_denominator = np.where(
+            np.abs(denominator) > eps,
+            denominator,
+            np.nan + 0.0j,
+        )
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            sigma = current_w / safe_denominator[:, np.newaxis]
+
+        return omega_axis, np.asarray(sigma, dtype=np.complex128)
+
     def effective_susceptibility_spectrum(
         self,
         *,
@@ -293,6 +348,70 @@ class XTP:
             "field_normalization": np.asarray([denominator], dtype=np.complex128),
         }
         return omega_axis, np.asarray(chi, dtype=np.complex128), metadata
+
+    def effective_conductivity_spectrum(
+        self,
+        *,
+        order: int,
+        input_direction: str = "auto",
+        input_omega: float | None = None,
+        eps: float = 1.0e-14,
+    ) -> tuple[RealArray, ComplexArray, dict[str, Any]]:
+        r"""Return one effective ``sigma^(order)(omega)`` spectrum for a repeated input axis.
+
+        For ``order > 1`` this is defined as
+
+        .. math::
+
+            \sigma^{(s)}_{i j \ldots j}(\omega)
+            \equiv
+            \frac{J^{(s)}_i(\omega)}{E_j(\omega_\mathrm{in})^s},
+
+        where ``j`` is the selected input direction and ``omega_in`` defaults to
+        the lowest positive carrier frequency present in the configured laser
+        system.
+        """
+
+        if order < 1:
+            raise ValueError("order must be >= 1.")
+
+        resolved_direction = self.resolve_input_direction(
+            requested_direction=input_direction,
+            input_omega=input_omega,
+        )
+        resolved_input_omega = self.reference_input_omega() if input_omega is None else float(input_omega)
+        input_axis = self._direction_axis(resolved_direction)
+
+        omega_axis, current_w = self.order_current_frequency_domain(order=order)
+        _, electric_field_w = self.electric_field_frequency_domain()
+        input_index = self._nearest_frequency_index(
+            omega_axis,
+            resolved_input_omega,
+            prefer_positive=True,
+        )
+
+        denominator = electric_field_w[input_index, input_axis]
+        if np.abs(denominator) <= eps:
+            raise ValueError(
+                f"Electric-field component E_{resolved_direction}(omega={resolved_input_omega}) "
+                "is too small to normalize the conductivity spectrum."
+            )
+
+        active_dimension = self.hamiltonian.dimension
+        sigma = current_w[:, :active_dimension] / denominator**order
+        component_magnitudes = np.abs(electric_field_w[input_index, :active_dimension])
+
+        metadata = {
+            "input_direction": resolved_direction,
+            "input_axis": input_axis,
+            "input_omega": resolved_input_omega,
+            "input_frequency_index": input_index,
+            "normalization_mode": "fixed_input_frequency_component",
+            "single_component_drive": self._is_single_component_drive(component_magnitudes),
+            "input_component_magnitudes": np.asarray(component_magnitudes, dtype=np.float64),
+            "field_normalization": np.asarray([denominator], dtype=np.complex128),
+        }
+        return omega_axis, np.asarray(sigma, dtype=np.complex128), metadata
 
     def susceptibility_tensor_spectrum(
         self,
@@ -359,6 +478,96 @@ class XTP:
             )
             repeated_input = (input_axis,) * order
             tensor[(slice(None), slice(None)) + repeated_input] = chi_column[:, :active_dimension]
+            component_magnitudes = np.asarray(metadata["input_component_magnitudes"], dtype=np.float64)
+            field_normalization = np.asarray(metadata["field_normalization"], dtype=np.complex128)
+            normalization_mode = str(metadata["normalization_mode"])
+            resolved_input_omega = float(metadata["input_omega"])
+            input_index = int(metadata["input_frequency_index"])
+
+        available_indices = [
+            (output_axis,) + (input_axis,) * order
+            for output_axis in range(active_dimension)
+        ]
+        component_labels = [
+            self._tensor_component_label(indices)
+            for indices in available_indices
+        ]
+
+        return {
+            "omega_axis": np.asarray(omega_axis, dtype=np.float64),
+            "tensor": np.asarray(tensor, dtype=np.complex128),
+            "available_indices": np.asarray(available_indices, dtype=np.int16),
+            "component_labels": component_labels,
+            "direction_labels": self._direction_labels(active_dimension),
+            "order": int(order),
+            "input_direction": resolved_direction,
+            "input_axis": int(input_axis),
+            "input_omega": float(resolved_input_omega),
+            "input_frequency_index": int(input_index),
+            "normalization_mode": normalization_mode,
+            "single_component_drive": self._is_single_component_drive(component_magnitudes),
+            "input_component_magnitudes": np.asarray(component_magnitudes, dtype=np.float64),
+            "field_normalization": np.asarray(field_normalization, dtype=np.complex128),
+        }
+
+    def conductivity_tensor_spectrum(
+        self,
+        *,
+        order: int,
+        input_direction: str = "auto",
+        input_omega: float | None = None,
+        eps: float = 1.0e-14,
+    ) -> dict[str, Any]:
+        """Return one sparse conductivity tensor spectrum for a single XTP run."""
+
+        if order < 1:
+            raise ValueError("order must be >= 1.")
+        if order not in self.rho_orders:
+            raise ValueError(f"rho_orders does not contain order {order}.")
+
+        active_dimension = self.hamiltonian.dimension
+        resolved_direction = self.resolve_input_direction(
+            requested_direction=input_direction,
+            input_omega=input_omega,
+        )
+        input_axis = self._direction_axis(resolved_direction)
+
+        if order == 1:
+            omega_axis, sigma_column = self.linear_conductivity(
+                input_direction=resolved_direction,
+                eps=eps,
+            )
+            tensor = np.full(
+                (len(omega_axis),) + (active_dimension,) * 2,
+                np.nan + 1.0j * np.nan,
+                dtype=np.complex128,
+            )
+            tensor[:, :, input_axis] = sigma_column[:, :active_dimension]
+            reference_omega = self.reference_input_omega()
+            input_index = self._nearest_frequency_index(
+                omega_axis,
+                reference_omega,
+                prefer_positive=True,
+            )
+            _, electric_field_w = self.electric_field_frequency_domain()
+            component_magnitudes = np.abs(electric_field_w[input_index, :active_dimension])
+            field_normalization = np.empty(0, dtype=np.complex128)
+            normalization_mode = "pointwise_field_component"
+            resolved_input_omega = reference_omega
+        else:
+            omega_axis, sigma_column, metadata = self.effective_conductivity_spectrum(
+                order=order,
+                input_direction=resolved_direction,
+                input_omega=input_omega,
+                eps=eps,
+            )
+            tensor = np.full(
+                (len(omega_axis),) + (active_dimension,) * (order + 1),
+                np.nan + 1.0j * np.nan,
+                dtype=np.complex128,
+            )
+            repeated_input = (input_axis,) * order
+            tensor[(slice(None), slice(None)) + repeated_input] = sigma_column[:, :active_dimension]
             component_magnitudes = np.asarray(metadata["input_component_magnitudes"], dtype=np.float64)
             field_normalization = np.asarray(metadata["field_normalization"], dtype=np.complex128)
             normalization_mode = str(metadata["normalization_mode"])

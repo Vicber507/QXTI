@@ -538,6 +538,27 @@ def test_xtp_susceptibility_tensor_spectrum_builds_sparse_available_components()
     assert np.all(np.isnan(tensor2[:, :, 1, 0]))
     assert np.all(np.isnan(tensor2[:, :, 1, 1]))
 
+    sigma1 = xtp.conductivity_tensor_spectrum(order=1, input_direction="auto")
+    sigma_tensor1 = np.asarray(sigma1["tensor"], dtype=np.complex128)
+    sigma_available1 = np.asarray(sigma1["available_indices"], dtype=int)
+    assert sigma_tensor1.shape == (len(cmd.timegrid.frequency_axis()), 2, 2)
+    np.testing.assert_array_equal(sigma_available1, np.array([[0, 0], [1, 0]], dtype=int))
+    assert sigma1["input_direction"] == "x"
+    assert sigma1["normalization_mode"] == "pointwise_field_component"
+    assert np.any(np.isfinite(sigma_tensor1[:, 0, 0]))
+    assert np.all(np.isnan(sigma_tensor1[:, :, 1]))
+
+    sigma2 = xtp.conductivity_tensor_spectrum(order=2, input_direction="auto")
+    sigma_tensor2 = np.asarray(sigma2["tensor"], dtype=np.complex128)
+    sigma_available2 = np.asarray(sigma2["available_indices"], dtype=int)
+    assert sigma_tensor2.shape == (len(cmd.timegrid.frequency_axis()), 2, 2, 2)
+    np.testing.assert_array_equal(sigma_available2, np.array([[0, 0, 0], [1, 0, 0]], dtype=int))
+    assert sigma2["normalization_mode"] == "fixed_input_frequency_component"
+    assert np.any(np.isfinite(sigma_tensor2[:, 0, 0, 0]))
+    assert np.all(np.isnan(sigma_tensor2[:, :, 0, 1]))
+    assert np.all(np.isnan(sigma_tensor2[:, :, 1, 0]))
+    assert np.all(np.isnan(sigma_tensor2[:, :, 1, 1]))
+
 
 def test_susceptibility_data_serializes_xtp_tensor_spectra() -> None:
     cmd, operator_factory = build_cmd_stack(max_order=2)
@@ -562,6 +583,10 @@ def test_susceptibility_data_serializes_xtp_tensor_spectra() -> None:
     assert np.asarray(dataset["omega_axis"], dtype=float).shape == (len(cmd.timegrid.frequency_axis()),)
     assert np.asarray(dataset["chi_order_1_tensor"], dtype=np.complex128).shape == (22, 2, 2)
     assert np.asarray(dataset["chi_order_2_tensor"], dtype=np.complex128).shape == (22, 2, 2, 2)
+    assert np.asarray(dataset["sigma_order_1_tensor"], dtype=np.complex128).shape == (22, 2, 2)
+    assert np.asarray(dataset["sigma_order_2_tensor"], dtype=np.complex128).shape == (22, 2, 2, 2)
+    assert np.any(np.isfinite(np.asarray(dataset["sigma_order_1_tensor"], dtype=np.complex128)[:, 0, 0]))
+    assert np.any(np.isfinite(np.asarray(dataset["sigma_order_2_tensor"], dtype=np.complex128)[:, 0, 0, 0]))
 
 
 def test_xtp_first_order_polarization_matches_manual_bz_dipole_integral() -> None:

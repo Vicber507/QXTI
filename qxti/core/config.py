@@ -278,6 +278,7 @@ class XTPConfig:
     susceptibility_plot_overview_enabled: bool = True
     susceptibility_plot_grid_enabled: bool = True
     susceptibility_plot_components_enabled: bool = True
+    susceptibility_plot_conductivity_enabled: bool = True
     susceptibility_plot_ev_axis: bool = True
 
 @dataclass(slots=True)
@@ -640,6 +641,10 @@ class QXTIConfig:
             ),
             susceptibility_plot_components_enabled=section.getboolean(
                 "susceptibility_plot_components_enabled",
+                fallback=True,
+            ),
+            susceptibility_plot_conductivity_enabled=section.getboolean(
+                "susceptibility_plot_conductivity_enabled",
                 fallback=True,
             ),
             susceptibility_plot_ev_axis=section.getboolean(

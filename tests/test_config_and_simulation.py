@@ -179,6 +179,7 @@ def write_config_file(
             susceptibility_plot_overview_enabled = true
             susceptibility_plot_grid_enabled = true
             susceptibility_plot_components_enabled = true
+            susceptibility_plot_conductivity_enabled = true
             """
         )
     )
@@ -240,6 +241,7 @@ def test_qxti_config_parses_hamiltonian_and_plot_sections(tmp_path: Path) -> Non
     assert config.xtp.susceptibility_num_frequencies == 11
     assert np.isclose(config.xtp.susceptibility_eps, 1.0e-14)
     assert config.xtp.susceptibility_plot_enabled is False
+    assert config.xtp.susceptibility_plot_conductivity_enabled is True
 
 
 def test_simulation_builds_custom_hamiltonian_from_config(tmp_path: Path) -> None:
@@ -497,6 +499,40 @@ def test_response_graphics_skip_disabled_response_datasets(tmp_path: Path) -> No
     assert response_outputs == {}
 
 
+def test_susceptibility_scan_saves_current_based_conductivity_tensors(tmp_path: Path) -> None:
+    model_path = write_model_file(tmp_path)
+    config_path = write_config_file(
+        tmp_path,
+        model_path,
+        xtp_susceptibility_enabled=True,
+        xtp_susceptibility_orders="[1, 2]",
+        xtp_susceptibility_num_frequencies=2,
+    )
+
+    outputs = SusceptibilityScanRunner.from_file(config_path).run()
+    dataset = load_dataset_npz(outputs["xtp_susceptibility_data"])
+
+    sigma_order_1 = np.asarray(dataset["sigma_order_1_tensor"], dtype=np.complex128)
+    sigma_order_2 = np.asarray(dataset["sigma_order_2_tensor"], dtype=np.complex128)
+    sigma_order_1_indices = np.asarray(dataset["sigma_order_1_available_indices"], dtype=int)
+    sigma_order_2_indices = np.asarray(dataset["sigma_order_2_available_indices"], dtype=int)
+
+    assert sigma_order_1.shape == (2, 2, 2)
+    assert sigma_order_2.shape == (2, 2, 2, 2)
+    np.testing.assert_array_equal(
+        sigma_order_1_indices,
+        np.array([[0, 0], [0, 1], [1, 0], [1, 1]], dtype=int),
+    )
+    np.testing.assert_array_equal(
+        sigma_order_2_indices,
+        np.array([[0, 0, 0], [0, 1, 1], [1, 0, 0], [1, 1, 1]], dtype=int),
+    )
+    assert np.any(np.isfinite(sigma_order_1[:, 0, 0]))
+    assert np.any(np.isfinite(sigma_order_1[:, 1, 0]))
+    assert np.any(np.isfinite(sigma_order_2[:, 0, 0, 0]))
+    assert np.any(np.isfinite(sigma_order_2[:, 1, 0, 0]))
+
+
 def test_susceptibility_graphics_generate_outputs_from_saved_dataset(tmp_path: Path) -> None:
     if importlib.util.find_spec("matplotlib") is None:
         pytest.skip("matplotlib is not available in this environment.")
@@ -519,6 +555,9 @@ def test_susceptibility_graphics_generate_outputs_from_saved_dataset(tmp_path: P
     assert "susceptibility_order_1_grid" in outputs
     assert "susceptibility_order_1_xx" in outputs
     assert "susceptibility_order_1_yx" in outputs
+    assert "conductivity_order_1_grid" in outputs
+    assert "conductivity_order_1_xx" in outputs
+    assert "conductivity_order_1_yx" in outputs
     for path in outputs.values():
         assert path.exists()
         assert path.stat().st_size > 0
@@ -624,6 +663,7 @@ def test_susceptibility_scan_runner_accepts_special_solver_section_without_cmd(t
             susceptibility_omega_values = [0.7, 0.9]
             susceptibility_eps = 1.0e-14
             susceptibility_plot_enabled = true
+            susceptibility_plot_conductivity_enabled = true
 
             [susceptibility_solver]
             max_order = 1
@@ -650,11 +690,13 @@ def test_susceptibility_scan_runner_accepts_special_solver_section_without_cmd(t
     assert config.susceptibility_solver.max_order == 1
     assert config.xtp.susceptibility_enabled is True
     assert config.xtp.susceptibility_plot_enabled is True
+    assert config.xtp.susceptibility_plot_conductivity_enabled is True
 
     outputs = SusceptibilityScanRunner.from_file(config_path).run()
 
     assert "xtp_susceptibility_data" in outputs
     assert "susceptibility_order_1_overview" in outputs
+    assert "conductivity_order_1_overview" in outputs
     assert not (tmp_path / "cmd").exists()
     dataset = load_dataset_npz(outputs["xtp_susceptibility_data"])
     assert tuple(int(order) for order in dataset["orders"]) == (1,)

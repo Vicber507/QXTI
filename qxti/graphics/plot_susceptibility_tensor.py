@@ -36,6 +36,21 @@ DEFAULT_SUSCEPTIBILITY_PLOT_CONFIG = {
         "enabled": True,
         "output_file_template": "chi{order}_{label}.png",
     },
+    "conductivity": {
+        "enabled": True,
+        "overview": {
+            "enabled": True,
+            "output_file_template": "sigma{order}_overview.png",
+        },
+        "grid": {
+            "enabled": True,
+            "output_file_template": "sigma{order}_grid.png",
+        },
+        "components": {
+            "enabled": True,
+            "output_file_template": "sigma{order}_{label}.png",
+        },
+    },
 }
 
 # Edit this dictionary directly if you want to change the plotting behavior.
@@ -394,8 +409,8 @@ def _deep_update(target: dict[str, Any], updates: dict[str, Any]) -> None:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Generate susceptibility tensor plots from a dedicated laser-frequency "
-            "sweep dataset using the plot settings stored in [xtp]."
+            "Generate susceptibility and conductivity tensor plots from a dedicated "
+            "laser-frequency sweep dataset using the plot settings stored in [xtp]."
         )
     )
     parser.add_argument(

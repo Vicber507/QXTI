@@ -554,6 +554,66 @@ def plot_susceptibility_graphics_from_saved_data(
                 path = plotter.plot_component(component, output_path=output_path)
                 outputs[f"susceptibility_order_{order}_{label}"] = path
 
+        conductivity_cfg = resolved_plot_config.get("conductivity", {})
+        conductivity_tensor_key = f"sigma_order_{order}_tensor"
+        conductivity_indices_key = f"sigma_order_{order}_available_indices"
+        if isinstance(conductivity_cfg, dict) and bool(conductivity_cfg.get("enabled", False)):
+            if conductivity_tensor_key not in data:
+                print(
+                    f"[graphics] missing saved conductivity tensor for order {order}; "
+                    "rerun the susceptibility workflow to generate J/E conductivity plots."
+                )
+                continue
+
+            sigma_tensor = np.asarray(data[conductivity_tensor_key], dtype=np.complex128)[mask]
+            sigma_available_indices_array = np.asarray(
+                data.get(conductivity_indices_key, available_indices_array),
+                dtype=int,
+            )
+            sigma_available_components = [
+                tuple(int(index) for index in row)
+                for row in np.atleast_2d(sigma_available_indices_array)
+                if sigma_available_indices_array.size > 0
+            ]
+            sigma_plotter = SusceptibilityTensorPlotter(
+                x_axis=omega_axis,
+                tensor=sigma_tensor,
+                output_dir=order_dir,
+                x_label=r"$\omega_\mathrm{laser}\;(\mathrm{a.u.})$",
+                argument_label=r"\omega_\mathrm{laser}",
+                tensor_name=f"sigma{order}",
+                direction_labels=direction_labels,
+                available_components=sigma_available_components or None,
+                dpi=dpi,
+                include_ev_axis=include_ev_axis,
+            )
+
+            conductivity_overview_cfg = conductivity_cfg.get("overview", {})
+            if isinstance(conductivity_overview_cfg, dict) and bool(conductivity_overview_cfg.get("enabled", False)):
+                overview_path = sigma_plotter.plot_overview(
+                    output_path=order_dir / str(conductivity_overview_cfg["output_file_template"]).format(order=order),
+                )
+                outputs[f"conductivity_order_{order}_overview"] = overview_path
+
+            conductivity_grid_cfg = conductivity_cfg.get("grid", {})
+            if isinstance(conductivity_grid_cfg, dict) and bool(conductivity_grid_cfg.get("enabled", False)):
+                grid_path = sigma_plotter.plot_grid(
+                    output_path=order_dir / str(conductivity_grid_cfg["output_file_template"]).format(order=order),
+                )
+                outputs[f"conductivity_order_{order}_grid"] = grid_path
+
+            conductivity_components_cfg = conductivity_cfg.get("components", {})
+            if isinstance(conductivity_components_cfg, dict) and bool(conductivity_components_cfg.get("enabled", False)):
+                component_indices = list(sigma_plotter.component_indices())
+                for component in component_indices:
+                    label = "".join(direction_labels[index] for index in component)
+                    output_path = order_dir / str(conductivity_components_cfg["output_file_template"]).format(
+                        order=order,
+                        label=label,
+                    )
+                    path = sigma_plotter.plot_component(component, output_path=output_path)
+                    outputs[f"conductivity_order_{order}_{label}"] = path
+
     return outputs
 
 
@@ -600,13 +660,27 @@ def _resolve_susceptibility_plot_config_from_xtp(
             "enabled": bool(xtp.susceptibility_plot_components_enabled),
             "output_file_template": "chi{order}_{label}.png",
         },
+        "conductivity": {
+            "enabled": bool(xtp.susceptibility_plot_conductivity_enabled),
+            "overview": {
+                "enabled": bool(xtp.susceptibility_plot_overview_enabled),
+                "output_file_template": "sigma{order}_overview.png",
+            },
+            "grid": {
+                "enabled": bool(xtp.susceptibility_plot_grid_enabled),
+                "output_file_template": "sigma{order}_grid.png",
+            },
+            "components": {
+                "enabled": bool(xtp.susceptibility_plot_components_enabled),
+                "output_file_template": "sigma{order}_{label}.png",
+            },
+        },
     }
     resolved = resolve_susceptibility_plot_config()
     _deep_update_local(resolved, base)
     if overrides:
         _deep_update_local(resolved, overrides)
     return resolved
-
 
 def _deep_update_local(target: dict[str, object], updates: dict[str, object]) -> None:
     for key, value in updates.items():
