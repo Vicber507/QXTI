@@ -607,6 +607,38 @@ class CMD:
             equilibrium_tensor[ik] = np.broadcast_to(rho0_band, (nt, nb, nb)).copy()
         return equilibrium_tensor
 
+    def _scratch_file_matches(
+        self,
+        output_path: Path | None,
+        *,
+        nk: int,
+        nt: int,
+        nb: int,
+    ) -> bool:
+        """Return whether an existing scratch ``.npy`` matches the run dimensions.
+
+        Checks the on-disk shape without loading the data, supporting both the
+        native-complex layout ``(Nk, Nt, Nb, Nb)`` and the float16_complex
+        layout ``(Nk, Nt, Nb, Nb, 2)``.  Used to decide whether a checkpoint can
+        be safely resumed.
+        """
+        if output_path is None:
+            return False
+        path = Path(output_path)
+        if not path.exists():
+            return False
+        try:
+            existing = np.load(path, mmap_mode="r")
+        except Exception:
+            return False
+        try:
+            shape = existing.shape
+            expected_native = (nk, nt, nb, nb)
+            expected_f16 = (nk, nt, nb, nb, 2)
+            return shape == expected_native or shape == expected_f16
+        finally:
+            del existing
+
     @staticmethod
     def _estimate_physical_ram() -> int:
         """Return an estimate of the physical RAM in bytes."""
@@ -754,18 +786,44 @@ class CMD:
         # --- Checkpoint: check for a previous partial run ------------------
         import json as _json  # noqa: PLC0415
 
+        # Metadata written with every checkpoint so a resumed run can verify
+        # that the existing scratch file matches the current run dimensions.
+        checkpoint_meta = {
+            "order": order,
+            "nt": int(nt),
+            "nk": int(nk),
+            "nb": int(nb),
+            "dtype": self.rho_storage_dtype.name,
+        }
+
         resume_from_k: int = 0
         if checkpoint_path is not None and Path(checkpoint_path).exists():
             try:
                 ck = _json.loads(Path(checkpoint_path).read_text())
-                resume_from_k = int(ck.get("completed_k", 0))
-                if 0 < resume_from_k < nk:
+                completed_k = int(ck.get("completed_k", 0))
+                # The checkpoint is only valid if the run dimensions match what
+                # is on disk. If the user changed k_points, the time grid, or
+                # the storage dtype between runs, the partial scratch file is
+                # incompatible and must be discarded (restart this order).
+                meta_ok = all(
+                    int(ck.get(key, -1)) == checkpoint_meta[key]
+                    for key in ("nt", "nk", "nb")
+                ) and str(ck.get("dtype", "")) == checkpoint_meta["dtype"]
+                scratch_ok = self._scratch_file_matches(output_path, nk=nk, nt=nt, nb=nb)
+                if meta_ok and scratch_ok and 0 < completed_k < nk:
+                    resume_from_k = completed_k
                     self._emit_progress(
                         f"CMD checkpoint found: resuming order {order} from k-point "
                         f"{resume_from_k}/{nk} (skipping {resume_from_k} already solved k-points)."
                     )
                 else:
                     resume_from_k = 0
+                    if not (meta_ok and scratch_ok):
+                        self._emit_progress(
+                            f"CMD checkpoint for order {order} is incompatible with the "
+                            f"current run (grid/time/dtype changed). Ignoring it and "
+                            f"restarting this order from scratch."
+                        )
             except Exception:
                 resume_from_k = 0
 
@@ -865,7 +923,7 @@ class CMD:
                         if checkpoint_path is not None:
                             try:
                                 Path(checkpoint_path).write_text(
-                                    _json.dumps({"order": order, "completed_k": resume_from_k + done})
+                                    _json.dumps({**checkpoint_meta, "completed_k": resume_from_k + done})
                                 )
                             except OSError:
                                 pass
@@ -910,7 +968,7 @@ class CMD:
             if checkpoint_path is not None:
                 try:
                     Path(checkpoint_path).write_text(
-                        _json.dumps({"order": order, "completed_k": nk})
+                        _json.dumps({**checkpoint_meta, "completed_k": nk})
                     )
                 except OSError:
                     pass
@@ -931,7 +989,7 @@ class CMD:
                     if checkpoint_path is not None:
                         try:
                             Path(checkpoint_path).write_text(
-                                _json.dumps({"order": order, "completed_k": ik + 1})
+                                _json.dumps({**checkpoint_meta, "completed_k": ik + 1})
                             )
                         except OSError:
                             pass

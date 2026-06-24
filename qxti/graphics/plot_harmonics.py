@@ -787,6 +787,41 @@ class HarmonicGraphics:
         return output
 
     @staticmethod
+    @staticmethod
+    def _spectrum_edge_level(
+        *,
+        x_values: np.ndarray,
+        valid_series: list[tuple[str, np.ndarray, str]],
+        use_harmonic_order: bool,
+        max_harmonic_order: float | None,
+    ) -> float | None:
+        """Return the spectrum level near the highest visible harmonic.
+
+        Used to set the y-axis floor so the panel spans the visible harmonics
+        (H1..H_max) instead of the global noise floor. The level is taken as the
+        largest peak of any series within ``[max_harmonic_order - 1,
+        max_harmonic_order]`` (the last visible harmonic, e.g. H9 for a max of
+        10), which is robust against deep interference valleys exactly at the
+        edge. Returns ``None`` when the harmonic axis or window is unavailable.
+        """
+        if not use_harmonic_order or max_harmonic_order is None:
+            return None
+        x_arr = np.asarray(x_values, dtype=float)
+        lower = float(max_harmonic_order) - 1.0
+        upper = float(max_harmonic_order)
+        window = (x_arr >= lower) & (x_arr <= upper)
+        if not np.any(window):
+            return None
+        edge_values: list[float] = []
+        for _label, y_values, _color in valid_series:
+            segment = np.asarray(y_values, dtype=float)[window]
+            segment = segment[np.isfinite(segment) & (segment > 0.0)]
+            if segment.size:
+                edge_values.append(float(np.max(segment)))
+        if not edge_values:
+            return None
+        return max(edge_values)
+
     def _draw_multi_series_spectrum(
         axis: Any,
         *,
@@ -826,11 +861,24 @@ class HarmonicGraphics:
 
         baseline = 0.0
         if log_scale:
-            min_positive = min(positive_minima) if positive_minima else 1.0e-12
-            baseline = max(min_positive * 0.35, 1.0e-16)
             axis.set_yscale("log")
+            # Choose the y-axis floor at the spectrum level near the highest
+            # visible harmonic (x ~ max_harmonic_order) instead of the global
+            # noise floor. This fills the panel with the visible harmonics
+            # (H1..H_max) and crops the dead space below the last harmonic.
+            edge_level = HarmonicGraphics._spectrum_edge_level(
+                x_values=x_values,
+                valid_series=valid_series,
+                use_harmonic_order=use_harmonic_order,
+                max_harmonic_order=max_harmonic_order,
+            )
+            if edge_level is not None and edge_level > 0.0:
+                baseline = max(edge_level * 0.5, 1.0e-16)  # a little headroom below H_max
+            else:
+                min_positive = min(positive_minima) if positive_minima else 1.0e-12
+                baseline = max(min_positive * 0.35, 1.0e-16)
             if y_peak > 0.0:
-                axis.set_ylim(bottom=baseline, top=y_peak * 2.2)
+                axis.set_ylim(bottom=baseline, top=y_peak * 1.8)  # a little headroom above the peak
             else:
                 axis.set_ylim(bottom=baseline)
         else:
