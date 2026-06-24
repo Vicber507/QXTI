@@ -21,12 +21,23 @@ def _as_1d_float_array(values: ArrayLike, *, name: str) -> FloatArray:
 
 @dataclass(slots=True)
 class KGrid:
-    """Uniform or user-provided k-space grid compatible with Hamiltonian scans."""
+    """Uniform or user-provided k-space grid compatible with Hamiltonian scans.
+
+    When ``shifted`` is ``True`` the grid is a symmetric Monkhorst-Pack grid:
+    the points are offset by half a step so they never land on the Brillouin
+    zone edges or center.  This avoids placing a sample exactly on a band
+    degeneracy (e.g. the Dirac points of graphene), which would otherwise
+    inject a singular Berry-connection contribution and spuriously break
+    even-harmonic selection rules.  A shifted grid represents a *periodic*
+    sampling, so Brillouin-zone integrals use uniform (midpoint) weights
+    instead of the trapezoidal/Simpson rule used for edge-inclusive grids.
+    """
 
     kx_values: ArrayLike = field(default_factory=lambda: np.array([0.0], dtype=float))
     ky_values: ArrayLike = field(default_factory=lambda: np.array([0.0], dtype=float))
     kz_values: ArrayLike = field(default_factory=lambda: np.array([0.0], dtype=float))
     dimension: int = 3
+    shifted: bool = False
 
     def __post_init__(self) -> None:
         if self.dimension not in {1, 2, 3}:
@@ -77,6 +88,24 @@ class KGrid:
             kz_values=kz_values,
             dimension=dimension,
         )
+
+    @staticmethod
+    def shifted_axis(lower: float, upper: float, num_points: int) -> FloatArray:
+        """Return a symmetric Monkhorst-Pack axis on ``[lower, upper]``.
+
+        The points are ``k_i = c + (2i - N + 1) / N * L`` where ``c`` is the
+        interval center and ``L`` its half-width.  They are symmetric under
+        ``k -> -k`` about the center, uniformly spaced by ``2L/N``, and never
+        touch the endpoints ``lower``/``upper`` (so they never land on a BZ
+        edge).  For ``N`` odd this also skips the exact center.
+        """
+        n = int(num_points)
+        if n <= 0:
+            raise ValueError("num_points must be strictly positive.")
+        center = 0.5 * (float(lower) + float(upper))
+        half_width = 0.5 * (float(upper) - float(lower))
+        i = np.arange(n, dtype=float)
+        return np.asarray(center + (2.0 * i - n + 1.0) / n * half_width, dtype=np.float64)
 
     @property
     def shape(self) -> tuple[int, int, int]:

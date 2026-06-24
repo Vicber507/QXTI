@@ -308,6 +308,22 @@ def test_cmd_streaming_supports_complex64_storage(tmp_path: Path) -> None:
         np.testing.assert_allclose(actual_tensor, expected_tensor, atol=5.0e-6, rtol=5.0e-6)
 
 
+def test_cmd_streaming_supports_float16_complex_storage(tmp_path: Path) -> None:
+    cmd_streaming, _ = build_cmd_stack(max_order=2, rho_storage_dtype="float16_complex")
+    cmd_in_memory, _ = build_cmd_stack(max_order=2, rho_storage_dtype="complex128")
+
+    expected = cmd_in_memory.solve_time_domain_in_memory()
+    paths = cmd_streaming.solve_time_domain(tmp_path)
+
+    for order, expected_tensor in expected.items():
+        actual_tensor = expand_rho_tensor_time_axis(
+            np.load(paths[order], mmap_mode="r"),
+            nt=cmd_streaming.timegrid.Nt,
+        )
+        assert actual_tensor.dtype == np.complex64
+        np.testing.assert_allclose(actual_tensor, expected_tensor, atol=3.0e-3, rtol=3.0e-3)
+
+
 def test_response_population_heatmap_data_and_plot(tmp_path: Path) -> None:
     cmd, _ = build_cmd_stack(max_order=3)
     rho_orders = cmd.solve_time_domain_in_memory()
@@ -589,6 +605,32 @@ def test_susceptibility_data_serializes_xtp_tensor_spectra() -> None:
     assert np.any(np.isfinite(np.asarray(dataset["sigma_order_2_tensor"], dtype=np.complex128)[:, 0, 0, 0]))
 
 
+def _integration_weights_1d(coords: np.ndarray) -> np.ndarray:
+    """Return weights matching XTP._axis_integration_weights for test reference.
+
+    Uses composite Simpson's 1/3 rule for odd-count uniform grids (same logic
+    as XTP), and falls back to trapezoidal otherwise.
+    """
+    n = len(coords)
+    if n == 1:
+        return np.array([1.0])
+    diffs = np.diff(coords)
+    is_uniform = bool(np.allclose(diffs, diffs[0], rtol=1e-10, atol=0.0))
+    if is_uniform and n >= 3 and n % 2 == 1:
+        h = float(diffs[0])
+        w = np.full(n, 2.0 * h / 3.0)
+        w[0] = h / 3.0
+        w[-1] = h / 3.0
+        w[1:-1:2] = 4.0 * h / 3.0
+        return w
+    w = np.empty(n)
+    w[0] = 0.5 * float(diffs[0])
+    w[-1] = 0.5 * float(diffs[-1])
+    if n > 2:
+        w[1:-1] = 0.5 * (coords[2:] - coords[:-2])
+    return w
+
+
 def test_xtp_first_order_polarization_matches_manual_bz_dipole_integral() -> None:
     cmd, operator_factory = build_cmd_stack(
         max_order=1,
@@ -627,12 +669,17 @@ def test_xtp_first_order_polarization_matches_manual_bz_dipole_integral() -> Non
             optimize=True,
         )
 
+    # Compute reference using the same integration rule as XTP:
+    # kx has 3 points (odd, uniform) → composite Simpson's rule.
+    # ky has 2 points (even) → trapezoidal rule.
+    kx_coords = np.asarray(cmd.kgrid.kx_values, dtype=float)
+    ky_coords = np.asarray(cmd.kgrid.ky_values, dtype=float)
+    w_kx = _integration_weights_1d(kx_coords)
+    w_ky = _integration_weights_1d(ky_coords)
+
     grid_values = point_values.reshape(nkx, nky, nkz, nt)
-    manual = np.trapezoid(
-        np.trapezoid(grid_values[:, :, 0, :], x=np.asarray(cmd.kgrid.ky_values, dtype=float), axis=1),
-        x=np.asarray(cmd.kgrid.kx_values, dtype=float),
-        axis=0,
-    )
+    # manual[t] = sum_{i,j} w_kx[i] * w_ky[j] * grid_values[i, j, 0, t]
+    manual = np.einsum("i,j,ijt->t", w_kx, w_ky, grid_values[:, :, 0, :])
 
     np.testing.assert_allclose(polarization[:, 0], np.real(manual), atol=1.0e-9)
     np.testing.assert_allclose(polarization[:, 1:], 0.0, atol=1.0e-12)
@@ -722,10 +769,15 @@ def test_xtp_current_frequency_domain_matches_manual_fft_and_plot(tmp_path: Path
     assert current_spectrum.shape == (nfft, 3)
     assert np.max(np.abs(current_spectrum[:, 0])) > 0.0
 
-    harmonic_data = HarmonicData(
+    progress_events: list[tuple[int, str]] = []
+    harmonic_builder = HarmonicData(
         xtp,
         electric_field_time=cmd.laser_system.electric_field(cmd.timegrid.generate()),
-    ).current_spectrum_data()
+    )
+    expected_work_units = harmonic_builder.current_spectrum_work_units()
+    harmonic_data = harmonic_builder.current_spectrum_data(
+        progress_callback=lambda steps, message: progress_events.append((int(steps), str(message))),
+    )
     equilibrium_current = np.column_stack(
         [xtp.current(0, direction) for direction in ("x", "y")]
         + [np.zeros(len(cmd.timegrid), dtype=float)]
@@ -751,6 +803,10 @@ def test_xtp_current_frequency_domain_matches_manual_fft_and_plot(tmp_path: Path
     np.testing.assert_allclose(harmonic_data["current_time_total"], current_time, atol=1.0e-12)
     np.testing.assert_allclose(harmonic_data["current_time"], induced_current, atol=1.0e-12)
     np.testing.assert_allclose(harmonic_data["current_spectrum"], induced_spectrum, atol=1.0e-10)
+    assert expected_work_units > 0
+    assert sum(steps for steps, _message in progress_events if steps > 0) == expected_work_units
+    assert any("current(" in message for _steps, message in progress_events)
+    assert any("polarization(" in message for _steps, message in progress_events)
     assert bool(harmonic_data["current_decomposition_available"]) is True
     np.testing.assert_allclose(
         np.asarray(harmonic_data["current_time_intraband"], dtype=float)
@@ -815,7 +871,9 @@ def test_cmd_local_driving_components_match_full_tensor_build() -> None:
     )
 
     for ik in range(cmd.kgrid.total_points):
-        local = cmd._driving_components_for_k_index(rho, mesh, connection_cache, ik)
+        local = cmd._driving_components_for_k_index(
+            rho, mesh, connection_cache, ik, nt=len(cmd.timegrid)
+        )
         np.testing.assert_allclose(local, full[ik], atol=1.0e-10)
 
 

@@ -153,6 +153,7 @@ class KGridConfig:
     kx_values: list[float] = field(default_factory=list)
     ky_values: list[float] = field(default_factory=list)
     kz_values: list[float] = field(default_factory=list)
+    shifted: bool = False
 
 
 @dataclass(slots=True)
@@ -214,6 +215,7 @@ class CMDConfig:
     output_dir: str = "outputs/cmd"
     max_order: int = 1
     rho_storage_dtype: str = "complex128"
+    scratch_rho_storage_dtype: str = "auto"
     keep_rho_orders: bool = True
     dataset_time_stride: int = 1
     save_population_dataset: bool = True
@@ -239,6 +241,8 @@ class CMDConfig:
     solver_min_factor: float = 0.2
     solver_max_factor: float = 4.0
     save_frequency_domain: bool = False
+    # Number of parallel workers for the k-point loop (0 = use all logical CPUs).
+    n_workers: int = 0
 
 
 @dataclass(slots=True)
@@ -439,6 +443,7 @@ class QXTIConfig:
             kx_values=_parse_float_list(section.get("kx_values", fallback=""), default=[]),
             ky_values=_parse_float_list(section.get("ky_values", fallback=""), default=[]),
             kz_values=_parse_float_list(section.get("kz_values", fallback=""), default=[]),
+            shifted=section.getboolean("shifted", fallback=section.getboolean("monkhorst_pack", fallback=False)),
         )
 
     @staticmethod
@@ -531,7 +536,8 @@ class QXTIConfig:
             enabled=section.getboolean("enabled", fallback=False),
             output_dir=section.get("output_dir", fallback="outputs/cmd").strip() or "outputs/cmd",
             max_order=section.getint("max_order", fallback=1),
-            rho_storage_dtype=section.get("rho_storage_dtype", fallback="complex128").strip() or "complex128",
+            rho_storage_dtype=section.get("rho_storage_dtype", fallback="complex128").strip().lower() or "complex128",
+            scratch_rho_storage_dtype=section.get("scratch_rho_storage_dtype", fallback="auto").strip().lower() or "auto",
             keep_rho_orders=section.getboolean("keep_rho_orders", fallback=True),
             dataset_time_stride=max(1, section.getint("dataset_time_stride", fallback=1)),
             save_population_dataset=section.getboolean("save_population_dataset", fallback=True),
@@ -557,6 +563,7 @@ class QXTIConfig:
             solver_min_factor=section.getfloat("solver_min_factor", fallback=0.2),
             solver_max_factor=section.getfloat("solver_max_factor", fallback=4.0),
             save_frequency_domain=section.getboolean("save_frequency_domain", fallback=False),
+            n_workers=section.getint("n_workers", fallback=0),
         )
 
     @staticmethod

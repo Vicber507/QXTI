@@ -68,6 +68,7 @@ def write_config_file(
     model_path: Path,
     *,
     keep_rho_orders: bool = True,
+    scratch_rho_storage_dtype: str = "auto",
     dataset_time_stride: int = 1,
     save_population_dataset: bool = True,
     save_coherence_dataset: bool = True,
@@ -143,6 +144,7 @@ def write_config_file(
             output_dir = {tmp_path / "cmd"}
             max_order = 1
             rho_storage_dtype = complex64
+            scratch_rho_storage_dtype = {scratch_rho_storage_dtype}
             keep_rho_orders = {"true" if keep_rho_orders else "false"}
             dataset_time_stride = {dataset_time_stride}
             save_population_dataset = {"true" if save_population_dataset else "false"}
@@ -219,6 +221,7 @@ def test_qxti_config_parses_hamiltonian_and_plot_sections(tmp_path: Path) -> Non
     assert config.cmd.enabled is True
     assert config.cmd.max_order == 1
     assert config.cmd.rho_storage_dtype == "complex64"
+    assert config.cmd.scratch_rho_storage_dtype == "auto"
     assert config.cmd.dataset_time_stride == 1
     assert config.cmd.save_population_dataset is True
     assert config.cmd.save_coherence_dataset is True
@@ -384,6 +387,23 @@ def test_simulation_can_drop_rho_orders_after_generating_compact_datasets(tmp_pa
     assert "equilibrium_population_frame" in population_dataset
     assert "coherence_frames_complex" in coherence_dataset
     assert np.iscomplexobj(np.asarray(coherence_dataset["coherence_frames_complex"]))
+
+
+def test_simulation_auto_uses_float16_scratch_for_temporary_rho_storage(tmp_path: Path) -> None:
+    model_path = write_model_file(tmp_path)
+    config_path = write_config_file(
+        tmp_path,
+        model_path,
+        keep_rho_orders=False,
+        save_population_dataset=False,
+        save_coherence_dataset=False,
+        save_xtp_dataset=False,
+    )
+    simulation = QXTISimulation.from_file(config_path)
+
+    runtime_cmd_cfg = simulation._cmd_runtime_config()
+
+    assert runtime_cmd_cfg.rho_storage_dtype == "float16_complex"
 
 
 def test_simulation_cmd_datasets_can_subsample_time_axis(tmp_path: Path) -> None:

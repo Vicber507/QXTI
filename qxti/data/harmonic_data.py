@@ -1,14 +1,44 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
 from qxti.response import XTP
 
+ProgressCallback = Callable[[int, str], None]
+
 
 class HarmonicData:
-    """Build reusable spectral datasets from XTP observables."""
+    """Build reusable high-harmonic generation (HHG) spectral datasets.
+
+    Wraps an :class:`~qxti.response.XTP` instance and assembles a single
+    serialisable dictionary with all time- and frequency-domain observables
+    needed for HHG analysis and plotting.
+
+    **Harmonic spectrum.**  The induced (driven) current is defined as the
+    sum of all positive perturbative orders:
+
+        J_driven(t) = sum_{s=1}^{max_order} J^(s)(t)
+
+    Its FFT magnitude ``|J_driven(omega)|`` constitutes the HHG spectrum.
+    The equilibrium (s = 0) contribution is reported separately so that
+    callers can inspect or subtract it.
+
+    **Intraband/interband decomposition.**  When ``band_gauge_frame`` is
+    available in the XTP instance, the current is further decomposed into
+    intraband (diagonal in band basis, Bloch oscillation) and interband
+    (off-diagonal, optical transition) contributions.
+
+    Parameters
+    ----------
+    xtp:
+        Fully configured :class:`~qxti.response.XTP` instance whose
+        ``rho_orders`` contain at least one positive perturbative order.
+    electric_field_time:
+        Optional ``(Nt, 3)`` electric-field time series to include verbatim
+        in the output dataset (useful for normalisation or plotting).
+    """
 
     def __init__(
         self,
@@ -19,7 +49,39 @@ class HarmonicData:
         self.xtp = xtp
         self.electric_field_time = None if electric_field_time is None else np.asarray(electric_field_time, dtype=float)
 
-    def current_spectrum_data(self) -> dict[str, Any]:
+    def current_spectrum_work_units(self) -> int:
+        """Return one coarse estimate of the heavy k-space work in HHG dataset construction."""
+
+        selected_orders = tuple(order for order in self.xtp.orders if int(order) > 0)
+        if not selected_orders:
+            return 0
+
+        nk = int(self.xtp.kgrid.total_points)
+        num_directions = len(self.xtp.directions)
+        current_units = nk * sum(
+            1
+            for order in self.xtp.orders
+            for direction in self.xtp.directions
+            if (int(order), self.xtp._normalize_direction(direction)) not in self.xtp._current_cache
+        )
+        polarization_units = nk * num_directions * sum(
+            1 for order in self.xtp.orders if int(order) not in self.xtp._polarization_cache
+        )
+        decomposition_units = 0
+        if self.xtp.has_current_decomposition():
+            decomposition_units = nk * sum(
+                1
+                for order in selected_orders
+                for direction in self.xtp.directions
+                if (int(order), self.xtp._normalize_direction(direction)) not in self.xtp._current_decomposition_cache
+            )
+        return int(current_units + polarization_units + decomposition_units)
+
+    def current_spectrum_data(
+        self,
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> dict[str, Any]:
         """Return one serializable dataset for the induced current spectrum.
 
         Harmonic plots use the sum of every radiative order available in
@@ -33,13 +95,22 @@ class HarmonicData:
         if not selected_orders:
             raise ValueError("Harmonic spectra require at least one positive perturbative order.")
 
-        current_time_total = np.asarray(self.xtp.total_current(), dtype=float)
-        polarization_time_total = np.asarray(self.xtp.total_polarization(), dtype=float)
-        equilibrium_current_time = self._equilibrium_current_time()
-        equilibrium_polarization_time = self._equilibrium_polarization_time()
-        driven_current_time = self._current_time_for_orders(selected_orders)
-        driven_polarization_time = self._polarization_time_for_orders(selected_orders)
+        self._notify_progress(progress_callback, 0, "integrating total current")
+        current_time_total = np.asarray(
+            self.xtp.total_current(progress_callback=progress_callback),
+            dtype=float,
+        )
+        self._notify_progress(progress_callback, 0, "collecting equilibrium current")
+        equilibrium_current_time = self._equilibrium_current_time(progress_callback=progress_callback)
+        self._notify_progress(progress_callback, 0, "collecting equilibrium polarization")
+        equilibrium_polarization_time = self._equilibrium_polarization_time(progress_callback=progress_callback)
+        self._notify_progress(progress_callback, 0, "collecting driven current")
+        driven_current_time = self._current_time_for_orders(selected_orders, progress_callback=progress_callback)
+        self._notify_progress(progress_callback, 0, "collecting driven polarization")
+        driven_polarization_time = self._polarization_time_for_orders(selected_orders, progress_callback=progress_callback)
+        self._notify_progress(progress_callback, 0, "computing driven-current FFT")
         omega_axis, current_spectrum = self._fft_time_signal(driven_current_time)
+        self._notify_progress(progress_callback, 0, "computing total-current FFT")
         _, total_current_spectrum = self._fft_time_signal(current_time_total)
         current_total_magnitude = np.sqrt(np.sum(np.abs(current_spectrum) ** 2, axis=1))
         data = {
@@ -61,8 +132,14 @@ class HarmonicData:
             "bz_mask": self.xtp.bz_mask_summary(),
         }
         if self.xtp.has_current_decomposition():
-            intraband_time, interband_time = self._current_decomposition_for_orders(selected_orders)
+            self._notify_progress(progress_callback, 0, "integrating intraband/interband current")
+            intraband_time, interband_time = self._current_decomposition_for_orders(
+                selected_orders,
+                progress_callback=progress_callback,
+            )
+            self._notify_progress(progress_callback, 0, "computing intraband FFT")
             _, intraband_spectrum = self._fft_time_signal(intraband_time)
+            self._notify_progress(progress_callback, 0, "computing interband FFT")
             _, interband_spectrum = self._fft_time_signal(interband_time)
             data.update(
                 {
@@ -84,47 +161,79 @@ class HarmonicData:
         else:
             data["current_decomposition_available"] = False
         if self.xtp.kgrid.dimension == 2:
+            self._notify_progress(progress_callback, 0, "packing Brillouin-zone mask data")
             data.update(self.xtp.bz_mask_plot_data())
         if self.electric_field_time is not None:
             data["electric_field_time"] = np.asarray(self.electric_field_time, dtype=float)
+        self._notify_progress(progress_callback, 0, "packing current-spectrum dataset")
         return data
 
-    def _equilibrium_current_time(self) -> np.ndarray:
+    def _equilibrium_current_time(
+        self,
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> np.ndarray:
         if 0 not in self.xtp.orders or len(self.xtp.orders) <= 1:
             return np.zeros((len(self.xtp.timegrid), 3), dtype=float)
 
         equilibrium = np.zeros((len(self.xtp.timegrid), 3), dtype=float)
         for direction in self.xtp.directions:
             axis = self.xtp._direction_axis(direction)
-            equilibrium[:, axis] = self.xtp.current(0, direction)
+            equilibrium[:, axis] = self.xtp.current(0, direction, progress_callback=progress_callback)
         return equilibrium
 
-    def _equilibrium_polarization_time(self) -> np.ndarray:
+    def _equilibrium_polarization_time(
+        self,
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> np.ndarray:
         if 0 not in self.xtp.orders or len(self.xtp.orders) <= 1:
             return np.zeros((len(self.xtp.timegrid), 3), dtype=float)
-        return np.asarray(self.xtp.polarization(0), dtype=float)
+        return np.asarray(self.xtp.polarization(0, progress_callback=progress_callback), dtype=float)
 
-    def _current_time_for_orders(self, orders: tuple[int, ...]) -> np.ndarray:
+    def _current_time_for_orders(
+        self,
+        orders: tuple[int, ...],
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> np.ndarray:
         current = np.zeros((len(self.xtp.timegrid), 3), dtype=float)
         for order in orders:
             for direction in self.xtp.directions:
                 axis = self.xtp._direction_axis(direction)
-                current[:, axis] += self.xtp.current(order, direction)
+                current[:, axis] += self.xtp.current(order, direction, progress_callback=progress_callback)
         return current
 
-    def _polarization_time_for_orders(self, orders: tuple[int, ...]) -> np.ndarray:
+    def _polarization_time_for_orders(
+        self,
+        orders: tuple[int, ...],
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> np.ndarray:
         polarization = np.zeros((len(self.xtp.timegrid), 3), dtype=float)
         for order in orders:
-            polarization += np.asarray(self.xtp.polarization(order), dtype=float)
+            polarization += np.asarray(
+                self.xtp.polarization(order, progress_callback=progress_callback),
+                dtype=float,
+            )
         return polarization
 
-    def _current_decomposition_for_orders(self, orders: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray]:
+    def _current_decomposition_for_orders(
+        self,
+        orders: tuple[int, ...],
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
         intraband = np.zeros((len(self.xtp.timegrid), 3), dtype=float)
         interband = np.zeros((len(self.xtp.timegrid), 3), dtype=float)
         for order in orders:
             for direction in self.xtp.directions:
                 axis = self.xtp._direction_axis(direction)
-                parts = self.xtp.current_decomposition(order, direction)
+                parts = self.xtp.current_decomposition(
+                    order,
+                    direction,
+                    progress_callback=progress_callback,
+                )
                 intraband[:, axis] += np.asarray(parts["intraband"], dtype=float)
                 interband[:, axis] += np.asarray(parts["interband"], dtype=float)
         return intraband, interband
@@ -143,3 +252,12 @@ class HarmonicData:
         spectrum = self.xtp.timegrid.dt * np.fft.fft(weighted, n=nfft, axis=0)
         omega_axis = np.asarray(self.xtp.timegrid.frequency_axis(), dtype=np.float64)
         return omega_axis, np.asarray(spectrum, dtype=np.complex128)
+
+    @staticmethod
+    def _notify_progress(
+        progress_callback: ProgressCallback | None,
+        steps: int,
+        message: str,
+    ) -> None:
+        if progress_callback is not None:
+            progress_callback(int(steps), str(message))
