@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, replace
+import os
 from pathlib import Path
 import time
 from typing import Any
@@ -8,7 +10,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
-from qxti.core.config import QXTIConfig
+from qxti.core.config import CMDConfig, LaserConfig, QXTIConfig
 from qxti.core.simulation import QXTISimulation
 from qxti.data import save_dataset_npz
 from qxti.response import SusceptibilityTensorCalculator, XTP
@@ -17,6 +19,155 @@ from qxti.utils.progress import ProgressTimer, format_bytes, format_duration
 
 ComplexArray = NDArray[np.complex128]
 RealArray = NDArray[np.float64]
+
+
+def _resolve_scan_solver_config(config: QXTIConfig) -> CMDConfig:
+    """Return the solver config used for susceptibility probes."""
+    scan_solver = config.susceptibility_solver
+    if scan_solver != type(scan_solver)():
+        return scan_solver
+    return config.cmd
+
+
+def _build_probe_laser_config(laser_config: LaserConfig, direction: str, omega: float) -> LaserConfig:
+    """Return a single-pulse laser config polarized along one Cartesian axis."""
+    if direction == "x":
+        thetaz, phiz, phix = 0.0, 0.0, 0.0
+    elif direction == "y":
+        thetaz, phiz, phix = 0.0, 0.0, 0.5 * np.pi
+    elif direction == "z":
+        thetaz, phiz, phix = -0.5 * np.pi, 0.0, 0.0
+    else:
+        raise ValueError(f"Unsupported Cartesian probe direction {direction!r}.")
+    return replace(
+        laser_config,
+        omega=float(omega),
+        ellip=0.0,
+        phix=float(phix),
+        thetaz=float(thetaz),
+        phiz=float(phiz),
+        pulses=[],
+    )
+
+
+def _compute_frequency_tensor_values(
+    xtp_by_direction: dict[str, XTP],
+    *,
+    input_omega: float,
+    orders: tuple[int, ...],
+    direction_labels: tuple[str, ...],
+    dimension: int,
+    eps: float,
+) -> dict[str, Any]:
+    """Compute one frequency's susceptibility/conductivity tensor rows.
+
+    Returns a dict (not the full dataset) with the per-order tensor rows and the
+    sampled FFT frequencies, so it can be returned cheaply from a worker process.
+    """
+    calculator = SusceptibilityTensorCalculator(xtp_by_direction, eps=eps)
+    result: dict[str, Any] = {
+        "chi": {},
+        "sigma": {},
+        "chi_sampled": {},
+        "sigma_sampled": {},
+        "bz_mask": xtp_by_direction[direction_labels[0]].bz_mask_summary(),
+    }
+
+    if 1 in orders:
+        omega_axis, chi_tensor = calculator.chi1()
+        omega_index = XTP._nearest_frequency_index(
+            np.asarray(omega_axis, dtype=np.float64), float(input_omega), prefer_positive=True
+        )
+        result["chi"][1] = np.asarray(chi_tensor[omega_index, :dimension, :dimension], dtype=np.complex128)
+        result["chi_sampled"][1] = float(omega_axis[omega_index])
+
+        sigma_row = np.full((dimension, dimension), np.nan + 1.0j * np.nan, dtype=np.complex128)
+        sigma_sampled = np.nan
+        for input_axis, direction in enumerate(direction_labels):
+            xtp = xtp_by_direction[direction]
+            sigma_omega_axis, sigma_column = xtp.linear_conductivity(input_direction=direction, eps=eps)
+            sigma_omega_index = XTP._nearest_frequency_index(
+                np.asarray(sigma_omega_axis, dtype=np.float64), float(input_omega), prefer_positive=True
+            )
+            sigma_row[:, input_axis] = np.asarray(sigma_column[sigma_omega_index, :dimension], dtype=np.complex128)
+            sigma_sampled = float(sigma_omega_axis[sigma_omega_index])
+        result["sigma"][1] = sigma_row
+        result["sigma_sampled"][1] = sigma_sampled
+
+    for order in orders:
+        if order == 1:
+            continue
+        tensor_shape = (dimension,) * (order + 1)
+        chi_row = np.full(tensor_shape, np.nan + 1.0j * np.nan, dtype=np.complex128)
+        sigma_row = np.full(tensor_shape, np.nan + 1.0j * np.nan, dtype=np.complex128)
+        target_output_omega = float(order * input_omega)
+        chi_sampled = np.nan
+        sigma_sampled = np.nan
+        for input_axis, direction in enumerate(direction_labels):
+            xtp = xtp_by_direction[direction]
+            omega_axis, chi_column, _meta = xtp.effective_susceptibility_spectrum(
+                order=order, input_direction=direction, input_omega=input_omega, eps=eps
+            )
+            omega_index = XTP._nearest_frequency_index(
+                np.asarray(omega_axis, dtype=np.float64), target_output_omega, prefer_positive=True
+            )
+            chi_row[(slice(None),) + (input_axis,) * order] = np.asarray(
+                chi_column[omega_index, :dimension], dtype=np.complex128
+            )
+            chi_sampled = float(omega_axis[omega_index])
+
+            sigma_omega_axis, sigma_column, _meta = xtp.effective_conductivity_spectrum(
+                order=order, input_direction=direction, input_omega=input_omega, eps=eps
+            )
+            sigma_omega_index = XTP._nearest_frequency_index(
+                np.asarray(sigma_omega_axis, dtype=np.float64), target_output_omega, prefer_positive=True
+            )
+            sigma_row[(slice(None),) + (input_axis,) * order] = np.asarray(
+                sigma_column[sigma_omega_index, :dimension], dtype=np.complex128
+            )
+            sigma_sampled = float(sigma_omega_axis[sigma_omega_index])
+        result["chi"][order] = chi_row
+        result["sigma"][order] = sigma_row
+        result["chi_sampled"][order] = chi_sampled
+        result["sigma_sampled"][order] = sigma_sampled
+
+    return result
+
+
+def _susceptibility_frequency_worker(payload: tuple) -> tuple[int, dict[str, Any]]:
+    """Top-level worker: solve all Cartesian probes at one laser frequency.
+
+    Runs in a separate process. The internal CMD k-loop is forced to a single
+    thread because parallelism comes from the process pool (one frequency per
+    process), avoiding core oversubscription.
+    """
+    config, index, input_omega, orders, eps, max_order, dimension, direction_labels = payload
+    simulation = QXTISimulation(config=config)
+    hamiltonian = simulation.build_hamiltonian()
+    solver_config = replace(_resolve_scan_solver_config(config), n_workers=1)
+
+    xtp_by_direction: dict[str, XTP] = {}
+    for direction in direction_labels:
+        cmd = simulation.build_cmd(
+            hamiltonian,
+            cmd_config=solver_config,
+            laser_system=simulation.build_laser_system(
+                _build_probe_laser_config(config.laser, direction, input_omega)
+            ),
+            max_order=max_order,
+        )
+        rho_orders = cmd.compute_all_orders()
+        xtp_by_direction[direction] = simulation.build_xtp(cmd, rho_orders)
+
+    values = _compute_frequency_tensor_values(
+        xtp_by_direction,
+        input_omega=float(input_omega),
+        orders=tuple(orders),
+        direction_labels=tuple(direction_labels),
+        dimension=int(dimension),
+        eps=float(eps),
+    )
+    return int(index), values
 
 
 @dataclass(slots=True)
@@ -62,57 +213,53 @@ class SusceptibilityScanRunner:
             dimension=hamiltonian.dimension,
         )
 
-        total_probe_runs = len(laser_omega_axis) * len(direction_labels)
-        probe_timer = ProgressTimer(total=total_probe_runs)
         frequency_timer = ProgressTimer(total=len(laser_omega_axis))
+        max_order = max(requested_orders)
+        n_workers = self._resolve_n_workers(
+            nfreq=len(laser_omega_axis),
+            ndir=len(direction_labels),
+            max_order=max_order,
+        )
 
-        for index, laser_omega in enumerate(laser_omega_axis):
-            frequency_start = time.perf_counter()
-            self._emit_progress(
-                f"Susceptibility frequency {index + 1}/{len(laser_omega_axis)}: "
-                f"omega_laser={laser_omega:.6f} a.u., running Cartesian probes."
+        # Build one payload per laser frequency (the natural parallel unit, since
+        # every Cartesian probe of a frequency is needed together to assemble chi).
+        payloads = [
+            (
+                self.config,
+                index,
+                float(laser_omega),
+                requested_orders,
+                xtp_cfg.susceptibility_eps,
+                max_order,
+                hamiltonian.dimension,
+                direction_labels,
             )
+            for index, laser_omega in enumerate(laser_omega_axis)
+        ]
 
-            xtp_by_direction: dict[str, XTP] = {}
-            for direction in direction_labels:
-                probe_start = time.perf_counter()
-                cmd = simulation.build_cmd(
-                    hamiltonian,
-                    cmd_config=solver_config,
-                    laser_system=simulation.build_laser_system(
-                        self._probe_laser_config(direction=direction, omega=laser_omega)
-                    ),
-                    max_order=max(requested_orders),
-                )
-                rho_orders = cmd.compute_all_orders()
-                xtp = simulation.build_xtp(cmd, rho_orders)
-                xtp_by_direction[direction] = xtp
-                if "bz_mask" not in dataset:
-                    dataset["bz_mask"] = xtp.bz_mask_summary()
-
-                probe_timer.advance()
+        if n_workers <= 1:
+            self._emit_progress("Susceptibility sweep: running serially (n_workers=1).")
+            results_iter = (_susceptibility_frequency_worker(payload) for payload in payloads)
+            for index, values in results_iter:
+                self._write_frequency_result(dataset, index, values)
+                frequency_timer.advance()
                 self._emit_progress(
-                    f"Susceptibility probe {probe_timer.completed}/{probe_timer.total}: "
-                    f"omega_laser={laser_omega:.6f} a.u., direction={direction} "
-                    f"completed in {format_duration(time.perf_counter() - probe_start)} "
-                    f"({self._runtime_suffix(probe_timer)})."
+                    f"Susceptibility frequency {frequency_timer.completed}/{len(laser_omega_axis)} "
+                    f"assembled ({self._runtime_suffix(frequency_timer)})."
                 )
-
-            self._accumulate_frequency_point(
-                dataset,
-                index=index,
-                input_omega=laser_omega,
-                orders=requested_orders,
-                direction_labels=direction_labels,
-                xtp_by_direction=xtp_by_direction,
-                eps=xtp_cfg.susceptibility_eps,
-            )
-            frequency_timer.advance()
+        else:
             self._emit_progress(
-                f"Susceptibility frequency {index + 1}/{len(laser_omega_axis)} assembled "
-                f"in {format_duration(time.perf_counter() - frequency_start)} "
-                f"({self._runtime_suffix(frequency_timer)})."
+                f"Susceptibility sweep: parallelizing {len(laser_omega_axis)} frequencies "
+                f"over {n_workers} processes (each process uses 1 thread for its k-loop)."
             )
+            with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                for index, values in executor.map(_susceptibility_frequency_worker, payloads):
+                    self._write_frequency_result(dataset, index, values)
+                    frequency_timer.advance()
+                    self._emit_progress(
+                        f"Susceptibility frequency {frequency_timer.completed}/{len(laser_omega_axis)} "
+                        f"assembled ({self._runtime_suffix(frequency_timer)})."
+                    )
 
         output_dir = Path(xtp_cfg.susceptibility_output_dir) / "data"
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -281,6 +428,68 @@ class SusceptibilityScanRunner:
                 else "sampled_repeated_axis_effective_current_response"
             )
         return data
+
+    def _write_frequency_result(
+        self,
+        dataset: dict[str, Any],
+        index: int,
+        values: dict[str, Any],
+    ) -> None:
+        """Write one worker's per-frequency tensor rows into the dataset."""
+        if "bz_mask" not in dataset and values.get("bz_mask") is not None:
+            dataset["bz_mask"] = values["bz_mask"]
+        for order, row in values["chi"].items():
+            np.asarray(dataset[f"chi_order_{order}_tensor"])[index] = row
+            dataset[f"chi_order_{order}_sampled_fft_omega"][index] = values["chi_sampled"][order]
+        for order, row in values["sigma"].items():
+            np.asarray(dataset[f"sigma_order_{order}_tensor"])[index] = row
+            dataset[f"sigma_order_{order}_sampled_fft_omega"][index] = values["sigma_sampled"][order]
+
+    def _resolve_n_workers(self, *, nfreq: int, ndir: int, max_order: int) -> int:
+        """Return a RAM-bounded process count for the frequency sweep.
+
+        Each process holds the in-memory density matrices of all orders for the
+        current frequency, ``(max_order+1) * Nk * Nt * Nb^2`` complex128 values,
+        plus FFT temporaries.  The count is capped so the total stays within a
+        fraction of physical RAM, and never exceeds the CPU count or the number
+        of frequencies.  ``susceptibility_n_workers = 0`` selects this automatic
+        value; a positive value overrides it (still clamped to nfreq).
+        """
+        del ndir
+        requested = int(self.config.xtp.susceptibility_n_workers)
+        cpu = os.cpu_count() or 1
+
+        simulation = QXTISimulation(config=self.config)
+        hamiltonian = simulation.build_hamiltonian()
+        kgrid = simulation.build_kgrid(hamiltonian)
+        nk = kgrid.total_points
+        nb = hamiltonian.basis_size
+        low_omega = float(np.min(self._resolve_laser_omega_axis()))
+        laser_system = simulation.build_laser_system(
+            _build_probe_laser_config(self.config.laser, "x", low_omega)
+        )
+        nt = simulation.build_timegrid(laser_system).Nt
+        # 3x margin for FFT/operator temporaries created during the solve.
+        bytes_per_proc = int((max_order + 1) * nk * nt * nb * nb * 16 * 3)
+        ram = self._available_ram()
+        by_ram = max(1, int(ram * 0.6 / max(bytes_per_proc, 1)))
+
+        auto = min(cpu, nfreq, by_ram)
+        n = auto if requested <= 0 else min(requested, nfreq)
+        n = max(1, n)
+        self._emit_progress(
+            f"Susceptibility sweep workers: {n} "
+            f"(cpu={cpu}, nfreq={nfreq}, RAM-cap={by_ram}, "
+            f"~{format_bytes(bytes_per_proc)}/process, Nk={nk}, Nt={nt})."
+        )
+        return n
+
+    @staticmethod
+    def _available_ram() -> int:
+        try:
+            return int(os.sysconf("SC_PHYS_PAGES")) * int(os.sysconf("SC_PAGE_SIZE"))
+        except (AttributeError, ValueError, OSError):
+            return 8 * 1024 ** 3
 
     def _accumulate_frequency_point(
         self,

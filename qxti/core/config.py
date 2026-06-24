@@ -271,6 +271,8 @@ class XTPConfig:
     susceptibility_num_frequencies: int = 11
     susceptibility_omega_values: tuple[float, ...] = field(default_factory=tuple)
     susceptibility_eps: float = 1.0e-14
+    # Parallel processes for the laser-frequency sweep (0 = auto, RAM-bounded).
+    susceptibility_n_workers: int = 0
     susceptibility_plot_enabled: bool = False
     susceptibility_plot_output_dir: str = ""
     susceptibility_plot_dataset_file: str = "xtp_susceptibility.npz"
@@ -617,6 +619,7 @@ class QXTIConfig:
                 _parse_float_list(section.get("susceptibility_omega_values", fallback=""), default=[])
             ),
             susceptibility_eps=section.getfloat("susceptibility_eps", fallback=1.0e-14),
+            susceptibility_n_workers=section.getint("susceptibility_n_workers", fallback=0),
             susceptibility_plot_enabled=section.getboolean("susceptibility_plot_enabled", fallback=False),
             susceptibility_plot_output_dir=section.get("susceptibility_plot_output_dir", fallback="").strip(),
             susceptibility_plot_dataset_file=section.get(
