@@ -58,11 +58,17 @@ class StreamingCurrentAccumulator:
         self._dipole_ops = {k: np.asarray(v, dtype=np.complex128) for k, v in dipole_operators.items()}
         self._directions = self._DIRECTIONS[:max(1, min(3, int(active_dimension)))]
         self._current: dict[int, ComplexArray] = {}
+        self._current_intra: dict[int, ComplexArray] = {}
         self._polarization: dict[int, ComplexArray] = {}
         self._lock = threading.Lock()
 
     def accumulate(self, order: int, ik: int, rho_series: ComplexArray) -> None:
         """Accumulate one k-point ``ik`` for perturbative order ``order``.
+
+        Also accumulates the *intraband* current (the band-diagonal part,
+        ``J_intra = sum_n v_nn rho_nn``); the interband current is recovered as
+        ``J_total - J_intra``.  The diagonal contraction is cheap compared with
+        the full ``mn,tnm`` trace.
 
         Parameters
         ----------
@@ -76,24 +82,30 @@ class StreamingCurrentAccumulator:
         w = float(self._weights[ik])
         rho = np.asarray(rho_series, dtype=np.complex128)
         nt = rho.shape[0]
+        rho_diag = np.diagonal(rho, axis1=1, axis2=2)  # (Nt, Nb)
 
         # Compute contributions locally (no lock needed for reads).
         j_contrib = np.zeros((nt, 3), dtype=np.complex128)
+        j_intra_contrib = np.zeros((nt, 3), dtype=np.complex128)
         p_contrib = np.zeros((nt, 3), dtype=np.complex128)
         for axis, direction in enumerate(self._directions):
             v = self._current_ops[direction][ik]   # (Nb, Nb)
             d = self._dipole_ops[direction][ik]    # (Nb, Nb)
             j_contrib[:, axis] = np.einsum("mn,tnm->t", v, rho, optimize=True)
+            j_intra_contrib[:, axis] = np.einsum("n,tn->t", np.diagonal(v), rho_diag, optimize=True)
             p_contrib[:, axis] = np.einsum("mn,tnm->t", d, rho, optimize=True)
         j_contrib *= w
+        j_intra_contrib *= w
         p_contrib *= w
 
         # Atomic accumulation — only the += needs the lock.
         with self._lock:
             if order not in self._current:
                 self._current[order] = np.zeros((nt, 3), dtype=np.complex128)
+                self._current_intra[order] = np.zeros((nt, 3), dtype=np.complex128)
                 self._polarization[order] = np.zeros((nt, 3), dtype=np.complex128)
             self._current[order] += j_contrib
+            self._current_intra[order] += j_intra_contrib
             self._polarization[order] += p_contrib
 
     def accumulate_equilibrium(self, order: int, ik: int, rho0: ComplexArray) -> None:
@@ -104,19 +116,24 @@ class StreamingCurrentAccumulator:
         w = float(self._weights[ik])
         rho = np.asarray(rho0, dtype=np.complex128)
 
+        rho_diag = np.diagonal(rho)  # (Nb,)
         j_contrib = np.zeros(3, dtype=np.complex128)
+        j_intra_contrib = np.zeros(3, dtype=np.complex128)
         p_contrib = np.zeros(3, dtype=np.complex128)
         for axis, direction in enumerate(self._directions):
             v = self._current_ops[direction][ik]
             d = self._dipole_ops[direction][ik]
             j_contrib[axis] = w * np.einsum("mn,nm->", v, rho, optimize=True)
+            j_intra_contrib[axis] = w * np.einsum("n,n->", np.diagonal(v), rho_diag, optimize=True)
             p_contrib[axis] = w * np.einsum("mn,nm->", d, rho, optimize=True)
 
         with self._lock:
             if order not in self._current:
                 self._current[order] = np.zeros((self._nt, 3), dtype=np.complex128)
+                self._current_intra[order] = np.zeros((self._nt, 3), dtype=np.complex128)
                 self._polarization[order] = np.zeros((self._nt, 3), dtype=np.complex128)
             self._current[order] += j_contrib[np.newaxis, :]
+            self._current_intra[order] += j_intra_contrib[np.newaxis, :]
             self._polarization[order] += p_contrib[np.newaxis, :]
 
     def make_callback(self, order: int) -> Callable[[int, ComplexArray], None]:
@@ -140,6 +157,17 @@ class StreamingCurrentAccumulator:
         if arr is None:
             return np.zeros((self._nt, 3), dtype=np.float64)
         return np.asarray(np.real(arr), dtype=np.float64)
+
+    def current_intra_time(self, order: int) -> RealArray:
+        """Return the real part of the intraband current J_intra^(order)(t)."""
+        arr = self._current_intra.get(order)
+        if arr is None:
+            return np.zeros((self._nt, 3), dtype=np.float64)
+        return np.asarray(np.real(arr), dtype=np.float64)
+
+    def current_inter_time(self, order: int) -> RealArray:
+        """Return the interband current J_inter = J_total - J_intra for one order."""
+        return self.current_time(order) - self.current_intra_time(order)
 
     def available_orders(self) -> tuple[int, ...]:
         return tuple(sorted(self._current))

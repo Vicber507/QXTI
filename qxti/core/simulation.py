@@ -614,8 +614,16 @@ class QXTISimulation:
             omega = np.asarray(cmd.timegrid.frequency_axis(), dtype=float)
             return omega, np.asarray(spectrum, dtype=np.complex128)
 
+        # Intraband / interband decomposition of the driven current.
+        driven_intra = np.zeros((nt, 3), dtype=np.float64)
+        for s in driven_orders:
+            driven_intra += acc.current_intra_time(s)
+        driven_inter = driven_current - driven_intra
+
         omega_axis, current_spectrum = _fft(driven_current)
         _, total_current_spectrum = _fft(total_current)
+        _, intraband_spectrum = _fft(driven_intra)
+        _, interband_spectrum = _fft(driven_inter)
         current_total_magnitude = np.sqrt(np.sum(np.abs(current_spectrum) ** 2, axis=1))
 
         electric_field_time = np.asarray(
@@ -648,7 +656,18 @@ class QXTISimulation:
                 "sigma": 0.0,
             },
             "electric_field_time": electric_field_time,
-            "current_decomposition_available": False,
+            # Intraband/interband decomposition (streamed at no extra k-loop cost).
+            "current_decomposition_available": True,
+            "current_time_intraband": driven_intra,
+            "current_time_interband": driven_inter,
+            "current_spectrum_intraband": np.asarray(intraband_spectrum, dtype=np.complex128),
+            "current_spectrum_interband": np.asarray(interband_spectrum, dtype=np.complex128),
+            "current_total_magnitude_intraband": np.sqrt(
+                np.sum(np.abs(intraband_spectrum) ** 2, axis=1)
+            ).astype(float),
+            "current_total_magnitude_interband": np.sqrt(
+                np.sum(np.abs(interband_spectrum) ** 2, axis=1)
+            ).astype(float),
         }
 
         step_timer = ProgressTimer(total=1)
