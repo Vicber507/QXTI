@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Event, Thread
 import time
@@ -11,13 +11,14 @@ import numpy as np
 from numpy.typing import NDArray
 
 from qxti.core.config import CMDConfig, LaserConfig, QXTIConfig
-from qxti.data import HarmonicData, HamiltonianData, ResponseData, save_dataset_npz
+from qxti.data import HarmonicData, HamiltonianData, ResponseData, StreamingCurrentAccumulator, save_dataset_npz
 from qxti.grids import FrequencyGrid, KGrid, TimeGrid
 from qxti.physics import CustomHamiltonian, Hamiltonian, Laser, LaserSystem, OperatorFactory
 from qxti.response import CMD, XTP
+from qxti.response.xtp import XTP as _XTPClass
 from qxti.solvers import AdamsBashforth2Solver, RKF45Solver, Solver
 from qxti.utils.io_utils import expand_rho_tensor_time_axis, save_array_npy
-from qxti.utils.progress import ProgressTimer, format_bytes, format_duration
+from qxti.utils.progress import DetailedProgressReporter, ProgressTimer, format_bytes, format_duration
 
 
 ComplexArray = NDArray[np.complex128]
@@ -62,49 +63,115 @@ class QXTISimulation:
     def build_kgrid(self, hamiltonian: Hamiltonian) -> KGrid:
         kcfg = self.config.kgrid
         dimension = kcfg.dimension if kcfg.dimension is not None else hamiltonian.dimension
+        shifted = bool(getattr(kcfg, "shifted", False))
 
         if kcfg.kx_values or kcfg.ky_values or kcfg.kz_values:
+            # Explicit user-provided axes are used verbatim (no auto-shift).
             kx_values = np.asarray(kcfg.kx_values or [0.0], dtype=float)
             ky_values = np.asarray(kcfg.ky_values or [0.0], dtype=float)
             kz_values = np.asarray(kcfg.kz_values or [0.0], dtype=float)
+            kgrid = KGrid(
+                kx_values=kx_values,
+                ky_values=ky_values,
+                kz_values=kz_values,
+                dimension=dimension,
+                shifted=shifted,
+            )
+            if not shifted:
+                self._warn_if_grid_hits_degeneracy(hamiltonian, kgrid)
+            return kgrid
+
+        if kcfg.k_points:
+            if len(kcfg.k_points) != dimension:
+                raise ValueError(
+                    f"kgrid.k_points must have exactly {dimension} components for dimension={dimension}."
+                )
+            if any(points <= 0 for points in kcfg.k_points):
+                raise ValueError("All entries in kgrid.k_points must be strictly positive.")
+            nkx = int(kcfg.k_points[0])
+            nky = int(kcfg.k_points[1]) if dimension >= 2 else 1
+            nkz = int(kcfg.k_points[2]) if dimension >= 3 else 1
         else:
-            if kcfg.k_points:
-                if len(kcfg.k_points) != dimension:
-                    raise ValueError(
-                        f"kgrid.k_points must have exactly {dimension} components for dimension={dimension}."
-                    )
-                if any(points <= 0 for points in kcfg.k_points):
-                    raise ValueError("All entries in kgrid.k_points must be strictly positive.")
-                nkx = int(kcfg.k_points[0])
-                nky = int(kcfg.k_points[1]) if dimension >= 2 else 1
-                nkz = int(kcfg.k_points[2]) if dimension >= 3 else 1
-            else:
-                points_per_axis = 3 if kcfg.points_per_axis is None else int(kcfg.points_per_axis)
-                if points_per_axis <= 0:
-                    raise ValueError("kgrid.points_per_axis must be strictly positive.")
-                nkx = points_per_axis
-                nky = points_per_axis if dimension >= 2 else 1
-                nkz = points_per_axis if dimension >= 3 else 1
+            points_per_axis = 3 if kcfg.points_per_axis is None else int(kcfg.points_per_axis)
+            if points_per_axis <= 0:
+                raise ValueError("kgrid.points_per_axis must be strictly positive.")
+            nkx = points_per_axis
+            nky = points_per_axis if dimension >= 2 else 1
+            nkz = points_per_axis if dimension >= 3 else 1
 
-            bounds = hamiltonian.reciprocal_box_bounds()
-            kx_values = np.linspace(bounds[0][0], bounds[0][1], nkx, dtype=float)
-            ky_values = (
-                np.linspace(bounds[1][0], bounds[1][1], nky, dtype=float)
-                if dimension >= 2
-                else np.array([0.0], dtype=float)
-            )
-            kz_values = (
-                np.linspace(bounds[2][0], bounds[2][1], nkz, dtype=float)
-                if dimension >= 3
-                else np.array([0.0], dtype=float)
-            )
+        bounds = hamiltonian.reciprocal_box_bounds()
 
-        return KGrid(
+        def _axis(lo: float, hi: float, n: int) -> NDArray[np.float64]:
+            if shifted:
+                # Symmetric Monkhorst-Pack: never lands on a BZ edge/degeneracy.
+                return KGrid.shifted_axis(lo, hi, n)
+            return np.linspace(lo, hi, n, dtype=float)
+
+        kx_values = _axis(bounds[0][0], bounds[0][1], nkx)
+        ky_values = (
+            _axis(bounds[1][0], bounds[1][1], nky)
+            if dimension >= 2
+            else np.array([0.0], dtype=float)
+        )
+        kz_values = (
+            _axis(bounds[2][0], bounds[2][1], nkz)
+            if dimension >= 3
+            else np.array([0.0], dtype=float)
+        )
+
+        kgrid = KGrid(
             kx_values=kx_values,
             ky_values=ky_values,
             kz_values=kz_values,
             dimension=dimension,
+            shifted=shifted,
         )
+        if shifted:
+            self._emit_progress(
+                "KGrid: using shifted Monkhorst-Pack sampling (offset half a step). "
+                "Grid never lands on BZ edges/degeneracies; BZ integrals use uniform weights."
+            )
+        else:
+            self._warn_if_grid_hits_degeneracy(hamiltonian, kgrid)
+        return kgrid
+
+    def _warn_if_grid_hits_degeneracy(
+        self,
+        hamiltonian: Hamiltonian,
+        kgrid: KGrid,
+        *,
+        gap_threshold: float = 1.0e-6,
+    ) -> None:
+        """Warn when a grid point coincides with a band degeneracy.
+
+        A k-point sitting exactly on a band-touching point (gap ~ 0, e.g. a
+        Dirac point) makes the eigenvectors ambiguous and the Berry connection
+        singular, which can spuriously break harmonic selection rules (e.g.
+        revive the forbidden 2nd harmonic in graphene).  This is cheap: a single
+        ``eigvalsh`` per k-point.  Skipped entirely for shifted grids.
+        """
+        if hamiltonian.basis_size < 2:
+            return
+        points = kgrid.points()
+        min_gap = np.inf
+        worst_k = None
+        for kx, ky, kz in points:
+            energies = np.linalg.eigvalsh(hamiltonian._matrix_at(float(kx), float(ky), float(kz)))
+            gap = float(energies[1] - energies[0])
+            if gap < min_gap:
+                min_gap = gap
+                worst_k = (float(kx), float(ky), float(kz))
+        if min_gap < gap_threshold:
+            self._emit_progress(
+                f"[WARNING] KGrid hits a band degeneracy: minimum band gap is "
+                f"{min_gap:.2e} a.u. at k={worst_k}. A grid point sits on a "
+                f"band-touching point (e.g. a Dirac point), which makes the Berry "
+                f"connection singular and can produce SPURIOUS even harmonics "
+                f"(e.g. a forbidden 2nd harmonic). FIX: set 'shifted = true' in the "
+                f"[kgrid] section to use a Monkhorst-Pack grid that avoids "
+                f"degeneracies for any number of points (no extra cost), or change "
+                f"the number of k-points."
+            )
 
     def build_timegrid(self, laser_system: LaserSystem) -> TimeGrid:
         tcfg = self.config.timegrid
@@ -184,6 +251,7 @@ class QXTISimulation:
             include_interband=ccfg.include_interband,
             include_dephasing=ccfg.include_dephasing,
             rho_storage_dtype=ccfg.rho_storage_dtype,
+            n_workers=None if ccfg.n_workers <= 0 else ccfg.n_workers,
         )
 
     def build_xtp(
@@ -335,12 +403,19 @@ class QXTISimulation:
         if not cmd_cfg.enabled:
             return {}
 
-        cmd = self.build_cmd(hamiltonian)
+        runtime_cmd_cfg = self._cmd_runtime_config()
+        cmd = self.build_cmd(hamiltonian, cmd_config=runtime_cmd_cfg)
         output_dir = Path(cmd_cfg.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         self._emit_progress(
             f"CMD enabled: solving density matrices up to order {cmd_cfg.max_order}."
         )
+        if runtime_cmd_cfg.rho_storage_dtype != cmd_cfg.rho_storage_dtype:
+            self._emit_progress(
+                "CMD scratch storage auto-optimized: using "
+                f"{runtime_cmd_cfg.rho_storage_dtype} for temporary rho scratch "
+                f"(configured retained-rho dtype: {cmd_cfg.rho_storage_dtype})."
+            )
 
         outputs: dict[str, Path] = {}
         scratch_dir = output_dir if cmd_cfg.keep_rho_orders else (output_dir / ".scratch_rho")
@@ -350,7 +425,77 @@ class QXTISimulation:
                 "CMD rho retention disabled: large rho_order_*.npy files will be used as temporary scratch and deleted after datasets are saved."
             )
 
-        rho_order_paths = cmd.solve_time_domain(scratch_dir)
+        # ---- Streaming observable path ----
+        # When only the HHG spectrum is needed (not rho files, not kx-ky maps)
+        # we stream J^(s)(t) on-the-fly during the CMD solve.
+        # This eliminates the need to save and re-read the final rho_order file,
+        # which can save tens of GB of disk I/O for large grids.
+        use_streaming = (
+            bool(cmd_cfg.save_xtp_dataset)
+            and not bool(cmd_cfg.keep_rho_orders)
+            and not bool(cmd_cfg.save_population_dataset)
+            and not bool(cmd_cfg.save_coherence_dataset)
+            and not bool(cmd_cfg.save_frequency_domain)
+            and cmd.basis == "band"
+            and cmd.band_gauge_frame is not None
+        )
+        needs_saved_rho_postprocessing = self._needs_saved_rho_postprocessing(use_streaming=use_streaming)
+        reclaim_intermediate_orders = (
+            not bool(cmd_cfg.keep_rho_orders)
+            and not needs_saved_rho_postprocessing
+            and not bool(cmd_cfg.save_frequency_domain)
+        )
+        skip_final_order_disk_write = (
+            not bool(cmd_cfg.keep_rho_orders)
+            and not needs_saved_rho_postprocessing
+            and not use_streaming
+        )
+
+        streaming_acc: StreamingCurrentAccumulator | None = None
+        order_observe_callbacks: dict[int, object] | None = None
+
+        if use_streaming:
+            weights = self._compute_bz_weights(cmd)
+            active_dim = hamiltonian.dimension
+            direction_labels = self._active_directions(active_dim)
+            streaming_acc = StreamingCurrentAccumulator(
+                nt=cmd.timegrid.Nt,
+                integration_weights=weights,
+                current_operators={
+                    d: cmd.band_gauge_frame.current(d) for d in direction_labels
+                },
+                dipole_operators={
+                    d: cmd.band_gauge_frame.connection(d) for d in direction_labels
+                },
+                active_dimension=active_dim,
+            )
+            # Accumulate order 0 (equilibrium, constant in time) via the
+            # specialised equilibrium callback (avoids (Nt, Nb, Nb) broadcast).
+            order_observe_callbacks = {0: streaming_acc.make_equilibrium_callback(0)}
+            # Accumulate driven orders; last order uses streaming (no disk write).
+            for s in range(1, cmd.max_order + 1):
+                order_observe_callbacks[s] = streaming_acc.make_callback(s)
+            self._emit_progress(
+                "CMD streaming observable mode: J(t) and P(t) accumulated on the fly. "
+                f"Last order (rho^({cmd.max_order})) will NOT be written to disk."
+            )
+        elif skip_final_order_disk_write:
+            self._emit_progress(
+                "CMD compact-only mode: final rho order will be computed without being written to disk."
+            )
+
+        if reclaim_intermediate_orders:
+            self._emit_progress(
+                "CMD scratch reclamation enabled: obsolete rho scratch files will be deleted order-by-order."
+            )
+
+        rho_order_paths = cmd.solve_time_domain(
+            scratch_dir,
+            order_observe_callbacks=order_observe_callbacks,
+            reclaim_intermediate_orders=reclaim_intermediate_orders,
+            skip_final_order_disk_write=skip_final_order_disk_write,
+        )
+
         if cmd_cfg.keep_rho_orders:
             for order, npy_path in rho_order_paths.items():
                 outputs[f"rho_order_{order}"] = npy_path
@@ -369,7 +514,12 @@ class QXTISimulation:
                         f"CMD saved frequency order {order}: '{npy_path.name}'."
                     )
 
-            if self._needs_saved_rho_postprocessing():
+            if use_streaming and streaming_acc is not None:
+                # Build the harmonic dataset directly from accumulated arrays.
+                outputs.update(
+                    self._generate_xtp_datasets_from_streaming(cmd, streaming_acc, output_dir)
+                )
+            elif needs_saved_rho_postprocessing:
                 rho_orders = self._load_saved_rho_order_paths(rho_order_paths, nt=cmd.timegrid.Nt)
                 outputs.update(self.generate_cmd_datasets(cmd, rho_orders))
                 outputs.update(self.generate_xtp_datasets(cmd, rho_orders))
@@ -382,6 +532,136 @@ class QXTISimulation:
                 self._cleanup_rho_order_paths(rho_order_paths)
                 self._cleanup_directory_if_empty(scratch_dir)
         return outputs
+
+    @staticmethod
+    def _compute_bz_weights(cmd: CMD) -> np.ndarray:
+        """Compute BZ integration weights matching XTP._integration_weights."""
+        kgrid = cmd.kgrid
+        hamiltonian = cmd.hamiltonian
+        try:
+            bounds = tuple(hamiltonian.reciprocal_box_bounds())
+        except ValueError:
+            kx = np.asarray(kgrid.kx_values, dtype=float)
+            ky = np.asarray(kgrid.ky_values, dtype=float)
+            kz = np.asarray(kgrid.kz_values, dtype=float)
+            bounds = (
+                (float(kx[0]), float(kx[-1])),
+                (float(ky[0]), float(ky[-1])),
+                (float(kz[0]), float(kz[-1])),
+            )
+        periodic = bool(getattr(kgrid, "shifted", False))
+        wx = _XTPClass._axis_integration_weights(
+            np.asarray(kgrid.kx_values, dtype=float), bounds[0], active=True, periodic=periodic
+        )
+        wy = _XTPClass._axis_integration_weights(
+            np.asarray(kgrid.ky_values, dtype=float),
+            bounds[1] if kgrid.dimension >= 2 else (0.0, 0.0),
+            active=kgrid.dimension >= 2,
+            periodic=periodic,
+        )
+        wz = _XTPClass._axis_integration_weights(
+            np.asarray(kgrid.kz_values, dtype=float),
+            bounds[2] if kgrid.dimension >= 3 else (0.0, 0.0),
+            active=kgrid.dimension >= 3,
+            periodic=periodic,
+        )
+        return np.asarray(
+            (wx[:, None, None] * wy[None, :, None] * wz[None, None, :]).reshape(-1),
+            dtype=np.float64,
+        )
+
+    def _generate_xtp_datasets_from_streaming(
+        self,
+        cmd: CMD,
+        acc: StreamingCurrentAccumulator,
+        output_dir: Path,
+    ) -> dict[str, Path]:
+        """Build current-spectrum dataset from streamed J^(s)(t) arrays."""
+        self._emit_progress("XTP streaming: assembling current-spectrum dataset from on-the-fly accumulation.")
+        output_data_dir = output_dir / "data"
+        output_data_dir.mkdir(parents=True, exist_ok=True)
+
+        nt = cmd.timegrid.Nt
+        driven_orders = acc.driven_orders()
+        all_orders = acc.available_orders()
+        directions = tuple(self._active_directions(cmd.hamiltonian.dimension))
+
+        # Driven current time series: sum of positive orders.
+        driven_current = np.zeros((nt, 3), dtype=np.float64)
+        driven_polarization = np.zeros((nt, 3), dtype=np.float64)
+        for s in driven_orders:
+            driven_current += acc.current_time(s)
+            driven_polarization += acc.polarization_time(s)
+
+        # Total current: sum over all orders (including equilibrium if accumulated).
+        total_current = np.zeros((nt, 3), dtype=np.float64)
+        for s in all_orders:
+            total_current += acc.current_time(s)
+
+        equilibrium_current = acc.current_time(0) if 0 in all_orders else np.zeros((nt, 3), dtype=np.float64)
+        equilibrium_polarization = acc.polarization_time(0) if 0 in all_orders else np.zeros((nt, 3), dtype=np.float64)
+
+        # FFT helper (mirrors HarmonicData._fft_time_signal).
+        def _fft(signal: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            vals = np.asarray(signal, dtype=np.complex128)
+            window = np.asarray(
+                cmd.timegrid.apply_window(np.ones(nt, dtype=float)), dtype=float
+            )
+            reshape = (nt,) + (1,) * (vals.ndim - 1)
+            weighted = vals * window.reshape(reshape)
+            nfft = nt * cmd.timegrid.padding_factor if cmd.timegrid.zero_padding else nt
+            spectrum = cmd.timegrid.dt * np.fft.fft(weighted, n=nfft, axis=0)
+            omega = np.asarray(cmd.timegrid.frequency_axis(), dtype=float)
+            return omega, np.asarray(spectrum, dtype=np.complex128)
+
+        omega_axis, current_spectrum = _fft(driven_current)
+        _, total_current_spectrum = _fft(total_current)
+        current_total_magnitude = np.sqrt(np.sum(np.abs(current_spectrum) ** 2, axis=1))
+
+        electric_field_time = np.asarray(
+            cmd.laser_system.electric_field(cmd.timegrid.generate()), dtype=float
+        )
+
+        data: dict = {
+            "omega_axis": omega_axis,
+            "current_spectrum": np.asarray(current_spectrum, dtype=np.complex128),
+            "current_magnitude": np.abs(current_spectrum).astype(float),
+            "current_total_magnitude": current_total_magnitude.astype(float),
+            "current_time": driven_current,
+            "polarization_time": driven_polarization,
+            "current_time_total": total_current,
+            "current_spectrum_total": np.asarray(total_current_spectrum, dtype=np.complex128),
+            "equilibrium_current_time": equilibrium_current,
+            "equilibrium_polarization_time": equilibrium_polarization,
+            "time_axis": np.asarray(cmd.timegrid.generate(), dtype=float),
+            "directions": directions,
+            "orders": driven_orders,
+            "all_orders": all_orders,
+            "equilibrium_subtracted": bool(0 in all_orders),
+            "bz_mask": {
+                "enabled": False,
+                "shape": "circular" if cmd.kgrid.dimension == 2 else "spherical",
+                "radius_percent": 100.0,
+                "sigma_input": None,
+                "reference_radius": 0.0,
+                "radius": 0.0,
+                "sigma": 0.0,
+            },
+            "electric_field_time": electric_field_time,
+            "current_decomposition_available": False,
+        }
+
+        step_timer = ProgressTimer(total=1)
+        step_start = time.perf_counter()
+        with self._step_progress_monitor("XTP streaming dataset", step_timer, "saving current-spectrum dataset"):
+            current_spectrum_path = save_dataset_npz(output_data_dir / "current_spectrum.npz", data)
+        self._emit_step_completed(
+            "XTP streaming dataset",
+            step_timer,
+            f"saved '{current_spectrum_path.name}' ({format_bytes(current_spectrum_path.stat().st_size)})",
+            step_seconds=time.perf_counter() - step_start,
+        )
+        return {"xtp_current_spectrum_data": current_spectrum_path}
 
     def generate_cmd_datasets(
         self,
@@ -573,9 +853,24 @@ class QXTISimulation:
         output_dir.mkdir(parents=True, exist_ok=True)
         outputs: dict[str, Path] = {}
 
-        with self._step_progress_monitor("XTP dataset", step_timer, "building current-spectrum dataset"):
-            data_builder = HarmonicData(xtp, electric_field_time=electric_field_time)
-            current_spectrum_data = data_builder.current_spectrum_data()
+        data_builder = HarmonicData(xtp, electric_field_time=electric_field_time)
+        build_reporter = DetailedProgressReporter(
+            label="XTP dataset build",
+            total=max(1, data_builder.current_spectrum_work_units()),
+            emit=self._emit_progress,
+            interval_seconds=self._STEP_HEARTBEAT_SECONDS,
+            min_completed_for_eta=max(1, min(cmd.kgrid.total_points, 8)),
+        )
+        with self._step_progress_monitor(
+            "XTP dataset",
+            step_timer,
+            "building current-spectrum dataset",
+            interval_seconds=0.0,
+        ):
+            current_spectrum_data = data_builder.current_spectrum_data(
+                progress_callback=build_reporter.advance,
+            )
+        build_reporter.finish("current-spectrum observables assembled")
         self._emit_step_completed(
             "XTP dataset",
             step_timer,
@@ -600,12 +895,38 @@ class QXTISimulation:
 
         return outputs
 
-    def _needs_saved_rho_postprocessing(self) -> bool:
+    def _cmd_runtime_config(self) -> CMDConfig:
+        cmd_cfg = self.config.cmd
+        if cmd_cfg.keep_rho_orders:
+            return cmd_cfg
+
+        scratch_dtype = cmd_cfg.scratch_rho_storage_dtype
+        if scratch_dtype == "auto":
+            scratch_dtype = self._auto_cmd_scratch_rho_storage_dtype()
+
+        if scratch_dtype == cmd_cfg.rho_storage_dtype:
+            return cmd_cfg
+        return replace(cmd_cfg, rho_storage_dtype=scratch_dtype)
+
+    def _auto_cmd_scratch_rho_storage_dtype(self) -> str:
+        cmd_cfg = self.config.cmd
+        scratch_only_mode = (
+            not cmd_cfg.keep_rho_orders
+            and not cmd_cfg.save_population_dataset
+            and not cmd_cfg.save_coherence_dataset
+            and not cmd_cfg.save_frequency_domain
+        )
+        if scratch_only_mode:
+            return "float16_complex"
+        return cmd_cfg.rho_storage_dtype
+
+    def _needs_saved_rho_postprocessing(self, *, use_streaming: bool = False) -> bool:
         cmd_cfg = self.config.cmd
         return bool(
             cmd_cfg.save_population_dataset
             or cmd_cfg.save_coherence_dataset
-            or cmd_cfg.save_xtp_dataset
+            or cmd_cfg.save_frequency_domain
+            or (cmd_cfg.save_xtp_dataset and not use_streaming)
         )
 
     def _build_solver(self, timegrid: TimeGrid) -> Solver:

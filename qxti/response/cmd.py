@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+import os
 from pathlib import Path
 import time
 
@@ -10,10 +12,12 @@ from qxti.grids import KGrid, TimeGrid
 from qxti.physics import BandGaugeFrame, Hamiltonian, LaserSystem, OperatorFactory
 from qxti.solvers import Solver
 from qxti.utils.io_utils import (
-    expand_rho_tensor_time_axis,
+    is_float16_complex_dtype,
     normalize_complex_storage_dtype,
     open_array_npy,
+    read_complex_slice,
     save_array_npy,
+    write_complex_to_float16_memmap,
 )
 from qxti.utils.progress import ProgressTimer, format_bytes, format_duration
 
@@ -25,21 +29,99 @@ FloatArray = NDArray[np.float64]
 
 
 class CMD:
-    """Recursive perturbative density-matrix solver in length gauge.
+    """Recursive perturbative density-matrix solver in the length gauge.
 
-    The implementation follows the standard length-gauge equation
+    Solves the standard length-gauge Liouville–von-Neumann equation order by
+    order in the applied field amplitude:
 
-        d rho^(s) / dt =
-            -(i omega + gamma) rho^(s)
-            + E(t) · [D_k rho^(s-1)]
+        d rho^(s) / dt = -(i*omega_{nm} + gamma_{nm}) * rho^(s)_{nm}
+                         + E(t) · [D_k rho^(s-1)]_{nm}
 
-    where, in the internal band basis,
+    where in the internal band basis the covariant k-derivative is
 
-        D_k rho = grad_k rho - i [A, rho]
+        D_k rho = nabla_k rho - i [A, rho]
 
-    on a discrete k-grid. Zeroth order is the equilibrium density matrix and
-    higher orders are built iteratively from the previous one.
+    with ``A`` the Berry-connection matrix.  All energies are in Hartree and
+    lengths in Bohr (atomic units).
+
+    **Computational workflow.**
+
+    1. Build the band-gauge frame once (eigenvalues, eigenvectors, Berry
+       connection) — this is the most expensive one-time step.
+    2. Solve the equilibrium order ``rho^(0)`` (diagonal Fermi–Dirac matrix).
+    3. For s = 1 … max_order, compute the source term from ``rho^(s-1)``
+       (intraband k-gradient + interband Berry-commutator) and propagate
+       ``rho^(s)`` forward in time using the trapezoidal exponential integrator.
+
+    **Time propagation.**  For each driven order the ODE reduces to
+
+        rho^(s)[t+1] = P(dt) * rho^(s)[t] + (dt/2) * (P(dt)*src[t] + src[t+1])
+
+    where ``P(dt) = exp(-(damping + i*omega)*dt)`` is the exact element-wise
+    propagator.  On uniform time grids this recurrence is solved by FFT linear
+    convolution (``O(Nt log Nt)`` numpy calls instead of an ``O(Nt)`` Python
+    loop), which gives a large speedup for production-size time series.
+
+    **Parallelisation.**  The k-loop is embarrassingly parallel; it is
+    distributed over ``n_workers`` threads via ``ThreadPoolExecutor``.  NumPy
+    releases the GIL for most array operations so threads gain near-linear
+    speedup when the per-k computation is dominated by numpy work (large ``Nb``
+    or large ``Nt``).
+
+    Parameters
+    ----------
+    hamiltonian:
+        Tight-binding Hamiltonian providing ``H(k)`` and ``diagonalize(k)``.
+    laser_system:
+        Electric field ``E(t)`` and vector potential ``A(t)`` of all pulses.
+    kgrid:
+        Reciprocal-space grid on which the density matrix is resolved.
+    timegrid:
+        Temporal discretisation (uniform spacing recommended for FFT path).
+    operator_factory:
+        Builds velocity, dipole, and current operators from the Hamiltonian.
+    solver:
+        Numerical ODE integrator (RKF45 or Adams–Bashforth).  Currently used
+        for the full non-perturbative path; the perturbative path uses its own
+        exponential integrator.
+    max_order:
+        Highest perturbative order to compute (s = 1 … max_order).
+    population_time:
+        T₁ longitudinal relaxation time (∞ → no population decay).
+    coherence_time:
+        T₂ transverse relaxation time (∞ → no decoherence).
+    temperature:
+        Electronic temperature in Hartree for the equilibrium distribution.
+    fermi_level:
+        Chemical potential in Hartree.
+    distribution:
+        Equilibrium distribution name: ``fermi_dirac``, ``valence_occupation``,
+        ``full_occupation``, ``maxwell_boltzmann``, or ``bose_einstein``.
+    basis:
+        ``"band"`` (diagonal band basis, recommended) or ``"working"`` (orbital
+        basis — useful when the eigenvectors are not smooth across k).
+    gauge:
+        Only ``"length"`` is currently implemented.
+    include_intraband:
+        Include the k-gradient (intraband / Bloch oscillation) source term.
+    include_interband:
+        Include the Berry-commutator (interband / optical transition) source
+        term.
+    include_dephasing:
+        Apply T₁/T₂ relaxation to the source term.
+    rho_storage_dtype:
+        On-disk dtype for ``rho_order_*.npy`` files (``"complex128"`` or
+        ``"complex64"``).  Computations always use ``complex128`` internally.
+    n_workers:
+        Number of threads for the parallel k-loop.  ``None`` → use all logical
+        CPUs (``os.cpu_count()``).  Set ``1`` to disable parallelism.
     """
+
+    # Switch from Python-loop time propagation to FFT convolution above this threshold.
+    _FFT_NT_THRESHOLD: int = 64
+    # Fraction of physical RAM reserved for the OS page cache when computing
+    # the memory-safe worker count.  Lower values are more conservative.
+    _RAM_CACHE_FRACTION: float = 0.40
 
     def __init__(
         self,
@@ -61,6 +143,7 @@ class CMD:
         include_interband: bool,
         include_dephasing: bool,
         rho_storage_dtype: str | np.dtype = "complex128",
+        n_workers: int | None = None,
     ) -> None:
         self.hamiltonian = hamiltonian
         self.laser_system = laser_system
@@ -109,6 +192,11 @@ class CMD:
         )
         self._time_domain_cache: dict[int, ComplexArray] | None = None
         self._frequency_domain_cache: dict[int, ComplexArray] | None = None
+        # Worker count for the parallel k-point loop.  None → use all logical CPUs.
+        cpu_count = os.cpu_count() or 1
+        self._n_workers: int = int(cpu_count if n_workers is None else max(1, n_workers))
+        # Pre-compute the k-independent damping matrix once; reused every time step.
+        self._damping_cache: ComplexArray = self._damping_matrix()
 
     def rho_equilibrium(self, k: NDArray[np.float64]) -> ComplexArray:
         """Return the equilibrium density matrix at one k-point."""
@@ -190,7 +278,14 @@ class CMD:
         self._frequency_domain_cache = transformed
         return transformed
 
-    def solve_time_domain(self, output_dir: str | Path) -> dict[int, Path]:
+    def solve_time_domain(
+        self,
+        output_dir: str | Path,
+        order_observe_callbacks: dict[int, object] | None = None,
+        *,
+        reclaim_intermediate_orders: bool = False,
+        skip_final_order_disk_write: bool = False,
+    ) -> dict[int, Path]:
         """Solve density-matrix orders sequentially and save each one to disk.
 
         This is the primary low-memory time-domain path. It keeps only the
@@ -198,6 +293,26 @@ class CMD:
         tensor needed to build the next perturbative source term. Use
         :meth:`solve_time_domain_in_memory` for the legacy all-orders-in-RAM
         behavior.
+
+        Parameters
+        ----------
+        output_dir:
+            Directory where ``rho_order_*.npy`` scratch files are written.
+        order_observe_callbacks:
+            Optional mapping from order index to a ``(ik, rho_series) ->
+            None`` callable.  When provided for the last driven order, the
+            disk write for that order is skipped (streaming observable mode):
+            the density matrix is never materialised on disk, saving one full
+            ``(Nk, Nt, Nb, Nb)`` file (~36 GB for large grids).  Intermediate
+            orders still write to disk (they are needed as source terms).
+        reclaim_intermediate_orders:
+            Delete scratch files for old orders immediately after the next
+            order has been built from them.  This keeps peak scratch close to
+            the algorithmic minimum, but should only be enabled when later
+            post-processing does not need every saved order.
+        skip_final_order_disk_write:
+            Compute the last driven order without saving ``rho^(max_order)``
+            when no later stage needs that tensor on disk.
         """
 
         if self.gauge != "length":
@@ -217,11 +332,51 @@ class CMD:
         saved_paths: dict[int, Path] = {}
         can_stream_saved_band_orders = self.basis == "band"
         progress_timer = ProgressTimer(total=total_order_solves)
+        callbacks = order_observe_callbacks or {}
+        last_order_observed = callbacks.get(self.max_order) is not None
+
+        nb = self.hamiltonian.basis_size
+        bytes_per_elem = (
+            4 if is_float16_complex_dtype(self.rho_storage_dtype) else
+            np.dtype(self.rho_storage_dtype).itemsize
+        )
+        bytes_per_order = int(len(k_points)) * int(len(target_times)) * int(nb) * int(nb) * int(bytes_per_elem)
+        last_order_written = not (bool(skip_final_order_disk_write) or last_order_observed)
+        if reclaim_intermediate_orders:
+            if self.max_order <= 0:
+                active_order_scratch = 0
+            elif last_order_written:
+                active_order_scratch = 1 if self.max_order == 1 else 2
+            else:
+                active_order_scratch = 0 if self.max_order == 1 else 1 if self.max_order == 2 else 2
+        else:
+            active_order_scratch = self.max_order if last_order_written else max(0, self.max_order - 1)
+        total_scratch = int(bytes_per_order) * int(active_order_scratch)  # order0 ≈ 0
+        ram_bytes = self._estimate_physical_ram()
 
         self._emit_progress(
             f"CMD streaming start: {self.max_order} driven orders, {len(k_points)} k-points, "
             f"{total_order_solves} order/k-point solves total. "
             f"Output dtype on disk: {self.rho_storage_dtype.name}."
+        )
+        self._emit_progress(
+            f"CMD scratch estimate: "
+            f"~{format_bytes(bytes_per_order)} per driven order × {active_order_scratch} active orders "
+            f"= ~{format_bytes(total_scratch)} peak scratch on disk. "
+            f"Physical RAM: {format_bytes(ram_bytes)}."
+        )
+        if total_scratch > ram_bytes:
+            self._emit_progress(
+                f"[WARNING] Scratch size ({format_bytes(total_scratch)}) exceeds physical RAM "
+                f"({format_bytes(ram_bytes)}). The simulation will use the OS page cache "
+                f"(slow I/O). Consider reducing k_points or setting "
+                f"rho_storage_dtype = float16_complex to halve file sizes."
+            )
+
+        eq_observe = (
+            callbacks.get(0)
+            if can_stream_saved_band_orders
+            else None
         )
 
         if can_stream_saved_band_orders:
@@ -234,13 +389,16 @@ class CMD:
             )
             for ik in range(len(k_points)):
                 rho0_band = self._rho_equilibrium_band(ik)
-                equilibrium_writer[ik, 0] = rho0_band
+                if is_float16_complex_dtype(equilibrium_writer.dtype):
+                    write_complex_to_float16_memmap(equilibrium_writer, ik, rho0_band[np.newaxis])
+                else:
+                    equilibrium_writer[ik, 0] = rho0_band
+                if eq_observe is not None:
+                    eq_observe(ik, rho0_band)
             equilibrium_writer.flush()
             saved_paths[0] = order0_path
-            previous_order_band = expand_rho_tensor_time_axis(
-                np.load(saved_paths[0], mmap_mode="r"),
-                nt=len(target_times),
-            )
+            self._close_array_memmap(equilibrium_writer)
+            previous_order_band = self._load_saved_order_for_recursion(saved_paths[0])
             self._emit_progress(
                 f"CMD saved order 0: '{saved_paths[0].name}' "
                 f"({format_bytes(saved_paths[0].stat().st_size)}, "
@@ -261,8 +419,27 @@ class CMD:
                 f"CMD order {order}/{self.max_order}: building source terms."
             )
             order_start = time.perf_counter()
+            observe_cb = callbacks.get(order)
+
+            # Last driven order with an observe_callback: skip disk write
+            # (streaming observable mode).  Intermediate orders still write to
+            # disk because they are needed as source terms for the next order.
+            is_last_order = order == self.max_order
+            use_streaming_for_this_order = is_last_order and observe_cb is not None
+            discard_output_for_this_order = (
+                is_last_order
+                and bool(skip_final_order_disk_write)
+                and observe_cb is None
+            )
+            skip_disk_write_for_this_order = (
+                use_streaming_for_this_order
+                or discard_output_for_this_order
+            )
+
             if can_stream_saved_band_orders:
-                order_path = output_path / f"rho_order_{order}.npy"
+                order_path = None if skip_disk_write_for_this_order else output_path / f"rho_order_{order}.npy"
+                ck_path = output_path / f".checkpoint_order_{order}.json" if not skip_disk_write_for_this_order else None
+                old_previous_order_band = previous_order_band
                 current_order_band, completed_solves = self._solve_single_order_band(
                     k_points,
                     target_times,
@@ -273,19 +450,52 @@ class CMD:
                     total_order_solves=total_order_solves,
                     progress_timer=progress_timer,
                     output_path=order_path,
+                    observe_callback=observe_cb,
+                    discard_output=discard_output_for_this_order,
+                    checkpoint_path=ck_path,
                 )
-                saved_paths[order] = order_path
-                self._emit_progress(
-                    f"CMD saved order {order}: '{saved_paths[order].name}' "
-                    f"({format_bytes(saved_paths[order].stat().st_size)}, "
-                    f"{format_duration(time.perf_counter() - order_start)}, "
-                    f"ETA {progress_timer.eta_text()})."
-                )
-                previous_order_band = expand_rho_tensor_time_axis(
-                    np.load(saved_paths[order], mmap_mode="r"),
-                    nt=len(target_times),
-                )
-                del current_order_band
+                next_previous_order_band: np.ndarray | None = None
+                if not skip_disk_write_for_this_order:
+                    saved_paths[order] = order_path
+                    self._emit_progress(
+                        f"CMD saved order {order}: '{saved_paths[order].name}' "
+                        f"({format_bytes(saved_paths[order].stat().st_size)}, "
+                        f"{format_duration(time.perf_counter() - order_start)}, "
+                        f"ETA {progress_timer.eta_text()})."
+                    )
+                    if order < self.max_order:
+                        self._close_array_memmap(current_order_band)
+                        next_previous_order_band = self._load_saved_order_for_recursion(saved_paths[order])
+                else:
+                    if use_streaming_for_this_order:
+                        self._emit_progress(
+                            f"CMD order {order} streamed (no disk write), "
+                            f"{format_duration(time.perf_counter() - order_start)}, "
+                            f"ETA {progress_timer.eta_text()}."
+                        )
+                    else:
+                        self._emit_progress(
+                            f"CMD order {order} computed and discarded (no disk write), "
+                            f"{format_duration(time.perf_counter() - order_start)}, "
+                            f"ETA {progress_timer.eta_text()}."
+                        )
+                if order < self.max_order and next_previous_order_band is not None:
+                    previous_order_band = next_previous_order_band
+                if ck_path is not None:
+                    try:
+                        ck_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                self._close_array_memmap(old_previous_order_band)
+                self._close_array_memmap(current_order_band)
+                if reclaim_intermediate_orders:
+                    reclaim_order = order - 1
+                    reclaim_path = saved_paths.pop(reclaim_order, None)
+                    if reclaim_path is not None:
+                        self._remove_order_scratch_files(output_path, reclaim_order, reclaim_path)
+                        self._emit_progress(
+                            f"CMD reclaimed scratch order {reclaim_order}: removed '{reclaim_path.name}'."
+                        )
             else:
                 current_order_band, completed_solves = self._solve_single_order_band(
                     k_points,
@@ -296,18 +506,28 @@ class CMD:
                     completed_solves=completed_solves,
                     total_order_solves=total_order_solves,
                     progress_timer=progress_timer,
+                    observe_callback=observe_cb,
+                    discard_output=discard_output_for_this_order,
                 )
-                saved_paths[order] = self._save_order_tensor(
-                    output_path,
-                    order=order,
-                    tensor_band=current_order_band,
-                )
-                self._emit_progress(
-                    f"CMD saved order {order}: '{saved_paths[order].name}' "
-                    f"({format_bytes(saved_paths[order].stat().st_size)}, "
-                    f"{format_duration(time.perf_counter() - order_start)}, "
-                    f"ETA {progress_timer.eta_text()})."
-                )
+                if not skip_disk_write_for_this_order:
+                    saved_paths[order] = self._save_order_tensor(
+                        output_path,
+                        order=order,
+                        tensor_band=current_order_band,
+                    )
+                    self._emit_progress(
+                        f"CMD saved order {order}: '{saved_paths[order].name}' "
+                        f"({format_bytes(saved_paths[order].stat().st_size)}, "
+                        f"{format_duration(time.perf_counter() - order_start)}, "
+                        f"ETA {progress_timer.eta_text()})."
+                    )
+                else:
+                    message = "streamed" if use_streaming_for_this_order else "computed and discarded"
+                    self._emit_progress(
+                        f"CMD order {order} {message} (no disk write), "
+                        f"{format_duration(time.perf_counter() - order_start)}, "
+                        f"ETA {progress_timer.eta_text()}."
+                    )
                 previous_order_band = current_order_band
 
         self._time_domain_cache = None
@@ -387,71 +607,336 @@ class CMD:
             equilibrium_tensor[ik] = np.broadcast_to(rho0_band, (nt, nb, nb)).copy()
         return equilibrium_tensor
 
+    @staticmethod
+    def _estimate_physical_ram() -> int:
+        """Return an estimate of the physical RAM in bytes."""
+        try:
+            return int(os.sysconf("SC_PHYS_PAGES")) * int(os.sysconf("SC_PAGE_SIZE"))
+        except (AttributeError, ValueError, OSError):
+            pass
+        try:
+            import resource  # noqa: PLC0415
+            return int(resource.getrlimit(resource.RLIMIT_AS)[1])
+        except Exception:
+            return 8 * 1024 ** 3  # conservative 8 GiB fallback
+
+    @staticmethod
+    def _close_array_memmap(array: np.ndarray | None) -> None:
+        current = array
+        visited: set[int] = set()
+        while current is not None and id(current) not in visited:
+            visited.add(id(current))
+            mmap_obj = getattr(current, "_mmap", None)
+            if mmap_obj is not None:
+                try:
+                    mmap_obj.close()
+                except (AttributeError, BufferError, OSError, ValueError):
+                    pass
+            current = getattr(current, "base", None)
+
+    @staticmethod
+    def _remove_order_scratch_files(output_dir: Path, order: int, rho_path: Path) -> None:
+        try:
+            rho_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        checkpoint_path = output_dir / f".checkpoint_order_{order}.json"
+        try:
+            checkpoint_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _load_saved_order_for_recursion(path: Path) -> np.ndarray:
+        return np.load(path, mmap_mode="r")
+
+    @staticmethod
+    def _expand_compact_series(series: np.ndarray, nt: int) -> np.ndarray:
+        values = np.asarray(series, dtype=np.complex128)
+        if values.ndim == 2:
+            return np.broadcast_to(values[np.newaxis, :, :], (nt, values.shape[0], values.shape[1]))
+        if values.ndim == 3:
+            if values.shape[0] == nt:
+                return values
+            if values.shape[0] == 1:
+                return np.broadcast_to(values, (nt, values.shape[1], values.shape[2]))
+        raise ValueError(
+            f"Stored rho series must have shape (Nb, Nb), (1, Nb, Nb), or ({nt}, Nb, Nb); got {values.shape}."
+        )
+
+    def _rho_series_from_storage_slice(
+        self,
+        tensor: np.ndarray,
+        key,
+        *,
+        nt: int,
+    ) -> np.ndarray:
+        return self._expand_compact_series(read_complex_slice(tensor, key), nt)
+
+    def _effective_n_workers_for_memmap(
+        self,
+        nk: int,
+        nt: int,
+        nb: int,
+        *,
+        using_memmap: bool,
+    ) -> int:
+        """Return a RAM-safe worker count when writing to or reading from a large memmap.
+
+        When multiple threads access widely separated regions of the same large
+        memory-mapped file simultaneously, the OS page cache fills up and the
+        system starts thrashing (paging to/from disk rapidly).  This method
+        limits ``n_workers`` so the total active page-cache footprint stays
+        within ``_RAM_CACHE_FRACTION`` of physical memory.
+
+        **Rule of thumb:** each worker needs roughly 3 kx-rows of
+        ``(Nky, Nt, Nb, Nb)`` active pages for the gradient stencil plus the
+        write buffer.  If the product ``n_workers × bytes_per_worker`` exceeds
+        available page-cache budget, the count is reduced accordingly.
+        """
+        requested = max(1, min(nk, self._n_workers))
+        if not using_memmap or requested <= 1:
+            return requested
+
+        # 3 kx-rows with all Nky points, full time series, both read+write.
+        nky = int(self.kgrid.shape[1]) if len(self.kgrid.shape) >= 2 else 1
+        bytes_per_worker = int(3 * nky * nt * nb * nb * 16)  # factor-of-2 for R+W
+
+        available = int(self._estimate_physical_ram() * self._RAM_CACHE_FRACTION)
+        max_workers = max(1, available // max(bytes_per_worker, 1))
+        effective = min(requested, max_workers)
+
+        if effective < requested:
+            self._emit_progress(
+                f"[CMD] Memory guard: n_workers reduced {requested} → {effective}. "
+                f"Each worker needs ~{bytes_per_worker / 1e9:.1f} GB of page cache; "
+                f"available for cache ~{available / 1e9:.1f} GB "
+                f"({self._RAM_CACHE_FRACTION*100:.0f}% of physical RAM). "
+                f"Reduce k_points or increase RAM for full parallelism."
+            )
+        return effective
+
     def _solve_single_order_band(
         self,
         k_points: FloatArray,
         target_times: FloatArray,
         field_series: FloatArray,
-        previous_order_band: ComplexArray,
+        previous_order_band: np.ndarray,
         *,
         order: int,
         completed_solves: int,
         total_order_solves: int,
         progress_timer: ProgressTimer | None = None,
         output_path: Path | None = None,
-    ) -> tuple[ComplexArray, int]:
+        observe_callback=None,
+        discard_output: bool = False,
+        checkpoint_path: Path | None = None,
+    ) -> tuple[ComplexArray | None, int]:
+        """Solve one perturbative density-matrix order for all k-points.
+
+        Each k-point is solved independently using the per-k-point FFT
+        integrator (see :meth:`_solve_linear_order_band_on_grid`).  When
+        ``_n_workers > 1``, k-points are distributed across threads in
+        contiguous chunks via :class:`~concurrent.futures.ThreadPoolExecutor`.
+
+        NumPy releases the GIL for FFT and element-wise operations, so threads
+        achieve real concurrency on numpy-heavy workloads.  Progress is
+        reported at ~10 % milestones.
+
+        When ``checkpoint_path`` is provided, a small JSON file records the last
+        completed k-point index so the solve can resume from that point after a
+        crash instead of starting from k=0.
+        """
         nk = len(k_points)
         nt = len(target_times)
         nb = self.hamiltonian.basis_size
-        if output_path is None:
+
+        # --- Checkpoint: check for a previous partial run ------------------
+        import json as _json  # noqa: PLC0415
+
+        resume_from_k: int = 0
+        if checkpoint_path is not None and Path(checkpoint_path).exists():
+            try:
+                ck = _json.loads(Path(checkpoint_path).read_text())
+                resume_from_k = int(ck.get("completed_k", 0))
+                if 0 < resume_from_k < nk:
+                    self._emit_progress(
+                        f"CMD checkpoint found: resuming order {order} from k-point "
+                        f"{resume_from_k}/{nk} (skipping {resume_from_k} already solved k-points)."
+                    )
+                else:
+                    resume_from_k = 0
+            except Exception:
+                resume_from_k = 0
+
+        # Pure streaming mode: no dense (Nk, Nt, Nb, Nb) array is allocated.
+        # The solved density matrix is passed to observe_callback k-by-k and
+        # discarded immediately, saving both memory and disk I/O.
+        streaming_only = output_path is None and (observe_callback is not None or discard_output)
+
+        if streaming_only:
+            solved = None
+        elif output_path is None:
             solved = np.empty((nk, nt, nb, nb), dtype=np.complex128)
         else:
             solved = open_array_npy(
                 output_path,
                 shape=(nk, nt, nb, nb),
                 dtype=self.rho_storage_dtype,
+                mode="r+" if resume_from_k > 0 else "w+",
             )
-        previous_order_mesh = previous_order_band.reshape(
-            *self.kgrid.shape,
-            nt,
-            nb,
-            nb,
-        )
+
+        previous_order_mesh = previous_order_band.reshape(*self.kgrid.shape, *previous_order_band.shape[1:])
         connection_cache = tuple(
             self.band_gauge_frame.connection(direction)
             for direction in ("x", "y", "z")
         )
 
-        for ik, k_point in enumerate(k_points):
-            omega_matrix = self.band_gauge_frame.omega_matrix(ik)
-            source_components = self._driving_components_for_k_index(
-                previous_order_band,
-                previous_order_mesh,
-                connection_cache,
-                ik,
-            )
-            source_series = self._field_weighted_source_series(
-                field_series,
-                source_components,
-            )
-            solved_series = self._solve_linear_order_band_on_grid(
-                target_times,
-                source_series,
-                omega_matrix,
-            )
-            solved[ik] = solved_series
-            completed_solves += 1
-            if progress_timer is not None:
-                progress_timer.advance()
-            self._emit_progress(
-                f"CMD progress: order {order}/{self.max_order}, "
-                f"k-point {ik + 1}/{nk}, "
-                f"global {completed_solves}/{total_order_solves}, "
-                f"elapsed {format_duration(progress_timer.elapsed_seconds) if progress_timer is not None else 'unknown'}, "
-                f"eta {progress_timer.eta_text() if progress_timer is not None else 'unknown'}."
-            )
+        import threading as _threading
 
-        if isinstance(solved, np.memmap):
+        # Shared state for throttled parallel progress reporting.
+        # A lock guards the counter and the last-emit timestamp so that
+        # exactly one thread emits per heartbeat interval, regardless of
+        # how many are running concurrently.
+        _par_counter: list[int] = [0]
+        _par_last_emit: list[float] = [time.perf_counter()]
+        _par_lock = _threading.Lock()
+        _PAR_HEARTBEAT_S: float = 15.0  # emit at most once per 15 seconds
+
+        def _solve_k_range(start: int, stop: int) -> None:
+            """Process k-points [start, stop) as one thread task.
+
+            Chunking k-points reduces ThreadPoolExecutor scheduling overhead
+            vs. one-task-per-k-point, and keeps each task long enough for the
+            GIL-release benefit of NumPy to dominate.  A time-based heartbeat
+            inside the loop emits periodic progress so long runs do not appear
+            frozen when all threads are busy.
+            """
+            for ik in range(start, stop):
+                omega_matrix = self.band_gauge_frame.omega_matrix(ik)
+                source_components = self._driving_components_for_k_index(
+                    previous_order_band,
+                    previous_order_mesh,
+                    connection_cache,
+                    ik,
+                    nt=nt,
+                )
+                source_series_k = self._field_weighted_source_series(
+                    field_series,
+                    source_components,
+                )
+                solved_series = self._solve_linear_order_band_on_grid(
+                    target_times,
+                    source_series_k,
+                    omega_matrix,
+                )
+                # Each ik writes to a distinct row — no lock needed.
+                if solved is not None:
+                    if is_float16_complex_dtype(solved.dtype):
+                        write_complex_to_float16_memmap(solved, ik, solved_series)
+                    else:
+                        solved[ik] = solved_series
+                # Call the observable accumulator (streaming path).
+                if observe_callback is not None:
+                    observe_callback(ik, np.asarray(solved_series, dtype=np.complex128))
+
+                # Heartbeat: emit a progress line at most once per interval.
+                # Also write a checkpoint file so a crash can be resumed.
+                now = time.perf_counter()
+                with _par_lock:
+                    _par_counter[0] += 1
+                    done = _par_counter[0]
+                    if progress_timer is not None:
+                        progress_timer.advance()
+                    if now - _par_last_emit[0] >= _PAR_HEARTBEAT_S:
+                        _par_last_emit[0] = now
+                        elapsed = (
+                            format_duration(progress_timer.elapsed_seconds)
+                            if progress_timer else "unknown"
+                        )
+                        eta = progress_timer.eta_text() if progress_timer else "unknown"
+                        self._emit_progress(
+                            f"CMD progress: order {order}/{self.max_order}, "
+                            f"{done + resume_from_k}/{nk} k-points "
+                            f"({100 * (done + resume_from_k) // nk}%), "
+                            f"global {completed_solves + done}/{total_order_solves}, "
+                            f"elapsed {elapsed}, ETA {eta}."
+                        )
+                        if checkpoint_path is not None:
+                            try:
+                                Path(checkpoint_path).write_text(
+                                    _json.dumps({"order": order, "completed_k": resume_from_k + done})
+                                )
+                            except OSError:
+                                pass
+
+        n_workers = self._effective_n_workers_for_memmap(
+            nk, nt, nb, using_memmap=(output_path is not None)
+        )
+        # Emit at most ~10 progress messages per order (milestones every 10 %).
+        milestone_interval = max(1, nk // 10)
+
+        # k-points to actually solve: skip already-completed ones on resume.
+        remaining_k_start = resume_from_k
+        remaining_nk = nk - resume_from_k
+
+        if remaining_nk <= 0:
+            self._emit_progress(
+                f"CMD order {order}: all {nk} k-points already completed (checkpoint). Skipping."
+            )
+            completed_solves += nk
+            if progress_timer is not None:
+                progress_timer.advance(nk)
+        elif n_workers > 1:
+            # Distribute remaining k-points across workers in contiguous chunks.
+            chunk_size = max(1, (remaining_nk + n_workers - 1) // n_workers)
+            chunks = [
+                (remaining_k_start + i * chunk_size,
+                 min(remaining_k_start + (i + 1) * chunk_size, nk))
+                for i in range(min(n_workers, remaining_nk))
+            ]
+            with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                list(executor.map(lambda ab: _solve_k_range(*ab), chunks))
+            completed_solves += remaining_nk
+            elapsed = format_duration(progress_timer.elapsed_seconds) if progress_timer else "unknown"
+            eta = progress_timer.eta_text() if progress_timer else "unknown"
+            self._emit_progress(
+                f"CMD order {order}/{self.max_order}: {nk} k-points completed "
+                f"({n_workers} workers, {len(chunks)} chunks), "
+                f"global {completed_solves}/{total_order_solves}, "
+                f"elapsed {elapsed}, ETA {eta}."
+            )
+            # Final checkpoint: mark order as complete.
+            if checkpoint_path is not None:
+                try:
+                    Path(checkpoint_path).write_text(
+                        _json.dumps({"order": order, "completed_k": nk})
+                    )
+                except OSError:
+                    pass
+        else:
+            # Sequential k-loop with throttled milestone reporting.
+            for ik in range(remaining_k_start, nk):
+                _solve_k_range(ik, ik + 1)
+                completed_solves += 1
+                if (ik + 1) % milestone_interval == 0 or ik + 1 == nk:
+                    elapsed = format_duration(progress_timer.elapsed_seconds) if progress_timer else "unknown"
+                    eta = progress_timer.eta_text() if progress_timer else "unknown"
+                    self._emit_progress(
+                        f"CMD progress: order {order}/{self.max_order}, "
+                        f"k-point {ik + 1}/{nk} ({100 * (ik + 1) // nk}%), "
+                        f"global {completed_solves}/{total_order_solves}, "
+                        f"elapsed {elapsed}, ETA {eta}."
+                    )
+                    if checkpoint_path is not None:
+                        try:
+                            Path(checkpoint_path).write_text(
+                                _json.dumps({"order": order, "completed_k": ik + 1})
+                            )
+                        except OSError:
+                            pass
+
+        if solved is not None and isinstance(solved, np.memmap):
             solved.flush()
         return solved, completed_solves
 
@@ -461,22 +946,79 @@ class CMD:
         source_series: ComplexArray,
         omega_matrix: ComplexArray,
     ) -> ComplexArray:
+        """Propagate one driven density-matrix order on the discrete time grid.
+
+        Implements the trapezoidal exponential integrator
+
+            rho[t+1] = P(dt) * rho[t] + (dt/2) * (P(dt)*src[t] + src[t+1])
+
+        where ``P(dt) = exp(-(damping + i*omega) * dt)`` is the exact element-wise
+        propagator and ``rho[0] = 0`` (driven orders start from vacuum).
+
+        **Uniform grid (fast path).**  When consecutive time-steps are equal the
+        recurrence is solved via FFT linear convolution instead of a Python loop.
+        This replaces ``O(Nt)`` Python iterations with ``O(Nt log Nt)`` numpy FFT
+        calls, yielding a large speedup for ``Nt > _FFT_NT_THRESHOLD``.
+
+        **Non-uniform or short grid (fallback).**  Falls back to direct iteration
+        with propagator caching on dt change.
+        """
         nt = len(target_times)
         nb = self.hamiltonian.basis_size
         rho_series = np.zeros((nt, nb, nb), dtype=np.complex128)
-        damping = self._damping_matrix()
-        lambda_matrix = damping + 1.0j * omega_matrix
+        if nt <= 1:
+            return rho_series
 
-        for it in range(nt - 1):
-            dt = float(target_times[it + 1] - target_times[it])
-            if dt <= 0.0:
-                raise ValueError("target_times must be strictly increasing.")
-            propagator = np.exp(-lambda_matrix * dt)
-            rho_next = (
-                propagator * rho_series[it]
-                + 0.5 * dt * (propagator * source_series[it] + source_series[it + 1])
+        # _damping_cache is built once at construction — same matrix for all k.
+        lambda_matrix = self._damping_cache + 1.0j * np.asarray(omega_matrix, dtype=np.complex128)
+        dts = np.diff(target_times.astype(float))
+
+        if np.any(dts <= 0.0):
+            raise ValueError("target_times must be strictly increasing.")
+
+        uniform = bool(dts.size > 0 and np.allclose(dts, dts[0], rtol=1e-10, atol=1e-15))
+
+        if uniform and nt > self._FFT_NT_THRESHOLD:
+            # --- FFT convolution path ---
+            dt = float(dts[0])
+            half_dt = 0.5 * dt
+            propagator = np.exp(-lambda_matrix * dt)  # (Nb, Nb)
+
+            # Effective input after trapezoidal source integration:
+            #   u[t] = half_dt * (P * src[t] + src[t+1])  shape (Nt-1, Nb, Nb)
+            u = half_dt * (propagator[np.newaxis] * source_series[:-1] + source_series[1:])
+
+            # Impulse response: h[k, n, m] = P[n,m]^k = exp(-lambda[n,m] * k * dt)
+            # Computed via direct exponentiation (numerically stable, avoids complex power).
+            k_vals = np.arange(nt - 1, dtype=np.float64)
+            h = np.exp(
+                -lambda_matrix[np.newaxis] * (k_vals[:, np.newaxis, np.newaxis] * dt)
+            )  # (Nt-1, Nb, Nb)
+
+            # Linear convolution via FFT.  Zero-pad to the next power of 2 that is
+            # at least 2*(Nt-1) to avoid circular aliasing.
+            n_fft = 1 << max(1, (2 * (nt - 1)).bit_length())
+            conv = np.fft.ifft(
+                np.fft.fft(h, n=n_fft, axis=0) * np.fft.fft(u, n=n_fft, axis=0),
+                axis=0,
             )
-            rho_series[it + 1] = self.hamiltonian.validate_matrix(rho_next)
+            # rho[t+1] = (h ★ u)[t]  →  rho[1:] = conv[0 : Nt-1]
+            rho_series[1:] = conv[:nt - 1]
+
+        else:
+            # --- Direct trapezoidal integrator (non-uniform / short grid) ---
+            # Cache the propagator and recompute only when dt changes.
+            prev_dt: float = -1.0
+            propagator: ComplexArray = np.zeros_like(lambda_matrix)
+            for it in range(nt - 1):
+                dt = float(dts[it])
+                if dt != prev_dt:
+                    propagator = np.exp(-lambda_matrix * dt)
+                    prev_dt = dt
+                rho_series[it + 1] = (
+                    propagator * rho_series[it]
+                    + 0.5 * dt * (propagator * source_series[it] + source_series[it + 1])
+                )
 
         return rho_series
 
@@ -571,23 +1113,25 @@ class CMD:
 
     def _driving_components_for_k_index(
         self,
-        previous_order: ComplexArray,
-        previous_order_mesh: ComplexArray,
+        previous_order: np.ndarray,
+        previous_order_mesh: np.ndarray,
         connection_cache: tuple[ComplexArray, ComplexArray, ComplexArray],
         index: int,
+        *,
+        nt: int,
     ) -> ComplexArray:
-        nt = previous_order.shape[1]
-        nb = previous_order.shape[2]
+        rho_series = self._rho_series_from_storage_slice(previous_order, index, nt=nt)
+        nb = rho_series.shape[1]
         components = np.zeros((nt, 3, nb, nb), dtype=np.complex128)
 
         if self.include_intraband:
             components += self._k_gradient_components_for_k_index(
                 previous_order_mesh,
                 index,
+                nt=nt,
             )
 
         if self.include_interband:
-            rho_series = np.asarray(previous_order[index], dtype=np.complex128)
             components += self._connection_commutator_components_for_k_index(
                 rho_series,
                 connection_cache,
@@ -643,11 +1187,17 @@ class CMD:
 
     def _k_gradient_components_for_k_index(
         self,
-        tensor_mesh: ComplexArray,
+        tensor_mesh: np.ndarray,
         index: int,
+        *,
+        nt: int,
     ) -> ComplexArray:
-        nt = tensor_mesh.shape[3]
-        nb = tensor_mesh.shape[4]
+        sample_series = self._rho_series_from_storage_slice(
+            tensor_mesh,
+            tuple(np.unravel_index(index, self.kgrid.shape)),
+            nt=nt,
+        )
+        nb = sample_series.shape[1]
         gradients = np.zeros((nt, 3, nb, nb), dtype=np.complex128)
         multi_index = list(np.unravel_index(index, self.kgrid.shape))
 
@@ -663,6 +1213,7 @@ class CMD:
                 multi_index,
                 axis,
                 np.asarray(grid_values, dtype=float),
+                nt=nt,
             )
 
         return gradients
@@ -711,10 +1262,12 @@ class CMD:
 
     @staticmethod
     def _gradient_series_at_grid_index(
-        tensor_mesh: ComplexArray,
+        tensor_mesh: np.ndarray,
         multi_index: list[int],
         axis: int,
         coordinates: FloatArray,
+        *,
+        nt: int,
     ) -> ComplexArray:
         position = multi_index[axis]
         if len(coordinates) < 2:
@@ -723,7 +1276,8 @@ class CMD:
         def take(axis_position: int) -> ComplexArray:
             local_index = list(multi_index)
             local_index[axis] = axis_position
-            return np.asarray(tensor_mesh[tuple(local_index)], dtype=np.complex128)
+            values = read_complex_slice(tensor_mesh, tuple(local_index))
+            return CMD._expand_compact_series(values, nt)
 
         if len(coordinates) == 2:
             delta = float(coordinates[1] - coordinates[0])
@@ -774,11 +1328,29 @@ class CMD:
         )
 
     def _rho_equilibrium_band(self, index: int) -> ComplexArray:
+        """Return the equilibrium diagonal density matrix for k-point ``index``.
+
+        Issues a warning when any occupation falls outside ``[0, 1]``, which
+        would indicate a Fermi-level or temperature configuration that is
+        physically inconsistent with the chosen distribution.
+        """
         energies = self.band_gauge_frame.energies[index]
         occupations = np.asarray(
             self.distribution(energies, self.fermi_level, self.temperature),
             dtype=float,
         )
+        # Fermi-Dirac occupations must lie in [0, 1] by definition. Other
+        # distributions (Maxwell-Boltzmann, Bose-Einstein) can exceed 1.
+        if self.distribution_name in {"fermi_dirac", "valence_occupation", "full_occupation"}:
+            if np.any(occupations < -1e-9) or np.any(occupations > 1.0 + 1e-9):
+                import warnings
+                bad = occupations[(occupations < -1e-9) | (occupations > 1.0 + 1e-9)]
+                warnings.warn(
+                    f"[CMD] Fermi-Dirac occupations at k-index {index} contain "
+                    f"{len(bad)} value(s) outside [0, 1]: {bad}. "
+                    "Check fermi_level and temperature settings.",
+                    stacklevel=3,
+                )
         return np.diag(occupations).astype(np.complex128)
 
     def _omega_matrix(self, kx: float, ky: float, kz: float) -> ComplexArray:

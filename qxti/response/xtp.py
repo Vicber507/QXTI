@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 from numpy.typing import NDArray
@@ -11,12 +11,17 @@ from qxti.physics import BandGaugeFrame, Hamiltonian, LaserSystem, OperatorFacto
 
 ComplexArray = NDArray[np.complex128]
 RealArray = NDArray[np.float64]
+ProgressCallback = Callable[[int, str], None]
 
 
 class XTP:
     r"""Compute macroscopic response observables from perturbative density matrices.
 
-    The time-domain polarization of order ``s`` is evaluated as
+    **X-To-Polarization** (XTP) integrates precomputed perturbative density
+    matrices ``rho^(s)(k, t)`` over the Brillouin zone to obtain macroscopic
+    time-domain observables.
+
+    The *polarization* of order ``s`` along Cartesian direction ``i`` is
 
     .. math::
 
@@ -24,11 +29,71 @@ class XTP:
         \int_{\mathrm{BZ}} d\mathbf{k}\,
         \sum_{nm} d^i_{mn}(\mathbf{k})\,\rho^{(s)}_{nm}(\mathbf{k}, t),
 
-    where the Brillouin-zone integral is approximated on the rectangular
-    reciprocal-space box associated with the Hamiltonian lattice. When the
-    :class:`~qxti.grids.KGrid` is generated from
+    and the *current* is
+
+    .. math::
+
+        J_i^{(s)}(t) =
+        -\int_{\mathrm{BZ}} d\mathbf{k}\,
+        \sum_{nm} v^i_{mn}(\mathbf{k})\,\rho^{(s)}_{nm}(\mathbf{k}, t).
+
+    The Brillouin-zone integral is approximated on the rectangular
+    reciprocal-space box inferred from the Hamiltonian lattice constants.
+    When the :class:`~qxti.grids.KGrid` is generated from
     :meth:`Hamiltonian.reciprocal_box_bounds`, this corresponds to square/cubic
-    boxes ``[-pi / a_i, pi / a_i]`` in atomic units.
+    boxes ``[-pi/a_i, pi/a_i]`` (atomic units) with trapezoidal weights.
+
+    **Frequency-domain spectra** are obtained by windowed FFT of the
+    time-domain signals.  The harmonic spectrum of the driven current is the
+    primary output for high-harmonic generation (HHG) simulations.
+
+    **Susceptibility tensors** ``chi^(s)(omega)`` are computed by normalising
+    the frequency-domain polarization by the driving-field amplitude raised to
+    the ``s``-th power.
+
+    **BZ masking.** An optional radial Gaussian mask can suppress edge
+    contributions near the zone boundary (useful when the k-grid does not cover
+    a full BZ with periodic boundary conditions).
+
+    Parameters
+    ----------
+    hamiltonian:
+        Tight-binding Hamiltonian — used for dimension, basis size, and BZ
+        bounds.
+    rho_orders:
+        Dictionary mapping order index ``s`` to a ``(Nk, Nt, Nb, Nb)``
+        complex density-matrix tensor.
+    kgrid:
+        Reciprocal-space grid matching the first axis of every rho tensor.
+    timegrid:
+        Time discretisation, provides ``dt`` and FFT window settings.
+    frequencygrid:
+        Frequency axis metadata (currently informational; FFT axis is derived
+        from ``timegrid``).
+    operator_factory:
+        Builds dipole, velocity, and current operators on demand.
+    directions:
+        Cartesian directions to include in observable calculations (subset of
+        ``["x", "y", "z"]``).
+    orders:
+        Perturbative orders to compute; must be present in ``rho_orders``.
+    band_gauge_frame:
+        Pre-built Berry-connection and current operators in the band basis.
+        When provided, the chunked einsum path is used for efficiency instead
+        of calling ``operator_factory`` per k-point.
+    laser_system:
+        Required for frequency-domain susceptibility and conductivity
+        calculations (provides ``E(omega)`` for normalisation).
+    bz_mask_enabled:
+        Apply a radial Gaussian mask to the BZ integration weights.
+    bz_mask_radius_percent:
+        Radius of the flat-top mask region as a percentage of the shortest
+        reciprocal-box half-width.
+    bz_mask_sigma:
+        Gaussian decay width of the mask edge in reciprocal-length units.
+    bz_mask_sigma_percent_legacy:
+        Legacy percentage-of-radius sigma parameter (overridden by
+        ``bz_mask_sigma``).
     """
 
     _DIRECTION_TO_AXIS = {"x": 0, "y": 1, "z": 2}
@@ -69,6 +134,11 @@ class XTP:
         self.bz_mask_sigma_percent_legacy = (
             None if bz_mask_sigma_percent_legacy is None else float(bz_mask_sigma_percent_legacy)
         )
+        self._k_points = np.asarray(self.kgrid.points(), dtype=np.float64)
+        self._integration_weights_cache: RealArray | None = None
+        self._current_cache: dict[tuple[int, str], RealArray] = {}
+        self._polarization_cache: dict[int, RealArray] = {}
+        self._current_decomposition_cache: dict[tuple[int, str], dict[str, RealArray]] = {}
         if not self.orders:
             raise ValueError("orders must contain at least one perturbative order.")
         if self.bz_mask_radius_percent <= 0.0:
@@ -79,73 +149,83 @@ class XTP:
             raise ValueError("bz_mask_sigma_percent_legacy must be strictly positive when provided.")
         self._validate_rho_orders()
 
-    def polarization(self, order: int) -> RealArray:
+    def polarization(
+        self,
+        order: int,
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> RealArray:
         """Return the macroscopic polarization :math:`P^{(s)}(t)` for one order."""
 
+        cache_key = int(order)
+        cached = self._polarization_cache.get(cache_key)
+        if cached is not None:
+            return np.asarray(cached, dtype=np.float64)
+
         rho_tensor = self._rho_tensor(order)
-        nk = self.kgrid.total_points
         nt = rho_tensor.shape[1]
         polarization = np.zeros((nt, 3), dtype=np.complex128)
-        k_points = self.kgrid.points()
 
         for direction in self.directions:
             axis = self._direction_axis(direction)
-            expectation = np.zeros((nk, nt), dtype=np.complex128)
             cached_dipole = None if self.band_gauge_frame is None else self.band_gauge_frame.connection(direction)
+            polarization[:, axis] = self._weighted_observable_over_k(
+                rho_tensor,
+                operator_direction=direction,
+                cached_operator=cached_dipole,
+                operator_builder=self.operator_factory.dipole,
+                progress_callback=progress_callback,
+                progress_message=f"polarization(order={order}, direction={direction})",
+            )
 
-            for ik, (kx, ky, kz) in enumerate(k_points):
-                dipole = (
-                    self.operator_factory.dipole(direction, float(kx), float(ky), float(kz))
-                    if cached_dipole is None
-                    else cached_dipole[ik]
-                )
-                expectation[ik] = np.einsum(
-                    "mn,tnm->t",
-                    dipole,
-                    rho_tensor[ik],
-                    optimize=True,
-                )
+        result = self._coerce_real_matrix(polarization, name=f"polarization(order={order})")
+        self._polarization_cache[cache_key] = np.asarray(result, dtype=np.float64)
+        return np.asarray(result, dtype=np.float64)
 
-            polarization[:, axis] = self._integrate_over_brillouin_zone(expectation)
-
-        return self._coerce_real_matrix(polarization, name=f"polarization(order={order})")
-
-    def current(self, order: int, direction: str) -> RealArray:
+    def current(
+        self,
+        order: int,
+        direction: str,
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> RealArray:
         """Return the macroscopic current component for one order and direction."""
 
-        rho_tensor = self._rho_tensor(order)
         direction = self._normalize_direction(direction)
-        nk = self.kgrid.total_points
-        nt = rho_tensor.shape[1]
-        expectation = np.zeros((nk, nt), dtype=np.complex128)
-        k_points = self.kgrid.points()
+        cache_key = (int(order), direction)
+        cached = self._current_cache.get(cache_key)
+        if cached is not None:
+            return np.asarray(cached, dtype=np.float64)
+
+        rho_tensor = self._rho_tensor(order)
         cached_current = None if self.band_gauge_frame is None else self.band_gauge_frame.current(direction)
-
-        for ik, (kx, ky, kz) in enumerate(k_points):
-            current_operator = (
-                self.operator_factory.current(direction, float(kx), float(ky), float(kz))
-                if cached_current is None
-                else cached_current[ik]
-            )
-            expectation[ik] = np.einsum(
-                "mn,tnm->t",
-                current_operator,
-                rho_tensor[ik],
-                optimize=True,
-            )
-
-        integrated = self._integrate_over_brillouin_zone(expectation)
-        return self._coerce_real_vector(
+        integrated = self._weighted_observable_over_k(
+            rho_tensor,
+            operator_direction=direction,
+            cached_operator=cached_current,
+            operator_builder=self.operator_factory.current,
+            progress_callback=progress_callback,
+            progress_message=f"current(order={order}, direction={direction})",
+        )
+        result = self._coerce_real_vector(
             integrated,
             name=f"current(order={order}, direction={direction})",
         )
+        self._current_cache[cache_key] = np.asarray(result, dtype=np.float64)
+        return np.asarray(result, dtype=np.float64)
 
     def has_current_decomposition(self) -> bool:
         """Return whether intraband/interband current separation is available."""
 
         return self.band_gauge_frame is not None
 
-    def current_decomposition(self, order: int, direction: str) -> dict[str, RealArray]:
+    def current_decomposition(
+        self,
+        order: int,
+        direction: str,
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> dict[str, RealArray]:
         """Return intraband/interband current components for one order and direction."""
 
         if self.band_gauge_frame is None:
@@ -153,32 +233,39 @@ class XTP:
                 "Current decomposition requires a band_gauge_frame so operators and rho share the same band basis."
             )
 
-        rho_tensor = self._rho_tensor(order)
         direction = self._normalize_direction(direction)
-        nk = self.kgrid.total_points
-        nt = rho_tensor.shape[1]
-        intraband_expectation = np.zeros((nk, nt), dtype=np.complex128)
+        cache_key = (int(order), direction)
+        cached_parts = self._current_decomposition_cache.get(cache_key)
+        if cached_parts is not None:
+            return {
+                "intraband": np.asarray(cached_parts["intraband"], dtype=np.float64),
+                "interband": np.asarray(cached_parts["interband"], dtype=np.float64),
+            }
+
+        rho_tensor = self._rho_tensor(order)
         current_operator = self.band_gauge_frame.current(direction)
-
-        for ik in range(nk):
-            diagonal_current = np.diag(current_operator[ik])
-            band_diagonal = np.diagonal(rho_tensor[ik], axis1=1, axis2=2)
-            intraband_expectation[ik] = np.einsum(
-                "n,tn->t",
-                diagonal_current,
-                band_diagonal,
-                optimize=True,
-            )
-
         intraband = self._coerce_real_vector(
-            self._integrate_over_brillouin_zone(intraband_expectation),
+            self._weighted_intraband_current_over_k(
+                rho_tensor,
+                current_operator=current_operator,
+                progress_callback=progress_callback,
+                progress_message=f"intraband_current(order={order}, direction={direction})",
+            ),
             name=f"intraband_current(order={order}, direction={direction})",
         )
         total = self.current(order, direction)
         interband = np.asarray(total - intraband, dtype=np.float64)
-        return {
+        parts = {
             "intraband": intraband,
             "interband": interband,
+        }
+        self._current_decomposition_cache[cache_key] = {
+            "intraband": np.asarray(intraband, dtype=np.float64),
+            "interband": np.asarray(interband, dtype=np.float64),
+        }
+        return {
+            "intraband": np.asarray(parts["intraband"], dtype=np.float64),
+            "interband": np.asarray(parts["interband"], dtype=np.float64),
         }
 
     def polarization_frequency_domain(self, order: int) -> tuple[RealArray, ComplexArray]:
@@ -669,16 +756,24 @@ class XTP:
 
         return np.asarray(np.fft.fft(np.asarray(signal), axis=0), dtype=np.complex128)
 
-    def total_polarization(self) -> RealArray:
+    def total_polarization(
+        self,
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> RealArray:
         """Return the sum of the polarization over the configured orders."""
 
         nt = len(self.timegrid)
         total = np.zeros((nt, 3), dtype=np.float64)
         for order in self.orders:
-            total += self.polarization(order)
+            total += self.polarization(order, progress_callback=progress_callback)
         return total
 
-    def total_current(self) -> RealArray:
+    def total_current(
+        self,
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> RealArray:
         """Return the sum of current contributions over orders and directions."""
 
         nt = len(self.timegrid)
@@ -686,10 +781,14 @@ class XTP:
         for direction in self.directions:
             axis = self._direction_axis(direction)
             for order in self.orders:
-                total[:, axis] += self.current(order, direction)
+                total[:, axis] += self.current(order, direction, progress_callback=progress_callback)
         return total
 
-    def total_current_decomposition(self) -> dict[str, RealArray]:
+    def total_current_decomposition(
+        self,
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> dict[str, RealArray]:
         """Return intraband/interband current vectors summed over configured orders."""
 
         if self.band_gauge_frame is None:
@@ -701,7 +800,7 @@ class XTP:
         for direction in self.directions:
             axis = self._direction_axis(direction)
             for order in self.orders:
-                parts = self.current_decomposition(order, direction)
+                parts = self.current_decomposition(order, direction, progress_callback=progress_callback)
                 intraband[:, axis] += parts["intraband"]
                 interband[:, axis] += parts["interband"]
         return {
@@ -796,35 +895,10 @@ class XTP:
             raise ValueError(
                 "point_values first dimension must match the number of k-points in the grid."
             )
-
-        grid = values.reshape(*self.kgrid.shape, *values.shape[1:])
-        if self.bz_mask_enabled:
-            grid = grid * self._bz_mask_weights().reshape(*self.kgrid.shape, *([1] * (grid.ndim - 3)))
-        bounds = self.brillouin_zone_bounds()
-        result = grid
-
-        result = self._integrate_axis(
-            result,
-            axis=2,
-            coordinates=np.asarray(self.kgrid.kz_values, dtype=float),
-            bounds=bounds[2] if self.kgrid.dimension >= 3 else (0.0, 0.0),
-            active=self.kgrid.dimension >= 3,
-        )
-        result = self._integrate_axis(
-            result,
-            axis=1,
-            coordinates=np.asarray(self.kgrid.ky_values, dtype=float),
-            bounds=bounds[1] if self.kgrid.dimension >= 2 else (0.0, 0.0),
-            active=self.kgrid.dimension >= 2,
-        )
-        result = self._integrate_axis(
-            result,
-            axis=0,
-            coordinates=np.asarray(self.kgrid.kx_values, dtype=float),
-            bounds=bounds[0],
-            active=True,
-        )
-        return np.asarray(result, dtype=np.complex128)
+        weights = self._integration_weights()
+        flat = values.reshape(self.kgrid.total_points, -1)
+        integrated = np.einsum("k,km->m", weights, flat, optimize=True)
+        return np.asarray(integrated.reshape(values.shape[1:]), dtype=np.complex128)
 
     def _bz_mask_weights(self) -> RealArray:
         if not self.bz_mask_enabled:
@@ -841,6 +915,215 @@ class XTP:
         weights = np.exp(-0.5 * (radial_distance / sigma) ** 2)
         weights = np.where(radial_distance <= radius, weights, 0.0)
         return np.asarray(weights, dtype=np.float64)
+
+    def _integration_weights(self) -> RealArray:
+        if self._integration_weights_cache is not None:
+            return np.asarray(self._integration_weights_cache, dtype=np.float64)
+
+        bounds = self.brillouin_zone_bounds()
+        # Shifted (Monkhorst-Pack) grids sample a periodic function without
+        # touching the BZ edges, so the correct quadrature is uniform midpoint
+        # weights (dk per point) rather than the trapezoidal/Simpson rule.
+        periodic = bool(getattr(self.kgrid, "shifted", False))
+        weight_x = self._axis_integration_weights(
+            np.asarray(self.kgrid.kx_values, dtype=np.float64),
+            bounds[0],
+            active=True,
+            periodic=periodic,
+        )
+        weight_y = self._axis_integration_weights(
+            np.asarray(self.kgrid.ky_values, dtype=np.float64),
+            bounds[1] if self.kgrid.dimension >= 2 else (0.0, 0.0),
+            active=self.kgrid.dimension >= 2,
+            periodic=periodic,
+        )
+        weight_z = self._axis_integration_weights(
+            np.asarray(self.kgrid.kz_values, dtype=np.float64),
+            bounds[2] if self.kgrid.dimension >= 3 else (0.0, 0.0),
+            active=self.kgrid.dimension >= 3,
+            periodic=periodic,
+        )
+        weights = (
+            weight_x[:, np.newaxis, np.newaxis]
+            * weight_y[np.newaxis, :, np.newaxis]
+            * weight_z[np.newaxis, np.newaxis, :]
+        )
+        if self.bz_mask_enabled:
+            weights = weights * self._bz_mask_weights()
+        self._integration_weights_cache = np.asarray(weights.reshape(-1), dtype=np.float64)
+        return np.asarray(self._integration_weights_cache, dtype=np.float64)
+
+    @staticmethod
+    def _axis_integration_weights(
+        coordinates: NDArray[np.float64],
+        bounds: tuple[float, float],
+        *,
+        active: bool,
+        periodic: bool = False,
+    ) -> RealArray:
+        """Return 1-D numerical integration weights for one k-axis.
+
+        **Periodic (shifted / Monkhorst-Pack) grids** use uniform midpoint
+        weights ``(b_hi - b_lo) / N`` per point.  For a smooth periodic
+        integrand this is the correct rule and converges exponentially; it also
+        keeps the weights symmetric under ``k -> -k`` so even-harmonic
+        cancellation is preserved.
+
+        **Edge-inclusive grids** use the **composite Simpson's 1/3 rule** when
+        the grid is uniform with an **odd** number of points (O(h⁴)), and the
+        **trapezoidal rule** otherwise (non-uniform, even count, or < 3 points).
+
+        **Recommendation:** prefer ``shifted = true`` in ``[kgrid]`` to avoid
+        band degeneracies; otherwise use an *odd* k-count per axis to activate
+        Simpson's rule.
+        """
+        if not active:
+            return np.ones(1, dtype=np.float64)
+
+        coords = np.asarray(coordinates, dtype=np.float64)
+        n = coords.size
+
+        if n == 1:
+            return np.asarray([float(bounds[1] - bounds[0])], dtype=np.float64)
+
+        if periodic:
+            # Uniform midpoint weights: total weight = full BZ width.
+            width = float(bounds[1] - bounds[0])
+            return np.full(n, width / n, dtype=np.float64)
+
+        diffs = np.diff(coords)
+
+        # Composite Simpson's 1/3 rule: requires uniform spacing and odd n.
+        is_uniform = bool(np.allclose(diffs, diffs[0], rtol=1e-10, atol=0.0))
+        if is_uniform and n >= 3 and n % 2 == 1:
+            h = float(diffs[0])
+            # Pattern: h/3 * [1, 4, 2, 4, 2, …, 4, 1]
+            weights = np.full(n, 2.0 * h / 3.0, dtype=np.float64)
+            weights[0] = h / 3.0
+            weights[-1] = h / 3.0
+            weights[1:-1:2] = 4.0 * h / 3.0  # positions 1, 3, 5, …, n-2
+            return weights
+
+        # Trapezoidal rule (non-uniform spacing, even point count, or n == 2).
+        weights = np.empty_like(coords)
+        weights[0] = 0.5 * float(diffs[0])
+        weights[-1] = 0.5 * float(diffs[-1])
+        if n > 2:
+            weights[1:-1] = 0.5 * (coords[2:] - coords[:-2])
+        return np.asarray(weights, dtype=np.float64)
+
+    def _weighted_observable_over_k(
+        self,
+        rho_tensor: ComplexArray,
+        *,
+        operator_direction: str,
+        cached_operator: ComplexArray | None,
+        operator_builder,
+        progress_callback: ProgressCallback | None,
+        progress_message: str,
+    ) -> ComplexArray:
+        weights = self._integration_weights()
+        nt = rho_tensor.shape[1]
+        integrated = np.zeros(nt, dtype=np.complex128)
+        nk = self.kgrid.total_points
+
+        if cached_operator is not None:
+            chunk_size = self._recommended_k_chunk_size(
+                nt=nt,
+                rho_dtype=rho_tensor.dtype,
+                matrix_elements=self.hamiltonian.basis_size * self.hamiltonian.basis_size,
+                result_itemsize=np.dtype(np.complex128).itemsize,
+            )
+            for start in range(0, nk, chunk_size):
+                stop = min(start + chunk_size, nk)
+                expectation_chunk = np.einsum(
+                    "kmn,ktnm->kt",
+                    cached_operator[start:stop],
+                    rho_tensor[start:stop],
+                    optimize=True,
+                )
+                integrated += np.einsum(
+                    "k,kt->t",
+                    weights[start:stop],
+                    expectation_chunk,
+                    optimize=True,
+                )
+                self._advance_progress(progress_callback, stop - start, progress_message)
+            return np.asarray(integrated, dtype=np.complex128)
+
+        for ik, (kx, ky, kz) in enumerate(self._k_points):
+            operator = operator_builder(operator_direction, float(kx), float(ky), float(kz))
+            integrated += weights[ik] * np.einsum(
+                "mn,tnm->t",
+                operator,
+                rho_tensor[ik],
+                optimize=True,
+            )
+            self._advance_progress(progress_callback, 1, progress_message)
+        return np.asarray(integrated, dtype=np.complex128)
+
+    def _weighted_intraband_current_over_k(
+        self,
+        rho_tensor: ComplexArray,
+        *,
+        current_operator: ComplexArray,
+        progress_callback: ProgressCallback | None,
+        progress_message: str,
+    ) -> ComplexArray:
+        weights = self._integration_weights()
+        nt = rho_tensor.shape[1]
+        integrated = np.zeros(nt, dtype=np.complex128)
+        nk = self.kgrid.total_points
+        chunk_size = self._recommended_k_chunk_size(
+            nt=nt,
+            rho_dtype=rho_tensor.dtype,
+            matrix_elements=self.hamiltonian.basis_size,
+            result_itemsize=np.dtype(np.complex128).itemsize,
+        )
+
+        for start in range(0, nk, chunk_size):
+            stop = min(start + chunk_size, nk)
+            diagonal_current = np.diagonal(current_operator[start:stop], axis1=1, axis2=2)
+            band_diagonal = np.diagonal(rho_tensor[start:stop], axis1=2, axis2=3)
+            expectation_chunk = np.einsum(
+                "kn,ktn->kt",
+                diagonal_current,
+                band_diagonal,
+                optimize=True,
+            )
+            integrated += np.einsum(
+                "k,kt->t",
+                weights[start:stop],
+                expectation_chunk,
+                optimize=True,
+            )
+            self._advance_progress(progress_callback, stop - start, progress_message)
+
+        return np.asarray(integrated, dtype=np.complex128)
+
+    @staticmethod
+    def _recommended_k_chunk_size(
+        *,
+        nt: int,
+        rho_dtype: np.dtype,
+        matrix_elements: int,
+        result_itemsize: int,
+        target_bytes: int = 64 * 1024 * 1024,
+        max_chunk_size: int = 256,
+    ) -> int:
+        rho_itemsize = np.dtype(rho_dtype).itemsize
+        bytes_per_k = max(1, nt) * max(1, int(matrix_elements) * rho_itemsize + result_itemsize)
+        chunk_size = max(1, min(max_chunk_size, target_bytes // max(bytes_per_k, 1)))
+        return int(max(1, chunk_size))
+
+    @staticmethod
+    def _advance_progress(
+        progress_callback: ProgressCallback | None,
+        steps: int,
+        message: str,
+    ) -> None:
+        if progress_callback is not None:
+            progress_callback(int(steps), str(message))
 
     def _mask_reference_radius(self, bounds: tuple[tuple[float, float], ...]) -> float:
         active_bounds = bounds[: self.kgrid.dimension]
