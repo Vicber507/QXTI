@@ -28,6 +28,7 @@ from qxti.graphics.plot_response import ResponseGraphics, resolve_response_plot_
 from qxti.graphics.plot_susceptibility_tensor import (
     SusceptibilityTensorPlotter,
     resolve_susceptibility_plot_config,
+    to_helicity_basis,
 )
 
 
@@ -447,6 +448,63 @@ def plot_harmonic_graphics_from_saved_data(
     return outputs
 
 
+def _emit_tensor_plots(
+    *,
+    tensor: np.ndarray,
+    omega_axis: np.ndarray,
+    tensor_name: str,
+    direction_labels: tuple[str, ...],
+    available_components: list[tuple[int, ...]] | None,
+    dpi: int,
+    include_ev_axis: bool,
+    x_label: str,
+    argument_label: str,
+    base_dir: Path,
+    key_prefix: str,
+    do_overview: bool,
+    do_grid: bool,
+    do_components: bool,
+) -> dict[str, Path]:
+    """Emit overview/grid (in ``base_dir/overview``) and individual component
+    plots (in ``base_dir/components``) for one response tensor.
+
+    Used for both the cartesian and helicity bases, and for chi and sigma.
+    """
+    overview_dir = base_dir / "overview"
+    components_dir = base_dir / "components"
+    plotter = SusceptibilityTensorPlotter(
+        x_axis=omega_axis,
+        tensor=tensor,
+        output_dir=base_dir,
+        x_label=x_label,
+        argument_label=argument_label,
+        tensor_name=tensor_name,
+        direction_labels=direction_labels,
+        available_components=available_components or None,
+        dpi=dpi,
+        include_ev_axis=include_ev_axis,
+    )
+    out: dict[str, Path] = {}
+    if do_overview:
+        out[f"{key_prefix}_overview"] = plotter.plot_overview(
+            output_path=overview_dir / f"{tensor_name}_overview.png"
+        )
+    if do_grid:
+        out[f"{key_prefix}_grid"] = plotter.plot_grid(
+            output_path=overview_dir / f"{tensor_name}_grid.png"
+        )
+    if do_components:
+        for component in plotter.component_indices():
+            label = plotter._component_label(component)
+            # Sanitize the filename (helicity labels use +/- which are kept in
+            # the LaTeX titles but mapped to p/m in file names).
+            file_label = label.replace("+", "p").replace("-", "m")
+            out[f"{key_prefix}_{label}"] = plotter.plot_component(
+                component, output_path=components_dir / f"{tensor_name}_{file_label}.png"
+            )
+    return out
+
+
 def plot_susceptibility_graphics_from_saved_data(
     config_path: str | Path,
     *,
@@ -462,8 +520,12 @@ def plot_susceptibility_graphics_from_saved_data(
     )
     outputs: dict[str, Path] = {}
 
-    if not bool(config.xtp.susceptibility_plot_enabled):
-        print("[graphics] susceptibility plots disabled in [xtp]; skipping susceptibility graphics.")
+    # A susceptibility config is identified by susceptibility_enabled (the same
+    # flag used to run the sweep). Calling graphics on such a config generates
+    # its plots; on a non-susceptibility config it is silently skipped. No
+    # separate plot flag is needed in the input.
+    if not bool(config.xtp.susceptibility_enabled):
+        print("[graphics] not a susceptibility config (susceptibility_enabled=false); skipping susceptibility graphics.")
         return outputs
     if not dataset_path.exists():
         raise FileNotFoundError(
@@ -496,123 +558,122 @@ def plot_susceptibility_graphics_from_saved_data(
     )
     direction_labels = tuple(str(label) for label in data.get("direction_labels", ("x", "y", "z")))
     dpi = int(resolved_plot_config["dpi"])
-    include_ev_axis = bool(resolved_plot_config.get("include_ev_axis", True))
+
+    dimension = len(direction_labels)
+    # Plot the laser frequency axis in electron-volts (primary axis). The
+    # dataset stores omega in atomic units, so convert here. The redundant
+    # secondary eV axis is therefore disabled.
+    AU_TO_EV = 27.211386245988
+    include_ev_axis = False
+    x_label = r"$\omega_\mathrm{laser}\;(\mathrm{eV})$"
+    argument_label = r"\omega_\mathrm{laser}"
+
+    overview_cfg = resolved_plot_config["overview"]
+    grid_cfg = resolved_plot_config["grid"]
+    components_cfg = resolved_plot_config["components"]
+    do_overview = bool(overview_cfg["enabled"])
+    do_grid = bool(grid_cfg["enabled"])
+    do_components = bool(components_cfg["enabled"])
+    conductivity_cfg = resolved_plot_config.get("conductivity", {})
+    conductivity_on = isinstance(conductivity_cfg, dict) and bool(conductivity_cfg.get("enabled", False))
+
+    omega_axis = omega_axis_full[mask] * AU_TO_EV  # atomic units -> eV for plotting
+
+    def _components_from_indices(key: str, fallback: np.ndarray | None) -> list[tuple[int, ...]]:
+        arr = np.asarray(data.get(key, fallback if fallback is not None else np.empty((0,), dtype=int)), dtype=int)
+        return [
+            tuple(int(index) for index in row)
+            for row in np.atleast_2d(arr)
+            if arr.size > 0
+        ]
 
     for order in selected_orders:
         tensor_key = f"chi_order_{order}_tensor"
-        indices_key = f"chi_order_{order}_available_indices"
         if tensor_key not in data:
             print(f"[graphics] missing susceptibility tensor for order {order}; skipping.")
             continue
 
-        tensor = np.asarray(data[tensor_key], dtype=np.complex128)
-        omega_axis = omega_axis_full[mask]
-        tensor = tensor[mask]
-        available_indices_array = np.asarray(data.get(indices_key, np.empty((0, order + 1), dtype=int)), dtype=int)
-        available_components = [
-            tuple(int(index) for index in row)
-            for row in np.atleast_2d(available_indices_array)
-            if available_indices_array.size > 0
-        ]
         order_dir = output_dir / f"order_{order}"
-        plotter = SusceptibilityTensorPlotter(
-            x_axis=omega_axis,
-            tensor=tensor,
-            output_dir=order_dir,
-            x_label=r"$\omega_\mathrm{laser}\;(\mathrm{a.u.})$",
-            argument_label=r"\omega_\mathrm{laser}",
-            tensor_name=f"chi{order}",
-            direction_labels=direction_labels,
-            available_components=available_components or None,
-            dpi=dpi,
-            include_ev_axis=include_ev_axis,
+        cartesian_dir = order_dir / "cartesian"
+        helicity_dir = order_dir / "helicity"
+
+        # ---- susceptibility chi ----
+        chi_cart = np.asarray(data[tensor_key], dtype=np.complex128)[mask]
+        chi_components = _components_from_indices(
+            f"chi_order_{order}_available_indices", np.empty((0, order + 1), dtype=int)
         )
-
-        overview_cfg = resolved_plot_config["overview"]
-        if bool(overview_cfg["enabled"]):
-            overview_path = plotter.plot_overview(
-                output_path=order_dir / str(overview_cfg["output_file_template"]).format(order=order),
-            )
-            outputs[f"susceptibility_order_{order}_overview"] = overview_path
-
-        grid_cfg = resolved_plot_config["grid"]
-        if bool(grid_cfg["enabled"]):
-            grid_path = plotter.plot_grid(
-                output_path=order_dir / str(grid_cfg["output_file_template"]).format(order=order),
-            )
-            outputs[f"susceptibility_order_{order}_grid"] = grid_path
-
-        components_cfg = resolved_plot_config["components"]
-        if bool(components_cfg["enabled"]):
-            component_indices = list(plotter.component_indices())
-            for component in component_indices:
-                label = "".join(direction_labels[index] for index in component)
-                output_path = order_dir / str(components_cfg["output_file_template"]).format(
-                    order=order,
-                    label=label,
-                )
-                path = plotter.plot_component(component, output_path=output_path)
-                outputs[f"susceptibility_order_{order}_{label}"] = path
-
-        conductivity_cfg = resolved_plot_config.get("conductivity", {})
-        conductivity_tensor_key = f"sigma_order_{order}_tensor"
-        conductivity_indices_key = f"sigma_order_{order}_available_indices"
-        if isinstance(conductivity_cfg, dict) and bool(conductivity_cfg.get("enabled", False)):
-            if conductivity_tensor_key not in data:
-                print(
-                    f"[graphics] missing saved conductivity tensor for order {order}; "
-                    "rerun the susceptibility workflow to generate J/E conductivity plots."
-                )
-                continue
-
-            sigma_tensor = np.asarray(data[conductivity_tensor_key], dtype=np.complex128)[mask]
-            sigma_available_indices_array = np.asarray(
-                data.get(conductivity_indices_key, available_indices_array),
-                dtype=int,
-            )
-            sigma_available_components = [
-                tuple(int(index) for index in row)
-                for row in np.atleast_2d(sigma_available_indices_array)
-                if sigma_available_indices_array.size > 0
-            ]
-            sigma_plotter = SusceptibilityTensorPlotter(
-                x_axis=omega_axis,
-                tensor=sigma_tensor,
-                output_dir=order_dir,
-                x_label=r"$\omega_\mathrm{laser}\;(\mathrm{a.u.})$",
-                argument_label=r"\omega_\mathrm{laser}",
-                tensor_name=f"sigma{order}",
-                direction_labels=direction_labels,
-                available_components=sigma_available_components or None,
-                dpi=dpi,
-                include_ev_axis=include_ev_axis,
+        outputs.update(
+            {
+                f"susceptibility_order_{order}_{k}": v
+                for k, v in _emit_tensor_plots(
+                    tensor=chi_cart, omega_axis=omega_axis, tensor_name=f"chi{order}",
+                    direction_labels=direction_labels, available_components=chi_components,
+                    dpi=dpi, include_ev_axis=include_ev_axis, x_label=x_label,
+                    argument_label=argument_label, base_dir=cartesian_dir, key_prefix="cartesian",
+                    do_overview=do_overview, do_grid=do_grid, do_components=do_components,
+                ).items()
+            }
+        )
+        # Helicity (circular) basis: only well-defined for the rank-2 linear tensor.
+        if order == 1 and dimension >= 2:
+            chi_hel, hel_labels = to_helicity_basis(chi_cart, dimension)
+            outputs.update(
+                {
+                    f"susceptibility_order_{order}_{k}": v
+                    for k, v in _emit_tensor_plots(
+                        tensor=chi_hel, omega_axis=omega_axis, tensor_name=f"chi{order}",
+                        direction_labels=hel_labels, available_components=None,
+                        dpi=dpi, include_ev_axis=include_ev_axis, x_label=x_label,
+                        argument_label=argument_label, base_dir=helicity_dir, key_prefix="helicity",
+                        do_overview=do_overview, do_grid=do_grid, do_components=do_components,
+                    ).items()
+                }
             )
 
-            conductivity_overview_cfg = conductivity_cfg.get("overview", {})
-            if isinstance(conductivity_overview_cfg, dict) and bool(conductivity_overview_cfg.get("enabled", False)):
-                overview_path = sigma_plotter.plot_overview(
-                    output_path=order_dir / str(conductivity_overview_cfg["output_file_template"]).format(order=order),
+        # ---- conductivity sigma ----
+        sigma_key = f"sigma_order_{order}_tensor"
+        if conductivity_on and sigma_key in data:
+            sigma_cart = np.asarray(data[sigma_key], dtype=np.complex128)[mask]
+            sigma_components = _components_from_indices(
+                f"sigma_order_{order}_available_indices", np.empty((0, order + 1), dtype=int)
+            )
+            cond_overview = conductivity_cfg.get("overview", {})
+            cond_grid = conductivity_cfg.get("grid", {})
+            cond_components = conductivity_cfg.get("components", {})
+            sig_do_overview = isinstance(cond_overview, dict) and bool(cond_overview.get("enabled", False))
+            sig_do_grid = isinstance(cond_grid, dict) and bool(cond_grid.get("enabled", False))
+            sig_do_components = isinstance(cond_components, dict) and bool(cond_components.get("enabled", False))
+            outputs.update(
+                {
+                    f"conductivity_order_{order}_{k}": v
+                    for k, v in _emit_tensor_plots(
+                        tensor=sigma_cart, omega_axis=omega_axis, tensor_name=f"sigma{order}",
+                        direction_labels=direction_labels, available_components=sigma_components,
+                        dpi=dpi, include_ev_axis=include_ev_axis, x_label=x_label,
+                        argument_label=argument_label, base_dir=cartesian_dir, key_prefix="cartesian",
+                        do_overview=sig_do_overview, do_grid=sig_do_grid, do_components=sig_do_components,
+                    ).items()
+                }
+            )
+            if order == 1 and dimension >= 2:
+                sigma_hel, hel_labels = to_helicity_basis(sigma_cart, dimension)
+                outputs.update(
+                    {
+                        f"conductivity_order_{order}_{k}": v
+                        for k, v in _emit_tensor_plots(
+                            tensor=sigma_hel, omega_axis=omega_axis, tensor_name=f"sigma{order}",
+                            direction_labels=hel_labels, available_components=None,
+                            dpi=dpi, include_ev_axis=include_ev_axis, x_label=x_label,
+                            argument_label=argument_label, base_dir=helicity_dir, key_prefix="helicity",
+                            do_overview=sig_do_overview, do_grid=sig_do_grid, do_components=sig_do_components,
+                        ).items()
+                    }
                 )
-                outputs[f"conductivity_order_{order}_overview"] = overview_path
-
-            conductivity_grid_cfg = conductivity_cfg.get("grid", {})
-            if isinstance(conductivity_grid_cfg, dict) and bool(conductivity_grid_cfg.get("enabled", False)):
-                grid_path = sigma_plotter.plot_grid(
-                    output_path=order_dir / str(conductivity_grid_cfg["output_file_template"]).format(order=order),
-                )
-                outputs[f"conductivity_order_{order}_grid"] = grid_path
-
-            conductivity_components_cfg = conductivity_cfg.get("components", {})
-            if isinstance(conductivity_components_cfg, dict) and bool(conductivity_components_cfg.get("enabled", False)):
-                component_indices = list(sigma_plotter.component_indices())
-                for component in component_indices:
-                    label = "".join(direction_labels[index] for index in component)
-                    output_path = order_dir / str(conductivity_components_cfg["output_file_template"]).format(
-                        order=order,
-                        label=label,
-                    )
-                    path = sigma_plotter.plot_component(component, output_path=output_path)
-                    outputs[f"conductivity_order_{order}_{label}"] = path
+        elif conductivity_on and sigma_key not in data:
+            print(
+                f"[graphics] missing saved conductivity tensor for order {order}; "
+                "rerun the susceptibility workflow to generate J/E conductivity plots."
+            )
 
     return outputs
 
@@ -693,11 +754,24 @@ def _deep_update_local(target: dict[str, object], updates: dict[str, object]) ->
 def plot_all_graphics_from_saved_data(
     config_path: str | Path,
 ) -> dict[str, Path]:
+    """Generate every graphics family that has saved data for this config.
+
+    Families whose datasets are missing are skipped (not fatal), so a
+    susceptibility-only config produces only its susceptibility plots, an
+    HHG-only config produces only its harmonic/response plots, and so on.
+    """
     outputs: dict[str, Path] = {}
-    outputs.update(plot_hamiltonian_graphics_from_saved_data(config_path))
-    outputs.update(plot_harmonic_graphics_from_saved_data(config_path))
-    outputs.update(plot_susceptibility_graphics_from_saved_data(config_path))
-    outputs.update(plot_response_graphics_from_saved_data(config_path))
+    families = (
+        ("hamiltonian", plot_hamiltonian_graphics_from_saved_data),
+        ("harmonics", plot_harmonic_graphics_from_saved_data),
+        ("susceptibility", plot_susceptibility_graphics_from_saved_data),
+        ("response", plot_response_graphics_from_saved_data),
+    )
+    for name, plotter in families:
+        try:
+            outputs.update(plotter(config_path))
+        except FileNotFoundError as exc:
+            print(f"[graphics] skipping {name} graphics (no saved data): {exc}")
     return outputs
 
 

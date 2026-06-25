@@ -572,12 +572,16 @@ def test_susceptibility_graphics_generate_outputs_from_saved_dataset(tmp_path: P
 
     outputs = plot_susceptibility_graphics_from_saved_data(config_path)
 
-    assert "susceptibility_order_1_grid" in outputs
-    assert "susceptibility_order_1_xx" in outputs
-    assert "susceptibility_order_1_yx" in outputs
-    assert "conductivity_order_1_grid" in outputs
-    assert "conductivity_order_1_xx" in outputs
-    assert "conductivity_order_1_yx" in outputs
+    # Cartesian-basis plots (organized under cartesian/overview and cartesian/components).
+    assert "susceptibility_order_1_cartesian_grid" in outputs
+    assert "susceptibility_order_1_cartesian_xx" in outputs
+    assert "susceptibility_order_1_cartesian_yx" in outputs
+    assert "conductivity_order_1_cartesian_grid" in outputs
+    assert "conductivity_order_1_cartesian_xx" in outputs
+    assert "conductivity_order_1_cartesian_yx" in outputs
+    # Helicity-basis (circular +/-) plots are generated for the linear tensor.
+    assert "susceptibility_order_1_helicity_overview" in outputs
+    assert "conductivity_order_1_helicity_overview" in outputs
     for path in outputs.values():
         assert path.exists()
         assert path.stat().st_size > 0
@@ -714,13 +718,25 @@ def test_susceptibility_scan_runner_accepts_special_solver_section_without_cmd(t
 
     outputs = SusceptibilityScanRunner.from_file(config_path).run()
 
+    # The sweep now produces ONLY the data; plots are generated separately by the
+    # graphics entry point, keeping the workflow uniform with the rest of QXTI.
     assert "xtp_susceptibility_data" in outputs
-    assert "susceptibility_order_1_overview" in outputs
-    assert "conductivity_order_1_overview" in outputs
+    assert "susceptibility_order_1_overview" not in outputs
+    assert "conductivity_order_1_overview" not in outputs
     assert not (tmp_path / "cmd").exists()
     dataset = load_dataset_npz(outputs["xtp_susceptibility_data"])
     assert tuple(int(order) for order in dataset["orders"]) == (1,)
     assert np.asarray(dataset["laser_omega_axis"], dtype=float).shape == (2,)
+
+    # Plots are produced on demand from the saved dataset via graphics, honoring
+    # susceptibility_plot_enabled (same pattern as the other graphics families).
+    from qxti.graphics.graphics import plot_susceptibility_graphics_from_saved_data
+
+    plot_outputs = plot_susceptibility_graphics_from_saved_data(config_path)
+    assert "susceptibility_order_1_cartesian_overview" in plot_outputs
+    assert "conductivity_order_1_cartesian_overview" in plot_outputs
+    # Helicity-basis (circular) plots are produced alongside the cartesian ones.
+    assert "susceptibility_order_1_helicity_overview" in plot_outputs
 
 
 def test_simulation_can_skip_all_saved_rho_postprocessing_by_config(tmp_path: Path) -> None:
