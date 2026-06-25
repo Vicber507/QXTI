@@ -197,6 +197,14 @@ class CMD:
         self._n_workers: int = int(cpu_count if n_workers is None else max(1, n_workers))
         # Pre-compute the k-independent damping matrix once; reused every time step.
         self._damping_cache: ComplexArray = self._damping_matrix()
+        # Console progress (set False to silence, e.g. inside parallel workers).
+        self.progress_enabled: bool = True
+        # Use the gauge-invariant covariant k-gradient (parallel transport /
+        # Wilson links) instead of computing grad_k rho and the Berry-connection
+        # commutator separately. The separate form is not individually
+        # gauge-invariant and breaks symmetries for off-diagonal rho at orders
+        # >= 2; the covariant form fixes this. See _covariant_gradient_for_k_index.
+        self.use_covariant_gradient: bool = True
 
     def rho_equilibrium(self, k: NDArray[np.float64]) -> ComplexArray:
         """Return the equilibrium density matrix at one k-point."""
@@ -849,6 +857,16 @@ class CMD:
             self.band_gauge_frame.connection(direction)
             for direction in ("x", "y", "z")
         )
+        # Eigenvectors reshaped to the k-mesh, used by the covariant-gradient
+        # parallel transport. None when covariant gradient is disabled or when
+        # the grid is too coarse (any active axis with < 2 points) — in that
+        # case parallel transport cannot be formed and the separate
+        # gradient + Berry-commutator (with single-point fallback) is used.
+        vectors_mesh = (
+            self.band_gauge_frame.eigenvectors.reshape(*self.kgrid.shape, nb, nb)
+            if self.use_covariant_gradient and self._grid_supports_covariant_gradient()
+            else None
+        )
 
         import threading as _threading
 
@@ -878,6 +896,7 @@ class CMD:
                     connection_cache,
                     ik,
                     nt=nt,
+                    vectors_mesh=vectors_mesh,
                 )
                 source_series_k = self._field_weighted_source_series(
                     field_series,
@@ -1177,10 +1196,26 @@ class CMD:
         index: int,
         *,
         nt: int,
+        vectors_mesh: np.ndarray | None = None,
     ) -> ComplexArray:
         rho_series = self._rho_series_from_storage_slice(previous_order, index, nt=nt)
         nb = rho_series.shape[1]
         components = np.zeros((nt, 3, nb, nb), dtype=np.complex128)
+
+        # Gauge-invariant path: the covariant gradient D_k rho = grad_k rho -
+        # i[A, rho] is computed in one shot by parallel transport, which is
+        # exactly gauge-invariant and preserves crystal symmetries (no separate
+        # plain gradient + Berry commutator that individually break gauge).
+        if (
+            self.use_covariant_gradient
+            and self.include_intraband
+            and self.include_interband
+            and vectors_mesh is not None
+        ):
+            components += self._covariant_gradient_for_k_index(
+                previous_order_mesh, vectors_mesh, index, nt=nt
+            )
+            return components
 
         if self.include_intraband:
             components += self._k_gradient_components_for_k_index(
@@ -1197,6 +1232,110 @@ class CMD:
             )
 
         return components
+
+    def _grid_supports_covariant_gradient(self) -> bool:
+        """Return whether every active k-axis has >= 2 points (needed for transport)."""
+        axes = (self.kgrid.kx_values, self.kgrid.ky_values, self.kgrid.kz_values)
+        for axis in range(self.hamiltonian.dimension):
+            if len(axes[axis]) < 2:
+                return False
+        return True
+
+    def _covariant_gradient_for_k_index(
+        self,
+        rho_mesh: np.ndarray,
+        vectors_mesh: np.ndarray,
+        index: int,
+        *,
+        nt: int,
+    ) -> ComplexArray:
+        """Gauge-invariant covariant k-gradient via parallel transport.
+
+        Computes ``D_k rho = grad_k rho - i[A, rho]`` for all active Cartesian
+        directions using Wilson links ``W = U(k)^dag U(k')`` between neighbouring
+        k-points: the neighbour's density matrix is parallel-transported to the
+        band basis of the current k, ``W rho(k') W^dag``, before taking the finite
+        difference. The transport cancels the arbitrary eigenvector phases, so the
+        result is exactly gauge-invariant and respects the crystal symmetries even
+        for off-diagonal rho (orders >= 2), where the separate plain-gradient +
+        Berry-commutator form fails.
+        """
+        nb = self.hamiltonian.basis_size
+        grad = np.zeros((nt, 3, nb, nb), dtype=np.complex128)
+        multi_index = list(np.unravel_index(index, self.kgrid.shape))
+        u0_dag = vectors_mesh[tuple(multi_index)].conj().T
+
+        for axis, grid_values in enumerate(
+            (self.kgrid.kx_values, self.kgrid.ky_values, self.kgrid.kz_values)
+        ):
+            if axis >= self.hamiltonian.dimension:
+                break
+            coords = np.asarray(grid_values, dtype=float)
+            if coords.size < 2:
+                continue
+            grad[:, axis] = self._covariant_gradient_series(
+                rho_mesh, vectors_mesh, multi_index, axis, coords, u0_dag, nt
+            )
+        return grad
+
+    def _covariant_gradient_series(
+        self,
+        rho_mesh: np.ndarray,
+        vectors_mesh: np.ndarray,
+        multi_index: list[int],
+        axis: int,
+        coords: FloatArray,
+        u0_dag: ComplexArray,
+        nt: int,
+    ) -> ComplexArray:
+        """Finite-difference covariant derivative along one axis (parallel transport).
+
+        Same finite-difference coefficients as :meth:`_gradient_series_at_grid_index`
+        (handles non-uniform grids and edges), but each neighbour contributes the
+        transported density matrix ``W rho(k') W^dag`` instead of ``rho(k')``.
+        """
+        position = multi_index[axis]
+        n = int(coords.size)
+
+        def take(p: int) -> ComplexArray:
+            local = list(multi_index)
+            local[axis] = p
+            rho_j = self._rho_series_from_storage_slice(rho_mesh, tuple(local), nt=nt)
+            wilson = u0_dag @ vectors_mesh[tuple(local)]  # W = U(k)^dag U(k')
+            # (W rho_j W^dag)_il = W_ij rho_jk conj(W_lk), for every time step.
+            return np.einsum("ij,tjk,lk->til", wilson, rho_j, wilson.conj(), optimize=True)
+
+        if n == 2:
+            delta = float(coords[1] - coords[0])
+            if delta == 0.0:
+                raise ValueError("coordinates must be strictly monotonic.")
+            return np.asarray((take(1) - take(0)) / delta, dtype=np.complex128)
+
+        if position == 0:
+            s1 = float(coords[1] - coords[0])
+            s2 = float(coords[2] - coords[1])
+            c0 = -(2.0 * s1 + s2) / (s1 * (s1 + s2))
+            c1 = (s1 + s2) / (s1 * s2)
+            c2 = -s1 / (s2 * (s1 + s2))
+            return np.asarray(c0 * take(0) + c1 * take(1) + c2 * take(2), dtype=np.complex128)
+
+        if position == n - 1:
+            s1 = float(coords[-2] - coords[-3])
+            s2 = float(coords[-1] - coords[-2])
+            c0 = s2 / (s1 * (s1 + s2))
+            c1 = -(s1 + s2) / (s1 * s2)
+            c2 = (2.0 * s2 + s1) / (s2 * (s1 + s2))
+            return np.asarray(c0 * take(n - 3) + c1 * take(n - 2) + c2 * take(n - 1), dtype=np.complex128)
+
+        sl = float(coords[position] - coords[position - 1])
+        sr = float(coords[position + 1] - coords[position])
+        cp = -sr / (sl * (sl + sr))
+        cc = (sr - sl) / (sl * sr)
+        cn = sl / (sr * (sl + sr))
+        return np.asarray(
+            cp * take(position - 1) + cc * take(position) + cn * take(position + 1),
+            dtype=np.complex128,
+        )
 
     def _field_series(self, target_times: FloatArray) -> FloatArray:
         field = np.asarray(self.laser_system.electric_field(target_times), dtype=float)
@@ -1629,6 +1768,9 @@ class CMD:
             raise ValueError("LaserSystem must return 3 Cartesian components.")
         return vector
 
-    @staticmethod
-    def _emit_progress(message: str) -> None:
-        print(f"[CMD] {message}")
+    def _emit_progress(self, message: str) -> None:
+        # Per-instance progress can be silenced (e.g. inside parallel sweep
+        # workers, where the per-k-point progress would spam the console and
+        # the meaningful progress is the per-frequency global counter).
+        if getattr(self, "progress_enabled", True):
+            print(f"[CMD] {message}")

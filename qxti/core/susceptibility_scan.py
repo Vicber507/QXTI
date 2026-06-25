@@ -19,6 +19,7 @@ from qxti.utils.progress import ProgressTimer, format_bytes, format_duration
 
 ComplexArray = NDArray[np.complex128]
 RealArray = NDArray[np.float64]
+_AU_TO_EV = 27.211386245988
 
 
 def _resolve_scan_solver_config(config: QXTIConfig) -> CMDConfig:
@@ -156,6 +157,9 @@ def _susceptibility_frequency_worker(payload: tuple) -> tuple[int, dict[str, Any
             ),
             max_order=max_order,
         )
+        # Silence the per-k-point CMD progress inside the worker; the meaningful
+        # progress is the per-frequency global counter printed by the main process.
+        cmd.progress_enabled = False
         rho_orders = cmd.compute_all_orders()
         xtp_by_direction[direction] = simulation.build_xtp(cmd, rho_orders)
 
@@ -237,29 +241,32 @@ class SusceptibilityScanRunner:
             for index, laser_omega in enumerate(laser_omega_axis)
         ]
 
+        nfreq_total = len(laser_omega_axis)
+
+        def _emit_frequency_progress(index: int) -> None:
+            frequency_timer.advance()
+            omega_ev = float(laser_omega_axis[index]) * _AU_TO_EV
+            self._emit_progress(
+                f"Susceptibility sweep: frequency {frequency_timer.completed}/{nfreq_total} done "
+                f"(omega_laser={omega_ev:.4f} eV), {self._runtime_suffix(frequency_timer)}."
+            )
+
         if n_workers <= 1:
-            self._emit_progress("Susceptibility sweep: running serially (n_workers=1).")
-            results_iter = (_susceptibility_frequency_worker(payload) for payload in payloads)
-            for index, values in results_iter:
+            self._emit_progress(
+                f"Susceptibility sweep: running serially over {nfreq_total} frequencies (n_workers=1)."
+            )
+            for index, values in (_susceptibility_frequency_worker(p) for p in payloads):
                 self._write_frequency_result(dataset, index, values)
-                frequency_timer.advance()
-                self._emit_progress(
-                    f"Susceptibility frequency {frequency_timer.completed}/{len(laser_omega_axis)} "
-                    f"assembled ({self._runtime_suffix(frequency_timer)})."
-                )
+                _emit_frequency_progress(index)
         else:
             self._emit_progress(
-                f"Susceptibility sweep: parallelizing {len(laser_omega_axis)} frequencies "
+                f"Susceptibility sweep: parallelizing {nfreq_total} frequencies "
                 f"over {n_workers} processes (each process uses 1 thread for its k-loop)."
             )
             with ProcessPoolExecutor(max_workers=n_workers) as executor:
                 for index, values in executor.map(_susceptibility_frequency_worker, payloads):
                     self._write_frequency_result(dataset, index, values)
-                    frequency_timer.advance()
-                    self._emit_progress(
-                        f"Susceptibility frequency {frequency_timer.completed}/{len(laser_omega_axis)} "
-                        f"assembled ({self._runtime_suffix(frequency_timer)})."
-                    )
+                    _emit_frequency_progress(index)
 
         output_dir = Path(xtp_cfg.susceptibility_output_dir) / "data"
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -273,13 +280,18 @@ class SusceptibilityScanRunner:
         )
         outputs: dict[str, Path] = {"xtp_susceptibility_data": dataset_path}
 
-        if self.config.xtp.susceptibility_plot_enabled and self.config.source_path is not None:
-            self._emit_progress(
-                "XTP susceptibility plots enabled: generating susceptibility graphics from the saved dataset."
-            )
-            from qxti.graphics.graphics import plot_susceptibility_graphics_from_saved_data
-
-            outputs.update(plot_susceptibility_graphics_from_saved_data(self.config.source_path))
+        # Plots are NOT generated here. To keep the workflow uniform with the
+        # rest of QXTI (data first, plots second), the susceptibility/conductivity
+        # graphics are produced from the saved dataset by the graphics entry point:
+        #   python qxti/graphics/graphics.py <config> --family susceptibility
+        #   python qxti/graphics/plot_susceptibility_tensor.py <config>
+        # (both honor [xtp] susceptibility_plot_enabled).
+        config_name = self.config.source_path.name if self.config.source_path is not None else "<config>"
+        self._emit_progress(
+            "Susceptibility data saved. To generate the chi/sigma plots run: "
+            f"python qxti/graphics/graphics.py {config_name} --family susceptibility "
+            f"(or python qxti/graphics/plot_susceptibility_tensor.py {config_name})."
+        )
 
         return outputs
 

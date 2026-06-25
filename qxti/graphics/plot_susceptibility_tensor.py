@@ -81,6 +81,78 @@ OKABE_ITO = (
     "#F0E442",
 )
 
+# A 12-colour categorical palette so all 9 tensor components are distinguishable
+# in the overview (a 3x3 tensor has 9 curves; an 8-colour palette repeats).
+TENSOR_PALETTE = (
+    "#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#17becf",
+    "#8c564b", "#e377c2", "#bcbd22", "#7f7f7f", "#393b79", "#637939",
+)
+# Cyclic line styles, used together with colour to reinforce distinguishability.
+LINE_STYLES = ("-", "--", "-.", ":")
+
+
+def to_helicity_basis(
+    tensor: ComplexArray,
+    dimension: int,
+) -> tuple[ComplexArray, tuple[str, ...]]:
+    r"""Rotate a cartesian response tensor to the helicity (circular) basis.
+
+    The in-plane ``(x, y)`` block is expressed in the circular basis
+    ``e_\pm = (x \pm i y)/\sqrt{2}`` (left/right rotating), while ``z`` (if
+    present) is kept. For a rank-2 response ``J_i = T_{ij} E_j`` the transformed
+    tensor is ``T' = U^\dagger T U`` with ``U`` the columns ``[e_+, e_-, (z)]``.
+
+    This is the tensor analogue of forming the circular current ``J_\pm =
+    J_x \pm i J_y``. The chiral/Hall part shows up as ``T_{++} \neq T_{--}``
+    (their difference is the circular dichroism, proportional to the
+    antisymmetric ``T_{xy} - T_{yx}``).
+
+    Parameters
+    ----------
+    tensor:
+        Cartesian tensor of shape ``(Nomega, dim, dim)``.
+    dimension:
+        Spatial dimension (1, 2, or 3).
+
+    Returns
+    -------
+    (tensor_helicity, labels):
+        The rotated tensor (same shape) and the component labels, e.g.
+        ``("+", "-", "z")`` for 3D.
+    """
+    values = np.asarray(tensor, dtype=np.complex128)
+    if dimension <= 1:
+        # No in-plane rotation is possible in 1D.
+        return values, ("x",)
+
+    inv_sqrt2 = 1.0 / np.sqrt(2.0)
+    if dimension == 2:
+        unitary = np.array(
+            [[inv_sqrt2, inv_sqrt2], [1j * inv_sqrt2, -1j * inv_sqrt2]],
+            dtype=np.complex128,
+        )
+        labels: tuple[str, ...] = ("+", "-")
+    else:
+        unitary = np.array(
+            [
+                [inv_sqrt2, inv_sqrt2, 0.0],
+                [1j * inv_sqrt2, -1j * inv_sqrt2, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.complex128,
+        )
+        labels = ("+", "-", "z")
+
+    # T'_{ab} = sum_ij (U^dagger)_{ai} T_{ij} U_{jb}, applied for every omega.
+    transformed = np.einsum(
+        "ai,wij,jb->wab",
+        unitary.conj().T,
+        values,
+        unitary,
+        optimize=True,
+    )
+    return np.asarray(transformed, dtype=np.complex128), labels
+
 
 class SusceptibilityTensorPlotter:
     """Plot real and imaginary parts of susceptibility tensor components."""
@@ -184,6 +256,19 @@ class SusceptibilityTensorPlotter:
             linestyle="--",
             label=rf"$\Im\,{self.tensor_name}_{{{label}}}$",
         )
+        # Modulus |chi| (the envelope sqrt(Re^2+Im^2)); a faint filled band makes
+        # it easy to read off the magnitude alongside Re and Im.
+        modulus = np.abs(values)
+        axis.plot(
+            self.x_axis,
+            modulus,
+            color=OKABE_ITO[2],
+            linewidth=2.2,
+            linestyle="-",
+            alpha=0.9,
+            label=rf"$|{self.tensor_name}_{{{label}}}|$",
+        )
+        axis.fill_between(self.x_axis, 0.0, modulus, color=OKABE_ITO[2], alpha=0.07, linewidth=0.0)
         axis.axhline(0.0, color="#B8C4D0", linewidth=0.8, zorder=0)
         axis.set_xlabel(self.x_label)
         axis.set_ylabel(rf"${self.tensor_name}_{{{label}}}$")
@@ -255,8 +340,11 @@ class SusceptibilityTensorPlotter:
         for ipanel, (axis, component_indices) in enumerate(zip(axes.flat, indices)):
             values = self.tensor[(slice(None),) + component_indices]
             label = self._component_label(component_indices)
+            modulus = np.abs(values)
             axis.plot(self.x_axis, np.real(values), color=OKABE_ITO[0], linewidth=1.6, label="Re")
             axis.plot(self.x_axis, np.imag(values), color=OKABE_ITO[1], linewidth=1.6, linestyle="--", label="Im")
+            axis.plot(self.x_axis, modulus, color=OKABE_ITO[2], linewidth=1.8, label=r"$|\cdot|$")
+            axis.fill_between(self.x_axis, 0.0, modulus, color=OKABE_ITO[2], alpha=0.07, linewidth=0.0)
             axis.axhline(0.0, color="#B8C4D0", linewidth=0.8, zorder=0)
             axis.set_title(rf"{panel_labels[ipanel]}. ${self.tensor_name}_{{{label}}}$", fontsize=10, loc="left")
             axis.grid(True, alpha=0.18, linewidth=0.6)
@@ -298,30 +386,44 @@ class SusceptibilityTensorPlotter:
         if not component_indices:
             raise ValueError("No susceptibility components are available to plot.")
 
-        figure, axes = pyplot.subplots(2, 1, figsize=(8.2, 6.2), sharex=True, squeeze=False)
+        # Three stacked panels: real part, imaginary part, and modulus |.|.
+        figure, axes = pyplot.subplots(3, 1, figsize=(9.0, 9.5), sharex=True, squeeze=False)
         real_axis = axes[0, 0]
         imag_axis = axes[1, 0]
+        modulus_axis = axes[2, 0]
 
         for index, component in enumerate(component_indices):
             label = self._component_label(component)
-            color = OKABE_ITO[index % len(OKABE_ITO)]
+            # Distinct colour AND line style per component so all 9 curves of a
+            # 3x3 tensor are distinguishable. Diagonal components (e.g. xx) are
+            # drawn thicker to stand out from the off-diagonal ones.
+            color = TENSOR_PALETTE[index % len(TENSOR_PALETTE)]
+            linestyle = LINE_STYLES[index % len(LINE_STYLES)]
+            is_diagonal = len(set(component)) == 1
+            linewidth = 2.4 if is_diagonal else 1.5
             values = self.tensor[(slice(None),) + component]
             real_axis.plot(
-                self.x_axis,
-                np.real(values),
-                color=color,
-                linewidth=1.8,
+                self.x_axis, np.real(values), color=color,
+                linewidth=linewidth, linestyle=linestyle,
                 label=rf"${self.tensor_name}_{{{label}}}$",
             )
             imag_axis.plot(
-                self.x_axis,
-                np.imag(values),
-                color=color,
-                linewidth=1.8,
+                self.x_axis, np.imag(values), color=color,
+                linewidth=linewidth, linestyle=linestyle,
+                label=rf"${self.tensor_name}_{{{label}}}$",
+            )
+            modulus_axis.plot(
+                self.x_axis, np.abs(values), color=color,
+                linewidth=linewidth, linestyle=linestyle,
                 label=rf"${self.tensor_name}_{{{label}}}$",
             )
 
-        for axis, title in ((real_axis, "Real part"), (imag_axis, "Imaginary part")):
+        panels = (
+            (real_axis, "Real part"),
+            (imag_axis, "Imaginary part"),
+            (modulus_axis, "Modulus"),
+        )
+        for axis, title in panels:
             axis.axhline(0.0, color="#B8C4D0", linewidth=0.8, zorder=0)
             axis.grid(True, alpha=0.18, linewidth=0.6)
             axis.spines["top"].set_visible(False)
@@ -329,16 +431,10 @@ class SusceptibilityTensorPlotter:
             axis.ticklabel_format(axis="y", style="sci", scilimits=(-2, 2))
             axis.set_title(title, fontsize=10, loc="left")
 
-        imag_axis.set_xlabel(self.x_label)
+        modulus_axis.set_xlabel(self.x_label)
         real_axis.set_ylabel(rf"$\Re\,{self.tensor_name}$")
         imag_axis.set_ylabel(rf"$\Im\,{self.tensor_name}$")
-        real_axis.legend(
-            loc="upper center",
-            bbox_to_anchor=(0.5, 1.30),
-            ncol=min(4, len(component_indices)),
-            frameon=False,
-            fontsize=8,
-        )
+        modulus_axis.set_ylabel(rf"$|{self.tensor_name}|$")
         if self.include_ev_axis:
             top_axis = real_axis.secondary_xaxis(
                 "top",
@@ -346,14 +442,27 @@ class SusceptibilityTensorPlotter:
             )
             top_axis.set_xlabel(r"$\omega_\mathrm{laser}\;(\mathrm{eV})$")
 
+        # Legend to the RIGHT of the panels (one column) so it never overlaps the
+        # eV top axis and all 9 components stay readable.
+        handles, leg_labels = real_axis.get_legend_handles_labels()
+        figure.legend(
+            handles,
+            leg_labels,
+            loc="center left",
+            bbox_to_anchor=(0.84, 0.5),
+            ncol=1,
+            frameon=False,
+            fontsize=9,
+        )
         figure.suptitle(
             rf"Overview of {self.tensor_name}$^{{({self.order})}}$ components",
             fontsize=12.5,
         )
         output = self.output_dir / f"{self.tensor_name}_overview.png" if output_path is None else Path(output_path)
         output.parent.mkdir(parents=True, exist_ok=True)
-        figure.tight_layout()
-        figure.savefig(output, dpi=self.dpi, facecolor="white")
+        # Reserve the right margin for the legend and the top for the suptitle.
+        figure.tight_layout(rect=(0.0, 0.0, 0.83, 0.95))
+        figure.savefig(output, dpi=self.dpi, facecolor="white", bbox_inches="tight")
 
         if show:
             pyplot.show()
