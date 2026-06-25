@@ -90,22 +90,41 @@ class KGrid:
         )
 
     @staticmethod
-    def shifted_axis(lower: float, upper: float, num_points: int) -> FloatArray:
-        """Return a symmetric Monkhorst-Pack axis on ``[lower, upper]``.
+    def periodic_axis(
+        lower: float, upper: float, num_points: int, offset: float = 0.5
+    ) -> FloatArray:
+        """Return a uniform *periodic* axis on ``[lower, upper]``.
 
-        The points are ``k_i = c + (2i - N + 1) / N * L`` where ``c`` is the
-        interval center and ``L`` its half-width.  They are symmetric under
-        ``k -> -k`` about the center, uniformly spaced by ``2L/N``, and never
-        touch the endpoints ``lower``/``upper`` (so they never land on a BZ
-        edge).  For ``N`` odd this also skips the exact center.
+        The points are ``k_i = lower + (i + offset) * L / N`` with ``L`` the
+        full width and ``offset`` the fractional shift within the first cell.
+        The spacing is always uniform (``L/N``), so the grid samples a periodic
+        Brillouin zone and integrals use uniform (midpoint) weights.
+
+        - ``offset = 0.5`` gives the symmetric Monkhorst-Pack grid (symmetric
+          under ``k -> -k``; activates exact even/odd selection-rule
+          cancellation).
+        - An *incommensurate* (irrational) ``offset`` provably never lands on a
+          rational high-symmetry point of the BZ (Dirac at 2/3, the pi/2 spin
+          degeneracies, ...), for **any** ``N`` -- used by the automatic
+          degeneracy guard to move a grid off a band-touching point.
         """
         n = int(num_points)
         if n <= 0:
             raise ValueError("num_points must be strictly positive.")
-        center = 0.5 * (float(lower) + float(upper))
-        half_width = 0.5 * (float(upper) - float(lower))
+        width = float(upper) - float(lower)
         i = np.arange(n, dtype=float)
-        return np.asarray(center + (2.0 * i - n + 1.0) / n * half_width, dtype=np.float64)
+        return np.asarray(float(lower) + (i + float(offset)) * width / n, dtype=np.float64)
+
+    @staticmethod
+    def shifted_axis(lower: float, upper: float, num_points: int) -> FloatArray:
+        """Symmetric Monkhorst-Pack axis: :meth:`periodic_axis` with offset 1/2.
+
+        The points are symmetric under ``k -> -k`` about the interval center,
+        uniformly spaced, and never touch the endpoints ``lower``/``upper`` (so
+        they never land on a BZ edge).  For ``N`` odd this also skips the exact
+        center.
+        """
+        return KGrid.periodic_axis(lower, upper, num_points, offset=0.5)
 
     @property
     def shape(self) -> tuple[int, int, int]:

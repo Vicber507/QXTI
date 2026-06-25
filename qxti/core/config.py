@@ -154,6 +154,7 @@ class KGridConfig:
     ky_values: list[float] = field(default_factory=list)
     kz_values: list[float] = field(default_factory=list)
     shifted: bool = False
+    auto_degeneracy_guard: bool = True
 
 
 @dataclass(slots=True)
@@ -446,6 +447,7 @@ class QXTIConfig:
             ky_values=_parse_float_list(section.get("ky_values", fallback=""), default=[]),
             kz_values=_parse_float_list(section.get("kz_values", fallback=""), default=[]),
             shifted=section.getboolean("shifted", fallback=section.getboolean("monkhorst_pack", fallback=False)),
+            auto_degeneracy_guard=section.getboolean("auto_degeneracy_guard", fallback=True),
         )
 
     @staticmethod
