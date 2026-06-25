@@ -100,40 +100,163 @@ class QXTISimulation:
             nkz = points_per_axis if dimension >= 3 else 1
 
         bounds = hamiltonian.reciprocal_box_bounds()
+        npts = (nkx, nky, nkz)
+        guard_on = bool(getattr(kcfg, "auto_degeneracy_guard", True))
 
-        def _axis(lo: float, hi: float, n: int) -> NDArray[np.float64]:
-            if shifted:
-                # Symmetric Monkhorst-Pack: never lands on a BZ edge/degeneracy.
-                return KGrid.shifted_axis(lo, hi, n)
-            return np.linspace(lo, hi, n, dtype=float)
-
-        kx_values = _axis(bounds[0][0], bounds[0][1], nkx)
-        ky_values = (
-            _axis(bounds[1][0], bounds[1][1], nky)
-            if dimension >= 2
-            else np.array([0.0], dtype=float)
-        )
-        kz_values = (
-            _axis(bounds[2][0], bounds[2][1], nkz)
-            if dimension >= 3
-            else np.array([0.0], dtype=float)
+        axes, effective_shifted = self._resolve_safe_axes(
+            hamiltonian,
+            bounds=bounds,
+            npts=npts,
+            dimension=dimension,
+            want_shifted=shifted,
+            guard_on=guard_on,
         )
 
         kgrid = KGrid(
-            kx_values=kx_values,
-            ky_values=ky_values,
-            kz_values=kz_values,
+            kx_values=axes[0],
+            ky_values=axes[1],
+            kz_values=axes[2],
             dimension=dimension,
-            shifted=shifted,
+            shifted=effective_shifted,
         )
-        if shifted:
+        if effective_shifted and not shifted:
+            pass  # the guard already logged the auto-shift below.
+        elif shifted:
             self._emit_progress(
                 "KGrid: using shifted Monkhorst-Pack sampling (offset half a step). "
                 "Grid never lands on BZ edges/degeneracies; BZ integrals use uniform weights."
             )
-        else:
-            self._warn_if_grid_hits_degeneracy(hamiltonian, kgrid)
         return kgrid
+
+    def _resolve_safe_axes(
+        self,
+        hamiltonian: Hamiltonian,
+        *,
+        bounds: Any,
+        npts: tuple[int, int, int],
+        dimension: int,
+        want_shifted: bool,
+        guard_on: bool,
+    ) -> tuple[list[NDArray[np.float64]], bool]:
+        """Return k-axes that avoid band degeneracies for *any* point count.
+
+        The automatic degeneracy guard (on by default) scans the band gap over
+        the candidate grid.  If a grid point sits on a band-touching point (a
+        Dirac/Weyl node, or the spin degeneracies of a multi-band model -- gap
+        ~ 0, where the eigenvectors are ambiguous and the response silently
+        breaks crystal symmetries), it rebuilds a **symmetric Monkhorst-Pack
+        grid** (offset 1/2) and, if needed, nudges the point count by +-1, +-2,
+        ... to the nearest value whose grid clears the degeneracy.
+
+        Keeping the offset at 1/2 preserves the exact ``k -> -k`` symmetry of
+        the grid, which is what makes the symmetry-forbidden response components
+        cancel to machine zero.  (An incommensurate *offset* would also dodge the
+        degeneracy, but it breaks ``k -> -k`` symmetry and only restores the
+        forbidden components in the ``N -> infinity`` limit -- useless at the
+        coarse grids people actually run.)  So the count, not the offset, is
+        adjusted.  The user can pick *any* k-grid and the symmetry-clean result
+        is recovered automatically -- no hand-tuned point counts.
+
+        A healthy grid is returned unchanged, so an already-safe grid keeps its
+        exact symmetry and its original resolution.
+        """
+
+        def _axis(offset: float | None, axis: int, n: int) -> NDArray[np.float64]:
+            if axis >= dimension or n <= 1:
+                return np.array([0.0], dtype=float)
+            if offset is None:
+                return np.linspace(bounds[axis][0], bounds[axis][1], n, dtype=float)
+            return KGrid.periodic_axis(bounds[axis][0], bounds[axis][1], n, offset)
+
+        def _build(offset: float | None, counts: tuple[int, int, int]) -> list[NDArray[np.float64]]:
+            return [_axis(offset, axis, counts[axis]) for axis in range(3)]
+
+        base_offset = 0.5 if want_shifted else None
+        base_counts = (npts[0], npts[1], npts[2])
+        base_axes = _build(base_offset, base_counts)
+        active = [a for a in range(dimension) if npts[a] > 1]
+
+        if not guard_on or hamiltonian.basis_size < 2 or not active:
+            if not want_shifted:
+                self._warn_if_grid_hits_degeneracy(
+                    hamiltonian,
+                    KGrid(
+                        kx_values=base_axes[0],
+                        ky_values=base_axes[1],
+                        kz_values=base_axes[2],
+                        dimension=dimension,
+                    ),
+                )
+            return base_axes, want_shifted
+
+        min_gap, bandwidth, worst = self._grid_gap_diagnostics(hamiltonian, base_axes)
+        gap_floor = max(1.0e-9, 1.0e-6 * bandwidth)
+        if min_gap >= gap_floor:
+            # Already safe: leave the grid (and its exact symmetry) untouched.
+            return base_axes, want_shifted
+
+        # Degeneracy hit.  Keep the symmetric Monkhorst-Pack grid (offset 1/2)
+        # and search the nearest point count that clears it.  Try the smallest
+        # nudges first (delta = 0 also covers the case where the *only* problem
+        # was an edge-inclusive grid hitting the BZ boundary / a Dirac point,
+        # which switching to Monkhorst-Pack already fixes).
+        deltas = [0, -1, 1, -2, 2, -3, 3, -4, 4]
+        best_axes, best_counts, best_gap, best_delta = None, base_counts, min_gap, None
+        for delta in deltas:
+            counts = tuple(
+                (npts[axis] + delta) if axis in active else npts[axis] for axis in range(3)
+            )
+            if any(counts[axis] < 2 for axis in active):
+                continue
+            candidate = _build(0.5, counts)  # symmetric Monkhorst-Pack
+            gap, _, _ = self._grid_gap_diagnostics(hamiltonian, candidate)
+            if best_axes is None or gap > best_gap:
+                best_axes, best_counts, best_gap, best_delta = candidate, counts, gap, delta
+            if gap >= gap_floor:
+                best_axes, best_counts, best_gap, best_delta = candidate, counts, gap, delta
+                break
+
+        active_counts = tuple(best_counts[a] for a in active)
+        self._emit_progress(
+            "[KGrid] auto degeneracy guard: the requested grid sat on a band "
+            f"degeneracy (min gap {min_gap:.2e} a.u. at k={worst}). Rebuilt as a "
+            f"symmetric Monkhorst-Pack grid with point count(s) {active_counts} "
+            f"(min gap now {best_gap:.2e} a.u.); the k->-k symmetry that cancels "
+            "forbidden components to machine zero is preserved. Set "
+            "'auto_degeneracy_guard = false' in [kgrid] to disable."
+        )
+        return best_axes, True
+
+    def _grid_gap_diagnostics(
+        self,
+        hamiltonian: Hamiltonian,
+        axes: list[NDArray[np.float64]],
+    ) -> tuple[float, float, tuple[float, float, float] | None]:
+        """Minimum adjacent-band gap and bandwidth over the tensor-product grid.
+
+        Cheap (one ``eigvalsh`` per k-point); used by the degeneracy guard to
+        decide whether a grid point lands on a band-touching point.
+        """
+        if hamiltonian.basis_size < 2:
+            return np.inf, 0.0, None
+        min_gap = np.inf
+        e_lo = np.inf
+        e_hi = -np.inf
+        worst: tuple[float, float, float] | None = None
+        for kx in np.asarray(axes[0], dtype=float):
+            for ky in np.asarray(axes[1], dtype=float):
+                for kz in np.asarray(axes[2], dtype=float):
+                    energies = np.linalg.eigvalsh(
+                        hamiltonian._matrix_at(float(kx), float(ky), float(kz))
+                    )
+                    gap = float(np.min(np.diff(energies)))
+                    if gap < min_gap:
+                        min_gap = gap
+                        worst = (float(kx), float(ky), float(kz))
+                    e_lo = min(e_lo, float(energies[0]))
+                    e_hi = max(e_hi, float(energies[-1]))
+        bandwidth = max(e_hi - e_lo, 1.0e-30)
+        return min_gap, bandwidth, worst
 
     def _warn_if_grid_hits_degeneracy(
         self,
