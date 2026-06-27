@@ -4,6 +4,7 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, replace
 import os
 from pathlib import Path
+import tempfile
 import time
 from typing import Any
 
@@ -14,6 +15,7 @@ from qxti.core.config import CMDConfig, LaserConfig, QXTIConfig
 from qxti.core.simulation import QXTISimulation
 from qxti.data import save_dataset_npz
 from qxti.response import SusceptibilityTensorCalculator, XTP
+from qxti.response.cmd import CMD
 from qxti.utils.progress import ProgressTimer, format_bytes, format_duration
 
 
@@ -49,6 +51,24 @@ def _build_probe_laser_config(laser_config: LaserConfig, direction: str, omega: 
         phiz=float(phiz),
         pulses=[],
     )
+
+
+def _resolve_susceptibility_runtime_solver_config(config: QXTIConfig) -> CMDConfig:
+    """Return a low-memory solver config for one susceptibility probe."""
+    solver_config = replace(_resolve_scan_solver_config(config), n_workers=1)
+    # Susceptibility workers now use temporary rho scratch on disk instead of
+    # keeping every order in RAM. complex64 is a good scratch compromise:
+    # native complex memmaps can be consumed directly by XTP without inflating
+    # back to dense in-memory arrays.
+    if solver_config.rho_storage_dtype == "complex128":
+        solver_config = replace(solver_config, rho_storage_dtype="complex64")
+    return solver_config
+
+
+def _close_rho_order_memmaps(rho_orders: dict[int, np.ndarray]) -> None:
+    """Close any memmaps backing one rho-order mapping."""
+    for tensor in rho_orders.values():
+        CMD._close_array_memmap(tensor)
 
 
 def _compute_frequency_tensor_values(
@@ -142,36 +162,55 @@ def _susceptibility_frequency_worker(payload: tuple) -> tuple[int, dict[str, Any
     thread because parallelism comes from the process pool (one frequency per
     process), avoiding core oversubscription.
     """
-    config, index, input_omega, orders, eps, max_order, dimension, direction_labels = payload
+    config, index, input_omega, orders, eps, max_order, dimension, direction_labels, show_cmd_progress = payload
     simulation = QXTISimulation(config=config)
     hamiltonian = simulation.build_hamiltonian()
-    solver_config = replace(_resolve_scan_solver_config(config), n_workers=1)
+    solver_config = _resolve_susceptibility_runtime_solver_config(config)
 
     xtp_by_direction: dict[str, XTP] = {}
-    for direction in direction_labels:
-        cmd = simulation.build_cmd(
-            hamiltonian,
-            cmd_config=solver_config,
-            laser_system=simulation.build_laser_system(
-                _build_probe_laser_config(config.laser, direction, input_omega)
-            ),
-            max_order=max_order,
-        )
-        # Silence the per-k-point CMD progress inside the worker; the meaningful
-        # progress is the per-frequency global counter printed by the main process.
-        cmd.progress_enabled = False
-        rho_orders = cmd.compute_all_orders()
-        xtp_by_direction[direction] = simulation.build_xtp(cmd, rho_orders)
+    open_rho_orders: list[dict[int, np.ndarray]] = []
+    temp_dirs: list[tempfile.TemporaryDirectory[str]] = []
 
-    values = _compute_frequency_tensor_values(
-        xtp_by_direction,
-        input_omega=float(input_omega),
-        orders=tuple(orders),
-        direction_labels=tuple(direction_labels),
-        dimension=int(dimension),
-        eps=float(eps),
-    )
-    return int(index), values
+    try:
+        for direction in direction_labels:
+            if show_cmd_progress:
+                omega_ev = float(input_omega) * _AU_TO_EV
+                print(
+                    f"[QXTI] Susceptibility probe {index + 1}: solving direction '{direction}' "
+                    f"at omega_laser={omega_ev:.4f} eV with temporary scratch.",
+                    flush=True,
+                )
+            cmd = simulation.build_cmd(
+                hamiltonian,
+                cmd_config=solver_config,
+                laser_system=simulation.build_laser_system(
+                    _build_probe_laser_config(config.laser, direction, input_omega)
+                ),
+                max_order=max_order,
+            )
+            cmd.progress_enabled = bool(show_cmd_progress)
+
+            temp_dir = tempfile.TemporaryDirectory(prefix=f"qxti_susc_f{index:03d}_{direction}_")
+            temp_dirs.append(temp_dir)
+            rho_order_paths = cmd.solve_time_domain(temp_dir.name)
+            rho_orders = simulation._load_saved_rho_order_paths(rho_order_paths, nt=cmd.timegrid.Nt)
+            open_rho_orders.append(rho_orders)
+            xtp_by_direction[direction] = simulation.build_xtp(cmd, rho_orders)
+
+        values = _compute_frequency_tensor_values(
+            xtp_by_direction,
+            input_omega=float(input_omega),
+            orders=tuple(orders),
+            direction_labels=tuple(direction_labels),
+            dimension=int(dimension),
+            eps=float(eps),
+        )
+        return int(index), values
+    finally:
+        for rho_orders in open_rho_orders:
+            _close_rho_order_memmaps(rho_orders)
+        for temp_dir in temp_dirs:
+            temp_dir.cleanup()
 
 
 @dataclass(slots=True)
@@ -185,6 +224,77 @@ class SusceptibilityScanRunner:
         return cls(config=QXTIConfig.from_file(config_path))
 
     def run(self) -> dict[str, Path]:
+        """Dispatch on ``[xtp] susceptibility_method``: simulation, theory, or both."""
+        method = str(getattr(self.config.xtp, "susceptibility_method", "simulation")).lower()
+        if method not in {"simulation", "theory", "both"}:
+            raise ValueError(
+                f"susceptibility_method must be 'simulation', 'theory', or 'both' (got '{method}')."
+            )
+
+        outputs: dict[str, Path] = {}
+        sim_runtime = theory_runtime = None
+
+        if method in {"theory", "both"}:
+            theory_out, theory_runtime = self._run_theory()
+            outputs.update(theory_out)
+
+        if method in {"simulation", "both"}:
+            t0 = time.perf_counter()
+            sim_out = self._run_simulation()
+            sim_runtime = time.perf_counter() - t0
+            outputs.update(sim_out)
+
+        if method == "both":
+            self._report_timing(sim_runtime, theory_runtime, outputs)
+
+        return outputs
+
+    def _run_theory(self) -> tuple[dict[str, Path], float]:
+        """Compute the analytical susceptibility tensors (all orders) and save them."""
+        from qxti.analytics.theory_response import compute_susceptibility_spectrum
+
+        omega_axis = np.asarray(self._resolve_laser_omega_axis(), dtype=np.float64)
+        orders = self._resolve_orders()
+        self._emit_progress(
+            f"Theory engine: computing analytical susceptibility tensors for orders "
+            f"{orders} on {omega_axis.size} frequencies (no time propagation). "
+            "Order 1 is a single fast k-grid pass; orders >=2 use the closed-form "
+            "rho^(s) per frequency/direction. Progress with ETA below."
+        )
+        result = compute_susceptibility_spectrum(self.config, omega_axis, orders, progress=True)
+
+        # In 'both' mode the simulation owns xtp_susceptibility.npz, so theory
+        # writes a companion file; otherwise it writes the standard name so the
+        # susceptibility graphics find it transparently.
+        method = str(getattr(self.config.xtp, "susceptibility_method", "simulation")).lower()
+        out_dir = Path(self.config.xtp.susceptibility_output_dir) / "data"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_name = "xtp_susceptibility_theory.npz" if method == "both" else "xtp_susceptibility.npz"
+        out_path = out_dir / out_name
+        from qxti.data import save_dataset_npz
+        save_dataset_npz(out_path, result["dataset"])
+        plot_hint = (
+            f"python qxti/graphics/graphics.py <config> --family susceptibility"
+            + (f"  (theory dataset: {out_name})" if method == "both" else "")
+        )
+        self._emit_progress(
+            f"Theory susceptibility tensors saved as '{out_path.name}' "
+            f"(computed in {format_duration(result['runtime_seconds'])}). Plot with: {plot_hint}"
+        )
+        return {"xtp_susceptibility_theory_data": out_path}, float(result["runtime_seconds"])
+
+    def _report_timing(self, sim_runtime: float, theory_runtime: float, outputs: dict[str, Path]) -> None:
+        speedup = (sim_runtime / theory_runtime) if theory_runtime and theory_runtime > 0 else float("inf")
+        self._emit_progress(
+            "=== Comparacion de tiempos (mismos parametros) ===\n"
+            f"  Simulacion (CMD time-domain): {format_duration(sim_runtime)}\n"
+            f"  Teoria (Kubo analitico):      {format_duration(theory_runtime)}\n"
+            f"  Speedup teoria/simulacion:    {speedup:.1f}x mas rapida la teoria\n"
+            "  Datos: xtp_susceptibility.npz (simulacion) y "
+            "xtp_susceptibility_theory.npz (teoria)."
+        )
+
+    def _run_simulation(self) -> dict[str, Path]:
         xtp_cfg = self.config.xtp
         if not xtp_cfg.susceptibility_enabled:
             raise ValueError(
@@ -206,8 +316,9 @@ class SusceptibilityScanRunner:
         self._emit_progress(
             "XTP susceptibility sweep enabled: running a dedicated laser-frequency sweep "
             f"for orders {requested_orders} on {len(laser_omega_axis)} frequencies. "
-            "This mode solves the response in memory only; it does not save rho_order files "
-            "or CMD/XTP datasets to disk."
+            "This mode keeps the workflow self-contained: no rho_order files or CMD/XTP datasets "
+            "are saved persistently, but large runs may use temporary rho scratch during each "
+            "frequency probe to stay within RAM."
         )
 
         dataset = self._initialize_dataset(
@@ -237,6 +348,7 @@ class SusceptibilityScanRunner:
                 max_order,
                 hamiltonian.dimension,
                 direction_labels,
+                False,
             )
             for index, laser_omega in enumerate(laser_omega_axis)
         ]
@@ -255,7 +367,11 @@ class SusceptibilityScanRunner:
             self._emit_progress(
                 f"Susceptibility sweep: running serially over {nfreq_total} frequencies (n_workers=1)."
             )
-            for index, values in (_susceptibility_frequency_worker(p) for p in payloads):
+            serial_payloads = [
+                (*payload[:-1], True)
+                for payload in payloads
+            ]
+            for index, values in (_susceptibility_frequency_worker(p) for p in serial_payloads):
                 self._write_frequency_result(dataset, index, values)
                 _emit_frequency_progress(index)
         else:
@@ -460,39 +576,28 @@ class SusceptibilityScanRunner:
     def _resolve_n_workers(self, *, nfreq: int, ndir: int, max_order: int) -> int:
         """Return a RAM-bounded process count for the frequency sweep.
 
-        Each process holds the in-memory density matrices of all orders for the
-        current frequency, ``(max_order+1) * Nk * Nt * Nb^2`` complex128 values,
-        plus FFT temporaries.  The count is capped so the total stays within a
-        fraction of physical RAM, and never exceeds the CPU count or the number
-        of frequencies.  ``susceptibility_n_workers = 0`` selects this automatic
-        value; a positive value overrides it (still clamped to nfreq).
+        Susceptibility workers now solve one frequency/direction at a time using
+        temporary rho scratch on disk.  This dramatically reduces RAM pressure
+        relative to the legacy all-orders-in-memory path, but the scratch/page-
+        cache footprint can still be large.  For stability the automatic mode is
+        intentionally conservative and defaults to serial execution unless the
+        user explicitly requests more workers.
         """
-        del ndir
+        del ndir, max_order
         requested = int(self.config.xtp.susceptibility_n_workers)
         cpu = os.cpu_count() or 1
+        if requested <= 0:
+            n = 1
+            self._emit_progress(
+                f"Susceptibility sweep workers: {n} "
+                f"(cpu={cpu}, nfreq={nfreq}, auto-mode uses serial temporary-scratch execution for stability)."
+            )
+            return n
 
-        simulation = QXTISimulation(config=self.config)
-        hamiltonian = simulation.build_hamiltonian()
-        kgrid = simulation.build_kgrid(hamiltonian)
-        nk = kgrid.total_points
-        nb = hamiltonian.basis_size
-        low_omega = float(np.min(self._resolve_laser_omega_axis()))
-        laser_system = simulation.build_laser_system(
-            _build_probe_laser_config(self.config.laser, "x", low_omega)
-        )
-        nt = simulation.build_timegrid(laser_system).Nt
-        # 3x margin for FFT/operator temporaries created during the solve.
-        bytes_per_proc = int((max_order + 1) * nk * nt * nb * nb * 16 * 3)
-        ram = self._available_ram()
-        by_ram = max(1, int(ram * 0.6 / max(bytes_per_proc, 1)))
-
-        auto = min(cpu, nfreq, by_ram)
-        n = auto if requested <= 0 else min(requested, nfreq)
-        n = max(1, n)
+        n = max(1, min(requested, cpu, nfreq))
         self._emit_progress(
             f"Susceptibility sweep workers: {n} "
-            f"(cpu={cpu}, nfreq={nfreq}, RAM-cap={by_ram}, "
-            f"~{format_bytes(bytes_per_proc)}/process, Nk={nk}, Nt={nt})."
+            f"(cpu={cpu}, nfreq={nfreq}, user-requested parallelism)."
         )
         return n
 

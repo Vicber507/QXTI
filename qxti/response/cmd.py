@@ -27,6 +27,43 @@ from .distributions import T1T2Relaxation, bose_einstein, fermi_dirac, full_occu
 ComplexArray = NDArray[np.complex128]
 FloatArray = NDArray[np.float64]
 
+_DEFAULT_WORKERS_CACHE: int | None = None
+
+
+def _default_worker_count() -> int:
+    """Best default thread count for the GIL-bound parallel k-loop.
+
+    On Apple Silicon (and other heterogeneous CPUs) the optimum is the number of
+    PERFORMANCE cores: efficiency cores plus GIL contention make extra threads
+    slower. Detect performance cores on macOS via ``sysctl``; otherwise fall back
+    to the physical-core count, then to half the logical CPUs.
+    """
+    global _DEFAULT_WORKERS_CACHE
+    if _DEFAULT_WORKERS_CACHE is not None:
+        return _DEFAULT_WORKERS_CACHE
+    n = 0
+    try:  # macOS performance cores
+        import subprocess  # noqa: PLC0415
+        out = subprocess.run(
+            ["sysctl", "-n", "hw.perflevel0.physicalcpu"],
+            capture_output=True, text=True, timeout=1.0,
+        )
+        n = int(out.stdout.strip())
+    except Exception:
+        n = 0
+    if n <= 0:
+        try:  # physical cores (POSIX)
+            n = int(os.sysconf("SC_NPROCESSORS_ONLN"))
+            logical = os.cpu_count() or n
+            if logical >= 2 * n:  # hyperthreaded -> use physical
+                pass
+            else:
+                n = max(1, (logical + 1) // 2)
+        except (AttributeError, ValueError, OSError):
+            n = max(1, (os.cpu_count() or 2) // 2)
+    _DEFAULT_WORKERS_CACHE = max(1, n)
+    return _DEFAULT_WORKERS_CACHE
+
 
 class CMD:
     """Recursive perturbative density-matrix solver in the length gauge.
@@ -192,9 +229,13 @@ class CMD:
         )
         self._time_domain_cache: dict[int, ComplexArray] | None = None
         self._frequency_domain_cache: dict[int, ComplexArray] | None = None
-        # Worker count for the parallel k-point loop.  None → use all logical CPUs.
-        cpu_count = os.cpu_count() or 1
-        self._n_workers: int = int(cpu_count if n_workers is None else max(1, n_workers))
+        # Worker count for the parallel k-point loop.  None → auto.
+        # The k-loop is a GIL-bound ThreadPoolExecutor (NumPy releases the GIL for
+        # the heavy ops, but the per-k Python glue does not), so beyond the number
+        # of PERFORMANCE cores adding threads only adds GIL/efficiency-core
+        # contention and gets SLOWER. The auto default therefore uses the
+        # performance-core count, not all logical CPUs.
+        self._n_workers: int = int(_default_worker_count() if n_workers is None else max(1, n_workers))
         # Pre-compute the k-independent damping matrix once; reused every time step.
         self._damping_cache: ComplexArray = self._damping_matrix()
         # Console progress (set False to silence, e.g. inside parallel workers).
@@ -868,6 +909,7 @@ class CMD:
             else None
         )
 
+
         import threading as _threading
 
         # Shared state for throttled parallel progress reporting.
@@ -1302,8 +1344,9 @@ class CMD:
             local[axis] = p
             rho_j = self._rho_series_from_storage_slice(rho_mesh, tuple(local), nt=nt)
             wilson = u0_dag @ vectors_mesh[tuple(local)]  # W = U(k)^dag U(k')
-            # (W rho_j W^dag)_il = W_ij rho_jk conj(W_lk), for every time step.
-            return np.einsum("ij,tjk,lk->til", wilson, rho_j, wilson.conj(), optimize=True)
+            # (W rho_j W^dag) for every time step. Plain matmul broadcasts over the
+            # time axis and avoids einsum's per-call path search (the hot path).
+            return (wilson @ rho_j) @ wilson.conj().T
 
         if n == 2:
             delta = float(coords[1] - coords[0])
@@ -1349,15 +1392,13 @@ class CMD:
         active_dim = min(self.hamiltonian.dimension, source_components.shape[1], field_series.shape[1])
         if active_dim <= 0:
             raise ValueError("No active field/source dimensions are available for CMD.")
-        return np.asarray(
-            np.einsum(
-                "ta,tabc->tbc",
-                field_series[:, :active_dim],
-                source_components[:, :active_dim],
-                optimize=True,
-            ),
-            dtype=np.complex128,
-        )
+        # sum_a field[t,a] * source[t,a,b,c]; broadcast-sum avoids einsum's
+        # per-call contraction-path search (this is on the per-k hot path).
+        weighted = (
+            field_series[:, :active_dim, None, None]
+            * source_components[:, :active_dim]
+        ).sum(axis=1)
+        return np.asarray(weighted, dtype=np.complex128)
 
     def _k_gradient_components(self, tensor: ComplexArray) -> ComplexArray:
         nk, nt, nb, _ = tensor.shape

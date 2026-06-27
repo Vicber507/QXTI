@@ -494,6 +494,7 @@ def _emit_tensor_plots(
             output_path=overview_dir / f"{tensor_name}_grid.png"
         )
     if do_components:
+        modulus_dir = components_dir / "modulus"
         for component in plotter.component_indices():
             label = plotter._component_label(component)
             # Sanitize the filename (helicity labels use +/- which are kept in
@@ -501,6 +502,10 @@ def _emit_tensor_plots(
             file_label = label.replace("+", "p").replace("-", "m")
             out[f"{key_prefix}_{label}"] = plotter.plot_component(
                 component, output_path=components_dir / f"{tensor_name}_{file_label}.png"
+            )
+            # Extra modulus-only plot per component (y-axis from 0, paper style).
+            out[f"{key_prefix}_{label}_modulus"] = plotter.plot_component_modulus(
+                component, output_path=modulus_dir / f"{tensor_name}_{file_label}_modulus.png"
             )
     return out
 
