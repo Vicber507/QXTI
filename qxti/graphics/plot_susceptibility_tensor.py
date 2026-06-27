@@ -67,6 +67,70 @@ else:  # pragma: no cover - environment dependent
     plt = None
 
 
+_PAPER_STYLE_APPLIED = False
+
+
+def apply_paper_style() -> None:
+    """Apply a professional, publication-quality Matplotlib style.
+
+    Uses LaTeX for all text when a LaTeX installation is available, otherwise
+    falls back to Matplotlib's Computer Modern math fonts (the LaTeX look without
+    needing a LaTeX install). Inward ticks on all four sides, minor ticks, thin
+    spines and serif fonts give a clean "paper" appearance.
+    """
+    global _PAPER_STYLE_APPLIED
+    if not HAS_MATPLOTLIB or _PAPER_STYLE_APPLIED:
+        return
+    rc = {
+        "font.family": "serif",
+        "font.serif": ["Computer Modern Roman", "CMU Serif", "cmr10", "DejaVu Serif"],
+        "mathtext.fontset": "cm",
+        "axes.formatter.use_mathtext": True,
+        "axes.unicode_minus": True,
+        "font.size": 12,
+        "axes.labelsize": 15,
+        "axes.titlesize": 14,
+        "xtick.labelsize": 12,
+        "ytick.labelsize": 12,
+        "legend.fontsize": 11,
+        "axes.linewidth": 0.9,
+        "lines.linewidth": 2.0,
+        "xtick.direction": "in",
+        "ytick.direction": "in",
+        "xtick.top": True,
+        "ytick.right": True,
+        "xtick.minor.visible": True,
+        "ytick.minor.visible": True,
+        "xtick.major.size": 5.5,
+        "ytick.major.size": 5.5,
+        "xtick.minor.size": 3.0,
+        "ytick.minor.size": 3.0,
+        "xtick.major.width": 0.9,
+        "ytick.major.width": 0.9,
+        "xtick.minor.width": 0.7,
+        "ytick.minor.width": 0.7,
+        "legend.frameon": False,
+        "legend.handlelength": 1.6,
+        "figure.facecolor": "white",
+        "savefig.facecolor": "white",
+        "savefig.bbox": "tight",
+        "savefig.dpi": 300,
+    }
+    # Use Matplotlib's mathtext with the Computer Modern font set: it renders
+    # LaTeX-syntax math in the genuine LaTeX font WITHOUT invoking a real LaTeX
+    # subprocess, so it is robust (never breaks on labels other plots use) and
+    # needs no LaTeX installation.
+    try:
+        plt.rcParams.update(rc)
+        _PAPER_STYLE_APPLIED = True
+    except Exception:  # pragma: no cover
+        _PAPER_STYLE_APPLIED = True
+
+
+if HAS_MATPLOTLIB:
+    apply_paper_style()
+
+
 ComplexArray = NDArray[np.complex128]
 RealArray = NDArray[np.float64]
 AU_TO_EV = 27.211386245988
@@ -227,6 +291,76 @@ class SusceptibilityTensorPlotter:
             include_ev_axis=include_ev_axis,
         )
 
+    @property
+    def _tex_name(self) -> str:
+        """Proper LaTeX symbol for the tensor, e.g. ``chi2`` -> ``\\chi^{(2)}``."""
+        base = self.tensor_name.rstrip("0123456789")
+        greek = {"chi": r"\chi", "sigma": r"\sigma"}.get(base, rf"\mathrm{{{base}}}")
+        return rf"{greek}^{{({self.order})}}"
+
+    def plot_component_modulus(
+        self,
+        indices: tuple[int, ...],
+        *,
+        output_path: str | Path | None = None,
+        show: bool = False,
+    ) -> Path:
+        """Paper-style plot of ONLY the modulus of one component, y-axis from 0."""
+        pyplot = self._require_matplotlib()
+        self._validate_component_indices(indices)
+
+        values = self.tensor[(slice(None),) + indices]
+        label = self._component_label(indices)
+        modulus = np.abs(values)
+        sym = rf"{self._tex_name}_{{\mathrm{{{label}}}}}"
+
+        figure, axis = pyplot.subplots(figsize=(6.6, 4.4))
+        line_color = "#0B3D91"  # deep "publication" blue
+        axis.plot(self.x_axis, modulus, color=line_color, linewidth=2.3, solid_capstyle="round")
+        axis.fill_between(self.x_axis, 0.0, modulus, color=line_color, alpha=0.13, linewidth=0.0)
+
+        # y-axis starts exactly at 0.
+        top = float(np.nanmax(modulus)) if modulus.size and np.isfinite(modulus).any() else 1.0
+        axis.set_ylim(0.0, 1.05 * top if top > 0 else 1.0)
+        axis.set_xlim(float(self.x_axis.min()), float(self.x_axis.max()))
+        axis.margins(x=0.0)
+
+        axis.set_xlabel(self.x_label)
+        axis.set_ylabel(rf"$\left|{sym}\right|$")
+        axis.set_title(rf"$\left|{sym}({self.argument_label})\right|$")
+        axis.ticklabel_format(axis="y", style="sci", scilimits=(-2, 2))
+        if self.include_ev_axis:
+            top_axis = axis.secondary_xaxis(
+                "top",
+                functions=(lambda v: v * AU_TO_EV, lambda v: v / AU_TO_EV),
+            )
+            top_axis.set_xlabel(r"$\hbar\omega_\mathrm{laser}\;(\mathrm{eV})$")
+
+        output = (
+            self.output_dir / f"{self.tensor_name}_{label}_modulus.png"
+            if output_path is None else Path(output_path)
+        )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        figure.tight_layout()
+        figure.savefig(output, dpi=self.dpi)
+        pyplot.show() if show else pyplot.close(figure)
+        return output
+
+    def plot_all_components_modulus(
+        self,
+        *,
+        output_file_template: str | None = None,
+        show: bool = False,
+    ) -> list[Path]:
+        paths: list[Path] = []
+        for indices in self.component_indices():
+            label = self._component_label(indices)
+            output_path = None
+            if output_file_template is not None:
+                output_path = self.output_dir / output_file_template.format(order=self.order, label=label)
+            paths.append(self.plot_component_modulus(indices, output_path=output_path, show=show))
+        return paths
+
     def plot_component(
         self,
         indices: tuple[int, ...],
@@ -239,14 +373,15 @@ class SusceptibilityTensorPlotter:
 
         values = self.tensor[(slice(None),) + indices]
         label = self._component_label(indices)
+        sym = rf"{self._tex_name}_{{\mathrm{{{label}}}}}"
 
-        figure, axis = pyplot.subplots(figsize=(7.2, 4.6))
+        figure, axis = pyplot.subplots(figsize=(7.0, 4.6))
         axis.plot(
             self.x_axis,
             np.real(values),
             color=OKABE_ITO[0],
             linewidth=2.0,
-            label=rf"$\Re\,{self.tensor_name}_{{{label}}}$",
+            label=rf"$\Re\,{sym}$",
         )
         axis.plot(
             self.x_axis,
@@ -254,7 +389,7 @@ class SusceptibilityTensorPlotter:
             color=OKABE_ITO[1],
             linewidth=1.9,
             linestyle="--",
-            label=rf"$\Im\,{self.tensor_name}_{{{label}}}$",
+            label=rf"$\Im\,{sym}$",
         )
         # Modulus |chi| (the envelope sqrt(Re^2+Im^2)); a faint filled band makes
         # it easy to read off the magnitude alongside Re and Im.
@@ -266,18 +401,16 @@ class SusceptibilityTensorPlotter:
             linewidth=2.2,
             linestyle="-",
             alpha=0.9,
-            label=rf"$|{self.tensor_name}_{{{label}}}|$",
+            label=rf"$\left|{sym}\right|$",
         )
         axis.fill_between(self.x_axis, 0.0, modulus, color=OKABE_ITO[2], alpha=0.07, linewidth=0.0)
         axis.axhline(0.0, color="#B8C4D0", linewidth=0.8, zorder=0)
+        axis.set_xlim(float(self.x_axis.min()), float(self.x_axis.max()))
         axis.set_xlabel(self.x_label)
-        axis.set_ylabel(rf"${self.tensor_name}_{{{label}}}$")
-        axis.set_title(rf"${self.tensor_name}_{{{label}}}({self.argument_label})$")
-        axis.grid(True, alpha=0.18, linewidth=0.6)
-        axis.spines["top"].set_visible(False)
-        axis.spines["right"].set_visible(False)
+        axis.set_ylabel(rf"${sym}$")
+        axis.set_title(rf"${sym}({self.argument_label})$")
         axis.ticklabel_format(axis="y", style="sci", scilimits=(-2, 2))
-        axis.legend(frameon=False, fontsize=9)
+        axis.legend(frameon=False, fontsize=10.5)
         if self.include_ev_axis:
             top_axis = axis.secondary_xaxis(
                 "top",
@@ -343,13 +476,12 @@ class SusceptibilityTensorPlotter:
             modulus = np.abs(values)
             axis.plot(self.x_axis, np.real(values), color=OKABE_ITO[0], linewidth=1.6, label="Re")
             axis.plot(self.x_axis, np.imag(values), color=OKABE_ITO[1], linewidth=1.6, linestyle="--", label="Im")
-            axis.plot(self.x_axis, modulus, color=OKABE_ITO[2], linewidth=1.8, label=r"$|\cdot|$")
+            axis.plot(self.x_axis, modulus, color=OKABE_ITO[2], linewidth=1.8, label=r"$|\,\cdot\,|$")
             axis.fill_between(self.x_axis, 0.0, modulus, color=OKABE_ITO[2], alpha=0.07, linewidth=0.0)
             axis.axhline(0.0, color="#B8C4D0", linewidth=0.8, zorder=0)
-            axis.set_title(rf"{panel_labels[ipanel]}. ${self.tensor_name}_{{{label}}}$", fontsize=10, loc="left")
-            axis.grid(True, alpha=0.18, linewidth=0.6)
-            axis.spines["top"].set_visible(False)
-            axis.spines["right"].set_visible(False)
+            sym = rf"{self._tex_name}_{{\mathrm{{{label}}}}}"
+            axis.set_title(rf"({panel_labels[ipanel].lower()}) ${sym}$", fontsize=11, loc="left")
+            axis.set_xlim(float(self.x_axis.min()), float(self.x_axis.max()))
             axis.ticklabel_format(axis="y", style="sci", scilimits=(-2, 2))
 
         for axis in axes.flat[n_components:]:
@@ -358,10 +490,12 @@ class SusceptibilityTensorPlotter:
         for axis in axes[-1, :]:
             axis.set_xlabel(self.x_label)
 
-        axes[0, 0].legend(frameon=False, fontsize=8)
+        axes[0, 0].legend(frameon=False, fontsize=9, loc="best")
         figure.suptitle(
-            rf"{self.tensor_name}$^{{({self.order})}}$ tensor components vs. $\omega_\mathrm{{laser}}$",
-            fontsize=12.5,
+            rf"${self._tex_name}$ tensor components vs.\ $\omega_\mathrm{{laser}}$"
+            if plt.rcParams.get("text.usetex", False)
+            else rf"${self._tex_name}$ tensor components",
+            fontsize=14,
         )
 
         output = self.output_dir / f"{self.tensor_name}_grid.png" if output_path is None else Path(output_path)
@@ -402,39 +536,37 @@ class SusceptibilityTensorPlotter:
             is_diagonal = len(set(component)) == 1
             linewidth = 2.4 if is_diagonal else 1.5
             values = self.tensor[(slice(None),) + component]
+            sym = rf"{self._tex_name}_{{\mathrm{{{label}}}}}"
             real_axis.plot(
                 self.x_axis, np.real(values), color=color,
-                linewidth=linewidth, linestyle=linestyle,
-                label=rf"${self.tensor_name}_{{{label}}}$",
+                linewidth=linewidth, linestyle=linestyle, label=rf"${sym}$",
             )
             imag_axis.plot(
                 self.x_axis, np.imag(values), color=color,
-                linewidth=linewidth, linestyle=linestyle,
-                label=rf"${self.tensor_name}_{{{label}}}$",
+                linewidth=linewidth, linestyle=linestyle, label=rf"${sym}$",
             )
             modulus_axis.plot(
                 self.x_axis, np.abs(values), color=color,
-                linewidth=linewidth, linestyle=linestyle,
-                label=rf"${self.tensor_name}_{{{label}}}$",
+                linewidth=linewidth, linestyle=linestyle, label=rf"${sym}$",
             )
 
         panels = (
-            (real_axis, "Real part"),
-            (imag_axis, "Imaginary part"),
-            (modulus_axis, "Modulus"),
+            (real_axis, "(a) Real part"),
+            (imag_axis, "(b) Imaginary part"),
+            (modulus_axis, "(c) Modulus"),
         )
         for axis, title in panels:
             axis.axhline(0.0, color="#B8C4D0", linewidth=0.8, zorder=0)
-            axis.grid(True, alpha=0.18, linewidth=0.6)
-            axis.spines["top"].set_visible(False)
-            axis.spines["right"].set_visible(False)
+            axis.set_xlim(float(self.x_axis.min()), float(self.x_axis.max()))
             axis.ticklabel_format(axis="y", style="sci", scilimits=(-2, 2))
-            axis.set_title(title, fontsize=10, loc="left")
+            axis.set_title(title, fontsize=12, loc="left")
+        # modulus panel: y-axis from 0
+        modulus_axis.set_ylim(bottom=0.0)
 
         modulus_axis.set_xlabel(self.x_label)
-        real_axis.set_ylabel(rf"$\Re\,{self.tensor_name}$")
-        imag_axis.set_ylabel(rf"$\Im\,{self.tensor_name}$")
-        modulus_axis.set_ylabel(rf"$|{self.tensor_name}|$")
+        real_axis.set_ylabel(rf"$\Re\,{self._tex_name}$")
+        imag_axis.set_ylabel(rf"$\Im\,{self._tex_name}$")
+        modulus_axis.set_ylabel(rf"$\left|{self._tex_name}\right|$")
         if self.include_ev_axis:
             top_axis = real_axis.secondary_xaxis(
                 "top",
@@ -455,8 +587,8 @@ class SusceptibilityTensorPlotter:
             fontsize=9,
         )
         figure.suptitle(
-            rf"Overview of {self.tensor_name}$^{{({self.order})}}$ components",
-            fontsize=12.5,
+            rf"Overview of ${self._tex_name}$ tensor components",
+            fontsize=14,
         )
         output = self.output_dir / f"{self.tensor_name}_overview.png" if output_path is None else Path(output_path)
         output.parent.mkdir(parents=True, exist_ok=True)

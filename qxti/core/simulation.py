@@ -234,18 +234,49 @@ class QXTISimulation:
     ) -> tuple[float, float, tuple[float, float, float] | None]:
         """Minimum adjacent-band gap and bandwidth over the tensor-product grid.
 
-        Cheap (one ``eigvalsh`` per k-point); used by the degeneracy guard to
-        decide whether a grid point lands on a band-touching point.
+        One ``eigvalsh`` per k-point; used by the degeneracy guard to decide
+        whether a grid point lands on a band-touching point. For very large
+        grids the scan is sub-sampled (degeneracy manifolds span many points,
+        so a coarse stride detects them) and reports progress with an ETA so
+        the run never looks frozen.
         """
         if hamiltonian.basis_size < 2:
             return np.inf, 0.0, None
+
+        ax = [np.asarray(a, dtype=float) for a in axes]
+        total = int(ax[0].size * ax[1].size * ax[2].size)
+        # Cap the scan for huge grids; stride each axis to keep <= ~200k probes.
+        scan_cap = 200_000
+        stride = 1
+        if total > scan_cap:
+            stride = int(np.ceil((total / scan_cap) ** (1.0 / 3.0)))
+            ax = [a[::stride] if a.size > 1 else a for a in ax]
+        n_scan = int(ax[0].size * ax[1].size * ax[2].size)
+
+        from qxti.utils.progress import ProgressTimer
+        timer = ProgressTimer(total=n_scan)
+        announce = n_scan > 50_000
+        if announce:
+            self._emit_progress(
+                f"KGrid degeneracy scan: checking band gaps over {n_scan} k-points"
+                + (f" (sub-sampled by {stride}/axis from {total})" if stride > 1 else "")
+                + " ..."
+            )
+        heartbeat = max(1, n_scan // 10)
+
         min_gap = np.inf
         e_lo = np.inf
         e_hi = -np.inf
         worst: tuple[float, float, float] | None = None
-        for kx in np.asarray(axes[0], dtype=float):
-            for ky in np.asarray(axes[1], dtype=float):
-                for kz in np.asarray(axes[2], dtype=float):
+        count = 0
+        for kx in ax[0]:
+            for ky in ax[1]:
+                for kz in ax[2]:
+                    if announce and count % heartbeat == 0 and count > 0:
+                        self._emit_progress(
+                            f"KGrid degeneracy scan: {count}/{n_scan} "
+                            f"({100 * count // n_scan}%), ETA {timer.eta_text()}."
+                        )
                     energies = np.linalg.eigvalsh(
                         hamiltonian._matrix_at(float(kx), float(ky), float(kz))
                     )
@@ -255,6 +286,8 @@ class QXTISimulation:
                         worst = (float(kx), float(ky), float(kz))
                     e_lo = min(e_lo, float(energies[0]))
                     e_hi = max(e_hi, float(energies[-1]))
+                    count += 1
+                    timer.advance()
         bandwidth = max(e_hi - e_lo, 1.0e-30)
         return min_gap, bandwidth, worst
 
@@ -526,6 +559,70 @@ class QXTISimulation:
         if not cmd_cfg.enabled:
             return {}
 
+        method = str(getattr(cmd_cfg, "response_method", "simulation")).lower()
+        if method not in {"simulation", "theory", "both"}:
+            raise ValueError(
+                f"[cmd] response_method must be 'simulation', 'theory', or 'both' (got '{method}')."
+            )
+
+        outputs: dict[str, Path] = {}
+        theory_runtime = sim_runtime = None
+        if method in {"theory", "both"}:
+            theory_out, theory_runtime = self._generate_hhg_theory(hamiltonian)
+            outputs.update(theory_out)
+        if method == "theory":
+            return outputs
+        if method == "both":
+            t0 = time.perf_counter()
+            outputs.update(self._generate_cmd_simulation(hamiltonian))
+            sim_runtime = time.perf_counter() - t0
+            speedup = (sim_runtime / theory_runtime) if theory_runtime else float("inf")
+            self._emit_progress(
+                "=== HHG: comparacion de tiempos (mismos parametros) ===\n"
+                f"  Simulacion (CMD time-domain): {format_duration(sim_runtime)}\n"
+                f"  Teoria (perturbativa):        {format_duration(theory_runtime)}\n"
+                f"  Speedup:                      {speedup:.1f}x mas rapida la teoria"
+            )
+            return outputs
+
+        return self._generate_cmd_simulation(hamiltonian)
+
+    def _generate_hhg_theory(self, hamiltonian: Hamiltonian) -> tuple[dict[str, Path], float]:
+        """Compute the perturbative (theory) HHG spectrum and save it."""
+        from qxti.analytics.theory_response import compute_hhg_spectrum
+
+        cmd_cfg = self.config.cmd
+        self._emit_progress(
+            f"HHG theory engine: perturbative current spectrum up to order {cmd_cfg.max_order} "
+            "(linear sigma^(1) full spectrum + harmonic peaks). Progress with ETA below."
+        )
+        result = compute_hhg_spectrum(self.config, progress=True)
+        out_dir = Path(cmd_cfg.output_dir)
+        data_dir = out_dir / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save a graphics-compatible current_spectrum dataset so the standard
+        # harmonic graphics work transparently on the theory result. In 'both'
+        # mode the simulation owns current_spectrum.npz, so theory writes a
+        # clearly-named companion file instead.
+        method = str(getattr(cmd_cfg, "response_method", "simulation")).lower()
+        dataset_name = "current_spectrum_theory.npz" if method == "both" else "current_spectrum.npz"
+        dataset_path = data_dir / dataset_name
+        np.savez(dataset_path, **result["dataset"])
+
+        outputs = {"xtp_current_spectrum_theory_data": dataset_path}
+        graphics_name = "current_spectrum_theory.npz" if method == "both" else "current_spectrum.npz"
+        self._emit_progress(
+            f"HHG theory current spectrum saved as '{dataset_path.name}' "
+            f"(computed in {format_duration(result['runtime_seconds'])}). "
+            f"Plot it with: python qxti/graphics/graphics.py <config> --family harmonics"
+            + ("  (uses current_spectrum.npz)" if method != "both" else
+               f"  (theory dataset: {graphics_name})")
+        )
+        return outputs, float(result["runtime_seconds"])
+
+    def _generate_cmd_simulation(self, hamiltonian: Hamiltonian) -> dict[str, Path]:
+        cmd_cfg = self.config.cmd
         runtime_cmd_cfg = self._cmd_runtime_config()
         cmd = self.build_cmd(hamiltonian, cmd_config=runtime_cmd_cfg)
         output_dir = Path(cmd_cfg.output_dir)

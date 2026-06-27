@@ -215,6 +215,11 @@ class CMDConfig:
     enabled: bool = False
     output_dir: str = "outputs/cmd"
     max_order: int = 1
+    # HHG/CMD engine selector:
+    #   "simulation" = time-domain density-matrix solve + FFT (exact, slow)
+    #   "theory"     = perturbative analytical current spectrum (fast)
+    #   "both"       = run both and report timing + comparison
+    response_method: str = "simulation"
     rho_storage_dtype: str = "complex128"
     scratch_rho_storage_dtype: str = "auto"
     keep_rho_orders: bool = True
@@ -272,6 +277,11 @@ class XTPConfig:
     susceptibility_num_frequencies: int = 11
     susceptibility_omega_values: tuple[float, ...] = field(default_factory=tuple)
     susceptibility_eps: float = 1.0e-14
+    # Which engine computes the response:
+    #   "simulation" = time-domain CMD pulse + FFT (numerically exact, slow)
+    #   "theory"     = analytical frequency-domain Kubo/Hipolito formula (fast)
+    #   "both"       = run both and save both for comparison (+ timing report)
+    susceptibility_method: str = "simulation"
     # Parallel processes for the laser-frequency sweep (0 = auto, RAM-bounded).
     susceptibility_n_workers: int = 0
     susceptibility_plot_enabled: bool = False
@@ -540,6 +550,7 @@ class QXTIConfig:
             enabled=section.getboolean("enabled", fallback=False),
             output_dir=section.get("output_dir", fallback="outputs/cmd").strip() or "outputs/cmd",
             max_order=section.getint("max_order", fallback=1),
+            response_method=section.get("response_method", fallback="simulation").strip().lower() or "simulation",
             rho_storage_dtype=section.get("rho_storage_dtype", fallback="complex128").strip().lower() or "complex128",
             scratch_rho_storage_dtype=section.get("scratch_rho_storage_dtype", fallback="auto").strip().lower() or "auto",
             keep_rho_orders=section.getboolean("keep_rho_orders", fallback=True),
@@ -621,6 +632,7 @@ class QXTIConfig:
                 _parse_float_list(section.get("susceptibility_omega_values", fallback=""), default=[])
             ),
             susceptibility_eps=section.getfloat("susceptibility_eps", fallback=1.0e-14),
+            susceptibility_method=section.get("susceptibility_method", fallback="simulation").strip().lower() or "simulation",
             susceptibility_n_workers=section.getint("susceptibility_n_workers", fallback=0),
             susceptibility_plot_enabled=section.getboolean("susceptibility_plot_enabled", fallback=False),
             susceptibility_plot_output_dir=section.get("susceptibility_plot_output_dir", fallback="").strip(),
