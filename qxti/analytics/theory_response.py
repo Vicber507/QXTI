@@ -48,11 +48,121 @@ def _resolve_distribution(name: str):
     return _DISTRIBUTIONS.get(key, fermi_dirac)
 
 
+def _resolve_extra_k_weight_mask(
+    extra_k_weight_mask: FloatArray | None,
+    *,
+    kgrid,
+) -> FloatArray | None:
+    if extra_k_weight_mask is None:
+        return None
+
+    mask = np.asarray(extra_k_weight_mask, dtype=np.float64)
+    if mask.shape == tuple(kgrid.shape):
+        resolved = mask.reshape(-1)
+    elif mask.ndim == 1 and mask.size == int(kgrid.total_points):
+        resolved = mask.reshape(-1)
+    else:
+        raise ValueError(
+            "extra_k_weight_mask must have shape kgrid.shape or length kgrid.total_points."
+        )
+    if not np.all(np.isfinite(resolved)):
+        raise ValueError("extra_k_weight_mask must contain only finite values.")
+    return np.asarray(resolved, dtype=np.float64)
+
+
+def _bz_mask_reference_radius(bounds: tuple[tuple[float, float], ...], dimension: int) -> float:
+    active_bounds = bounds[:dimension]
+    return float(min(max(abs(lower), abs(upper)) for lower, upper in active_bounds))
+
+
+def _bz_mask_radius(config: QXTIConfig, bounds: tuple[tuple[float, float], ...], dimension: int) -> float:
+    return 0.01 * float(config.xtp.bz_mask_radius_percent) * _bz_mask_reference_radius(bounds, dimension)
+
+
+def _bz_mask_sigma(config: QXTIConfig, bounds: tuple[tuple[float, float], ...], dimension: int) -> float:
+    if config.xtp.bz_mask_sigma is not None:
+        return float(max(config.xtp.bz_mask_sigma, 1.0e-15))
+    radius = _bz_mask_radius(config, bounds, dimension)
+    sigma_percent = (
+        100.0
+        if config.xtp.bz_mask_sigma_percent_legacy is None
+        else float(config.xtp.bz_mask_sigma_percent_legacy)
+    )
+    return float(max(0.01 * sigma_percent * radius, 1.0e-15))
+
+
+def _bz_radial_mask_weights(
+    config: QXTIConfig,
+    *,
+    kgrid,
+    bounds: tuple[tuple[float, float], ...],
+    dimension: int,
+) -> FloatArray:
+    if not bool(config.xtp.bz_mask_enabled):
+        return np.ones(int(kgrid.total_points), dtype=np.float64)
+
+    mesh = kgrid.mesh(indexing="ij")
+    active_coordinates = [np.asarray(mesh[axis], dtype=np.float64) for axis in range(dimension)]
+    radial_distance = np.sqrt(np.sum([coordinate**2 for coordinate in active_coordinates], axis=0))
+
+    radius = _bz_mask_radius(config, bounds, dimension)
+    sigma = _bz_mask_sigma(config, bounds, dimension)
+    weights = np.exp(-0.5 * (radial_distance / sigma) ** 2)
+    weights = np.where(radial_distance <= radius, weights, 0.0)
+    return np.asarray(weights.reshape(-1), dtype=np.float64)
+
+
+def build_k_integration_weights(
+    config: QXTIConfig,
+    *,
+    hamiltonian: Any,
+    kgrid,
+    extra_k_weight_mask: FloatArray | None = None,
+) -> FloatArray:
+    """Return theory-side BZ integration weights matching XTP.
+
+    The result includes:
+    - the same axis quadrature rule used by XTP,
+    - the optional radial BZ mask configured in ``[xtp]``,
+    - and an optional extra multiplicative mask in k-space.
+    """
+    from qxti.response.xtp import XTP
+
+    dim = int(hamiltonian.dimension)
+    bounds = hamiltonian.reciprocal_box_bounds()
+    periodic = bool(getattr(kgrid, "shifted", False))
+    axis_values = (kgrid.kx_values, kgrid.ky_values, kgrid.kz_values)
+    axis_weights = []
+    for axis in range(3):
+        active = axis < dim
+        axis_weights.append(
+            XTP._axis_integration_weights(
+                np.asarray(axis_values[axis], dtype=np.float64),
+                bounds[axis] if active else (0.0, 0.0),
+                active=active,
+                periodic=periodic,
+            )
+        )
+
+    weights = (
+        axis_weights[0][:, None, None]
+        * axis_weights[1][None, :, None]
+        * axis_weights[2][None, None, :]
+    ).reshape(-1).astype(np.float64)
+    weights *= _bz_radial_mask_weights(config, kgrid=kgrid, bounds=bounds, dimension=dim)
+
+    resolved_extra_mask = _resolve_extra_k_weight_mask(extra_k_weight_mask, kgrid=kgrid)
+    if resolved_extra_mask is not None:
+        weights *= resolved_extra_mask
+    return np.asarray(weights, dtype=np.float64)
+
+
 def compute_linear_response_spectrum(
     config: QXTIConfig,
     omega_axis: FloatArray,
     *,
     progress: bool = True,
+    extra_k_weight_mask: FloatArray | None = None,
 ) -> dict[str, Any]:
     """Return analytical sigma^(1)(omega) and chi^(1)(omega) on ``omega_axis``.
 
@@ -63,6 +173,13 @@ def compute_linear_response_spectrum(
     smoothed band gauge, w_k are the XTP BZ weights, and gamma = 1/T2.
 
     chi^(1)_ab(omega) = sigma^(1)_ab(omega) / (-i * omega)   (P = J / (-i omega)).
+
+    Parameters
+    ----------
+    extra_k_weight_mask:
+        Optional multiplicative k-space mask/weight. It must have either shape
+        ``kgrid.shape`` or length ``kgrid.total_points``. This is applied on top
+        of the standard XTP quadrature and the optional global radial BZ mask.
 
     Returns a dict with ``omega_axis``, ``sigma`` (nw, dim, dim), ``chi``,
     ``runtime_seconds``, and metadata.
@@ -78,28 +195,14 @@ def compute_linear_response_spectrum(
     k_points = kgrid.points()
     nk = kgrid.total_points
 
-    # Same BZ integration weights as the simulation (XTP), built from the same
-    # static quadrature rule so the normalization matches exactly.
-    from qxti.response.xtp import XTP
-    bounds = hamiltonian.reciprocal_box_bounds()
-    periodic = bool(getattr(kgrid, "shifted", False))
-    axis_values = (kgrid.kx_values, kgrid.ky_values, kgrid.kz_values)
-    axis_weights = []
-    for axis in range(3):
-        active = axis < dim
-        axis_weights.append(
-            XTP._axis_integration_weights(
-                np.asarray(axis_values[axis], dtype=np.float64),
-                bounds[axis] if active else (0.0, 0.0),
-                active=active,
-                periodic=periodic,
-            )
-        )
-    weights = (
-        axis_weights[0][:, None, None]
-        * axis_weights[1][None, :, None]
-        * axis_weights[2][None, None, :]
-    ).reshape(-1).astype(np.float64)  # (nk,)
+    # Same BZ integration weights as the simulation (XTP), including the
+    # optional radial BZ mask and any extra node/local mask supplied here.
+    weights = build_k_integration_weights(
+        config,
+        hamiltonian=hamiltonian,
+        kgrid=kgrid,
+        extra_k_weight_mask=extra_k_weight_mask,
+    )
 
     ccfg = config.susceptibility_solver
     distribution = _resolve_distribution(ccfg.distribution)
@@ -194,6 +297,7 @@ def compute_linear_response_spectrum(
         "n_kpoints": nk,
         "gamma": gamma,
         "method": "theory",
+        "k_weight_mask_applied": extra_k_weight_mask is not None,
     }
 
 
@@ -293,14 +397,7 @@ def compute_hhg_spectrum(
     J_harm_t = np.zeros((Nt, dim), dtype=np.float64)
     if max_order >= 2:
         from qxti.analytics.rho_analytic import rho_order_s, _velocity_band
-        bounds = hamiltonian.reciprocal_box_bounds()
-        from qxti.response.xtp import XTP
-        periodic = bool(getattr(kgrid, "shifted", False))
-        axv = (kgrid.kx_values, kgrid.ky_values, kgrid.kz_values)
-        aw = [XTP._axis_integration_weights(np.asarray(axv[ax], float),
-              bounds[ax] if ax < dim else (0.0, 0.0), active=ax < dim, periodic=periodic)
-              for ax in range(3)]
-        weights = (aw[0][:, None, None] * aw[1][None, :, None] * aw[2][None, None, :]).reshape(-1)
+        weights = build_k_integration_weights(config, hamiltonian=hamiltonian, kgrid=kgrid)
         k_points = kgrid.points()
         T_au = temperature
         E_field = np.asarray(list(E_cw) + [0.0] * (3 - dim), dtype=complex)
@@ -446,14 +543,7 @@ def compute_susceptibility_spectrum(
     # --- Orders >=2 ---
     higher = [s for s in orders if s >= 2]
     ccfg = config.susceptibility_solver
-    from qxti.response.xtp import XTP
-    periodic = bool(getattr(kgrid, "shifted", False))
-    bounds = hamiltonian.reciprocal_box_bounds()
-    axv = (kgrid.kx_values, kgrid.ky_values, kgrid.kz_values)
-    aw = [XTP._axis_integration_weights(np.asarray(axv[ax], float),
-          bounds[ax] if ax < dim else (0.0, 0.0), active=ax < dim, periodic=periodic)
-          for ax in range(3)]
-    weights = (aw[0][:, None, None] * aw[1][None, :, None] * aw[2][None, None, :]).reshape(-1)
+    weights = build_k_integration_weights(config, hamiltonian=hamiltonian, kgrid=kgrid)
 
     # Order 2: fast grid-based mesh covariant gradient.
     if 2 in higher:

@@ -40,7 +40,9 @@ class QXTISimulation:
 
     @classmethod
     def from_file(cls, config_path: str | Path) -> QXTISimulation:
-        return cls(config=QXTIConfig.from_file(config_path))
+        # Standardize outputs to outputs/<model_name>/{cmd,hamiltonian} so any
+        # entry point (CLI, runner, graphics) reads/writes the same paths.
+        return cls(config=QXTIConfig.from_file(config_path).with_standard_output_dirs())
 
     def build_hamiltonian(self) -> Hamiltonian:
         hcfg = self.config.hamiltonian

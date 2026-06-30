@@ -227,10 +227,31 @@ class HarmonicGraphics:
             axis.spines["right"].set_visible(False)
             axis.spines["left"].set_linewidth(0.5)
             axis.spines["bottom"].set_linewidth(0.5)
-            axis.tick_params(axis="both", which="major", labelsize=7, width=0.5, length=3, direction="out")
+            axis.xaxis.set_ticks_position("bottom")
+            axis.tick_params(
+                axis="both",
+                which="major",
+                labelsize=7,
+                width=0.5,
+                length=3,
+                direction="out",
+                top=False,
+                labeltop=False,
+                right=False,
+                labelright=False,
+            )
             twin.spines["top"].set_visible(False)
             twin.spines["left"].set_visible(False)
+            twin.spines["bottom"].set_visible(False)
             twin.spines["right"].set_linewidth(0.5)
+            twin.tick_params(
+                axis="x",
+                which="both",
+                top=False,
+                labeltop=False,
+                bottom=False,
+                labelbottom=False,
+            )
             twin.tick_params(axis="y", which="major", labelsize=7, width=0.5, length=3, direction="out")
             legend_lines = field_lines + current_lines
             axis.legend(
@@ -919,8 +940,33 @@ class HarmonicGraphics:
         axis.spines["bottom"].set_color("#6b7280")
         axis.spines["left"].set_linewidth(0.9)
         axis.spines["bottom"].set_linewidth(0.9)
-        axis.tick_params(axis="both", which="major", labelsize=9, width=0.8, length=4, direction="out", colors="#111827")
-        axis.tick_params(axis="both", which="minor", width=0.6, length=2.5, direction="out", colors="#111827")
+        # The global paper style used elsewhere in QXTI enables top ticks on
+        # every axis. HHG panels add a dedicated secondary top x-axis
+        # (harmonic-energy scale), so the primary axis must explicitly disable
+        # its own top ticks/labels to avoid duplicated/superposed top axes.
+        axis.tick_params(
+            axis="both",
+            which="major",
+            labelsize=9,
+            width=0.8,
+            length=4,
+            direction="out",
+            colors="#111827",
+            top=False,
+            labeltop=False,
+            right=False,
+            labelright=False,
+        )
+        axis.tick_params(
+            axis="both",
+            which="minor",
+            width=0.6,
+            length=2.5,
+            direction="out",
+            colors="#111827",
+            top=False,
+            right=False,
+        )
         axis.margins(x=0.01)
 
         legend = axis.legend(
@@ -939,6 +985,7 @@ class HarmonicGraphics:
         legend.get_frame().set_linewidth(0.8)
 
         if show_top_axis and use_harmonic_order and top_energy_scale_ev is not None and top_energy_scale_ev > 0.0:
+            axis.xaxis.set_ticks_position("bottom")
             top_axis = axis.secondary_xaxis(
                 "top",
                 functions=(
@@ -947,7 +994,19 @@ class HarmonicGraphics:
                 ),
             )
             top_axis.set_xlabel(r"$\hbar\omega\;(\mathrm{eV})$", fontsize=10.5, color="#111827", labelpad=10)
-            top_axis.tick_params(axis="x", which="major", labelsize=8, width=0.8, length=4, direction="out", colors="#111827")
+            top_axis.tick_params(
+                axis="x",
+                which="major",
+                labelsize=8,
+                width=0.8,
+                length=4,
+                direction="out",
+                colors="#111827",
+                bottom=False,
+                labelbottom=False,
+                top=True,
+                labeltop=True,
+            )
             top_axis.spines["top"].set_linewidth(0.9)
             top_axis.spines["top"].set_color("#6b7280")
 
