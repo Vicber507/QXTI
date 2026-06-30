@@ -221,7 +221,9 @@ class SusceptibilityScanRunner:
 
     @classmethod
     def from_file(cls, config_path: str | Path) -> SusceptibilityScanRunner:
-        return cls(config=QXTIConfig.from_file(config_path))
+        # Standardize outputs to outputs/<model_name>/xtp so any entry point
+        # (CLI, runner, graphics) reads/writes the same paths.
+        return cls(config=QXTIConfig.from_file(config_path).with_standard_output_dirs())
 
     def run(self) -> dict[str, Path]:
         """Dispatch on ``[xtp] susceptibility_method``: simulation, theory, or both."""

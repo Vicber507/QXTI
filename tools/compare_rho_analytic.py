@@ -8,7 +8,7 @@ Usage:
     python tools/compare_rho_analytic.py \\
         --model graphene --order 1 \\
         --rho_path outputs/graphene_hhg/rho_order_1.npy \\
-        --cfg inputs/HHG/inputParams.cfg
+        --cfg inputs/inputParams.graphene.cfg
 """
 import argparse
 import sys

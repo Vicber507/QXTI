@@ -155,6 +155,17 @@ TENSOR_PALETTE = (
 LINE_STYLES = ("-", "--", "-.", ":")
 
 
+def prepare_primary_axis_for_secondary_top(axis: Any) -> None:
+    """Avoid duplicated top ticks when a secondary top x-axis is added.
+
+    The shared paper style enables top ticks globally. Any plot that adds a
+    dedicated secondary top x-axis must disable the primary axis top ticks and
+    labels first, or both axes render on top of each other.
+    """
+    axis.xaxis.set_ticks_position("bottom")
+    axis.tick_params(axis="x", which="both", top=False, labeltop=False)
+
+
 def to_helicity_basis(
     tensor: ComplexArray,
     dimension: int,
@@ -330,6 +341,7 @@ class SusceptibilityTensorPlotter:
         axis.set_title(rf"$\left|{sym}({self.argument_label})\right|$")
         axis.ticklabel_format(axis="y", style="sci", scilimits=(-2, 2))
         if self.include_ev_axis:
+            prepare_primary_axis_for_secondary_top(axis)
             top_axis = axis.secondary_xaxis(
                 "top",
                 functions=(lambda v: v * AU_TO_EV, lambda v: v / AU_TO_EV),
@@ -412,6 +424,7 @@ class SusceptibilityTensorPlotter:
         axis.ticklabel_format(axis="y", style="sci", scilimits=(-2, 2))
         axis.legend(frameon=False, fontsize=10.5)
         if self.include_ev_axis:
+            prepare_primary_axis_for_secondary_top(axis)
             top_axis = axis.secondary_xaxis(
                 "top",
                 functions=(lambda values: values * AU_TO_EV, lambda values: values / AU_TO_EV),
@@ -568,6 +581,7 @@ class SusceptibilityTensorPlotter:
         imag_axis.set_ylabel(rf"$\Im\,{self._tex_name}$")
         modulus_axis.set_ylabel(rf"$\left|{self._tex_name}\right|$")
         if self.include_ev_axis:
+            prepare_primary_axis_for_secondary_top(real_axis)
             top_axis = real_axis.secondary_xaxis(
                 "top",
                 functions=(lambda values: values * AU_TO_EV, lambda values: values / AU_TO_EV),

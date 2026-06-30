@@ -209,5 +209,32 @@ def weyl_nodes(params: dict[str, object] | None = None) -> np.ndarray:
     )
 
 
+def weyl_nodes_with_chirality(params: dict[str, object] | None = None) -> list[dict[str, object]]:
+    """Return Weyl-node positions together with their chirality.
+
+    For the 2x2 Weyl blocks of this model the chirality is the sign of the
+    Jacobian ``det(∂d_i / ∂k_j)`` at the node. In this Hamiltonian the ``ky``
+    and ``kz`` derivatives contribute with the same positive sign at every node,
+    so the chirality is fixed by the sign of ``-sin(kx a)``:
+
+    * ``kx < 0``  -> chirality ``+1``
+    * ``kx > 0``  -> chirality ``-1``
+
+    This yields two positive-chirality nodes and two negative-chirality nodes,
+    as required by Nielsen-Ninomiya.
+    """
+    nodes = np.asarray(weyl_nodes(params), dtype=float)
+    tagged: list[dict[str, object]] = []
+    for node in nodes:
+        chirality = +1 if float(node[0]) < 0.0 else -1
+        tagged.append(
+            {
+                "k": np.asarray(node, dtype=float),
+                "chirality": int(chirality),
+            }
+        )
+    return tagged
+
+
 # QXTI looks for the function 'H' by default.
 hamiltonian = H

@@ -41,10 +41,21 @@ DEFAULT_HAMILTONIAN_PLOTS = (
 )
 
 
+def _load_standardized_config(config_path: str | Path) -> QXTIConfig:
+    """Load a config and standardize its output dirs to outputs/<model>/{cmd,xtp,
+    hamiltonian} so graphics reads from the same paths main.py writes to. Guarded
+    with hasattr so SimpleNamespace test mocks (which patch from_file) still work.
+    """
+    config = QXTIConfig.from_file(config_path)
+    if hasattr(config, "with_standard_output_dirs"):
+        config = config.with_standard_output_dirs()
+    return config
+
+
 def plot_hamiltonian_graphics_from_saved_data(
     config_path: str | Path,
 ) -> dict[str, Path]:
-    config = QXTIConfig.from_file(config_path)
+    config = _load_standardized_config(config_path)
     plot_cfg = config.hamiltonian_plots
     output_dir = Path(plot_cfg.output_dir)
     data_dir = output_dir / "data"
@@ -100,7 +111,7 @@ def plot_response_graphics_from_saved_data(
     *,
     plot_config: dict[str, object] | None = None,
 ) -> dict[str, Path]:
-    config = QXTIConfig.from_file(config_path)
+    config = _load_standardized_config(config_path)
     output_dir = Path(config.cmd.output_dir)
     data_dir = output_dir / "data"
     resolved_plot_config = resolve_response_plot_config(plot_config)
@@ -299,7 +310,7 @@ def plot_harmonic_graphics_from_saved_data(
     *,
     plot_config: dict[str, object] | None = None,
 ) -> dict[str, Path]:
-    config = QXTIConfig.from_file(config_path)
+    config = _load_standardized_config(config_path)
     output_dir = Path(config.cmd.output_dir)
     data_dir = output_dir / "data"
     resolved_plot_config = resolve_harmonic_plot_config(plot_config)
@@ -515,7 +526,7 @@ def plot_susceptibility_graphics_from_saved_data(
     *,
     plot_config: dict[str, object] | None = None,
 ) -> dict[str, Path]:
-    config = QXTIConfig.from_file(config_path)
+    config = _load_standardized_config(config_path)
     output_dir = _susceptibility_plot_output_dir(config)
     data_dir = Path(config.xtp.susceptibility_output_dir) / "data"
     resolved_plot_config = _resolve_susceptibility_plot_config_from_xtp(config, plot_config)
@@ -864,7 +875,7 @@ def _augment_legacy_harmonic_dataset(data: dict[str, object]) -> dict[str, objec
 def _load_response_fallback_data(
     config_path: str | Path,
 ) -> tuple[dict[int, object], object, object, object, object, object]:
-    config = QXTIConfig.from_file(config_path)
+    config = _load_standardized_config(config_path)
     output_dir = Path(config.cmd.output_dir)
     from qxti.core import QXTISimulation
 

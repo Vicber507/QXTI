@@ -353,6 +353,47 @@ class QXTIConfig:
             source_path=path.resolve(),
         )
 
+    def run_name(self) -> str:
+        """Short identifier for this run, used for the standard output folder.
+
+        Derived from the config file name: ``inputParams.tblg.cfg`` -> ``tblg``.
+        Falls back to the model source-file stem, then ``"run"``.
+        """
+        if self.source_path is not None:
+            stem = Path(self.source_path).stem
+            if stem.startswith("inputParams."):
+                stem = stem[len("inputParams."):]
+            if stem and stem.lower() != "inputparams":
+                return stem
+        src = self.hamiltonian.source_file
+        return Path(src).stem if src else "run"
+
+    def with_standard_output_dirs(self) -> "QXTIConfig":
+        """Return a copy whose outputs all live under ``outputs/<run_name>/``.
+
+        HHG / time-domain  ->  outputs/<name>/cmd
+        Tensor sweep (xtp) ->  outputs/<name>/xtp
+        Hamiltonian plots  ->  outputs/<name>/hamiltonian
+
+        This is the single source of truth for paths: inputs no longer need to
+        set any output directory, and graphics reads from the same place.
+
+        Only directories still left at their library DEFAULT are rewritten. A
+        config that sets an explicit output_dir keeps it (so callers/tests can
+        still pin a custom location). Idempotent.
+        """
+        root = f"outputs/{self.run_name()}"
+        cmd = self.cmd
+        if cmd.output_dir == "outputs/cmd":
+            cmd = replace(cmd, output_dir=f"{root}/cmd")
+        xtp = self.xtp
+        if xtp.susceptibility_output_dir == "outputs/susceptibility":
+            xtp = replace(xtp, susceptibility_output_dir=f"{root}/xtp")
+        ham_plots = self.hamiltonian_plots
+        if ham_plots.output_dir == "outputs/hamiltonian":
+            ham_plots = replace(ham_plots, output_dir=f"{root}/hamiltonian")
+        return replace(self, cmd=cmd, xtp=xtp, hamiltonian_plots=ham_plots)
+
     @staticmethod
     def _parse_hamiltonian_section(section: configparser.SectionProxy) -> HamiltonianConfig:
         reserved = {
