@@ -25,12 +25,15 @@ IS_PERIODIC = True
 # Parametros fisicos por defecto
 # (equivalentes a los leidos por libconfig en el codigo C++)
 # ---------------------------------------------------------------------------
+EV_TO_HARTREE = 1.0 / 27.211386245988
+ANG_TO_BOHR = 1.0 / 0.529177210903
+
 DEFAULT_PARAMS = {
-    "t1"  : 0.075,                 # hopping primeros vecinos A->B  [a.u.]
-    "t2"  : 0.025,                 # hopping segundos vecinos A->A / B->B  [a.u.]
-    "M0"  : 2.54 * 0.025,          # M0 = Mt2 * t2 = 0.0635  [a.u.]
-    "phi0": 1.16,                  # fase del hopping NNN  [rad]
-    "a0"  : 1.0 / 0.529177,        # 1.0 Angstrom -> a.u. (1 Bohr = 0.529177 Å)
+    "t1"  : 2.7 * EV_TO_HARTREE,    # hopping NN tipo grafeno  [a.u.]
+    "t2"  : 0.30 * EV_TO_HARTREE,   # hopping NNN realista tipo grafeno  [a.u.]
+    "M0"  : 0.0,                    # masa de subred  [a.u.]
+    "phi0": 0.5 * np.pi,            # fase de Haldane  [rad]
+    "a0"  : 2.46 * ANG_TO_BOHR,     # escala de red tipo grafeno -> a.u.
 }
 
 # ---------------------------------------------------------------------------
@@ -51,14 +54,14 @@ DEFAULT_PARAMS = {
 #   kx_max = pi / (√3 · a0)
 #   ky_max = 2*pi / (3 · a0)
 
-_a0_au = 1.0 / 0.529177   # 1.0 Angstrom en unidades atomicas ~ 1.8897 a.u.
+_a0_au = 2.46 * ANG_TO_BOHR   # 2.46 Angstrom en unidades atomicas ~ 4.6487 a.u.
 _kx_max = np.pi / (np.sqrt(3.0) * _a0_au)
 _ky_max = 2.0 * np.pi / (3.0 * _a0_au)
 
 DEFAULT_LATTICE = {
     "lattice_type": "2D honeycomb (hexagonal)",
     "lattice_constants": {
-        "a0"       : _a0_au,   # constante de red en a.u. (~1.8897); clave leida por QXTI como fallback
+        "a0"       : _a0_au,   # constante de red en a.u. (~4.6487); clave leida por QXTI como fallback
         "a"        : _a0_au,   # alias por si QXTI busca la clave "a"
         "gamma_deg": 120.0,
     },
@@ -76,11 +79,12 @@ DEFAULT_LATTICE = {
         [0.0, 0.0, 0.0],
     ],
     "notes": (
-        "a0 = 1.0 Ang = 1.8897 a.u. | "
-        "t1 = 0.075 a.u. | t2 = 0.025 a.u. | "
-        "M0 = Mt2*t2 = 2.54*0.025 = 0.0635 a.u. | "
-        "phi0 = 1.16 rad. "
-        "El numero de Chern es C=+/-1 segun el signo de M0 y phi0."
+        "a0 = 2.46 Ang = 4.6487 a.u. | "
+        "t1 = 2.7 eV = 0.09922 a.u. | t2 = 0.30 eV = 0.01102 a.u. | "
+        "M0 = 0.0 a.u. | "
+        "phi0 = pi/2 rad. "
+        "Set grafeno-realista para HHG: escala energetica de grafeno con NNN "
+        "finito y una fase de Haldane que deja una fase topologica centrada en k."
     ),
 }
 

@@ -9,17 +9,20 @@ from pathlib import Path
 os.environ.setdefault("MPLCONFIGDIR", "/private/tmp")
 os.environ.setdefault("XDG_CACHE_HOME", "/private/tmp")
 
-from qxti.core import QXTIConfig, QXTISimulation, SusceptibilityScanRunner
+from qxti.core import QXTIConfig, QXTISimulation, SusceptibilityScanRunner, LDOSRunner
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Run QXTI physics calculations from a SINGLE input file. Choose the "
-            "calculation with a flag:\n"
-            "  -hhg : time-domain / HHG current spectrum (the [cmd] + [laser] workflow)\n"
-            "  -xtp : conductivity & susceptibility tensors sigma/chi(omega) "
-            "(the [xtp] + [susceptibility_solver] frequency sweep)\n"
+            "calculation with a flag (named after its config section):\n"
+            "  -cmd  : time-domain / HHG current spectrum (the [cmd] + [laser] workflow)\n"
+            "  -xtp  : conductivity & susceptibility tensors sigma/chi(omega) "
+            "(the [xtp] frequency sweep)\n"
+            "  -ldos : density of states g(E), projected PDOS and spectral A(k,E) "
+            "(the [ldos] workflow)\n"
+            "(-hhg is kept as a deprecated alias of -cmd.)\n"
             "If no flag is given, main.py auto-detects from [xtp] susceptibility_enabled "
             "(backward compatible)."
         ),
@@ -33,12 +36,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
-        "-hhg", "--hhg", dest="hhg", action="store_true",
-        help="Run the HHG / time-domain current workflow (uses [cmd], [laser]).",
+        "-cmd", "--cmd", "-hhg", "--hhg", dest="cmd", action="store_true",
+        help="Run the time-domain / HHG current workflow (uses [cmd], [laser]). "
+        "-hhg is a deprecated alias.",
     )
     mode.add_argument(
         "-xtp", "--xtp", dest="xtp", action="store_true",
-        help="Run the conductivity/susceptibility tensor sweep (uses [xtp], [susceptibility_solver]).",
+        help="Run the conductivity/susceptibility tensor sweep (uses [xtp]).",
+    )
+    mode.add_argument(
+        "-ldos", "--ldos", dest="ldos", action="store_true",
+        help="Run the density-of-states calculation (uses [ldos]).",
     )
     return parser
 
@@ -50,21 +58,32 @@ def run_from_config_path(
 ) -> dict[str, Path]:
     """Run one calculation from a single config.
 
-    ``mode`` is "hhg", "xtp", or None. When None it falls back to the legacy
-    auto-detection (``[xtp] susceptibility_enabled``). A SINGLE input file can
-    hold both the [cmd]/[laser] (HHG) and [xtp]/[susceptibility_solver] (tensor)
-    sections; the flag selects which one runs.
+    ``mode`` is "cmd" (alias "hhg"), "xtp", "ldos", or None. When None it falls
+    back to the legacy auto-detection (``[xtp] susceptibility_enabled``). A SINGLE
+    input file can hold the [cmd]/[laser] (HHG), [xtp] (tensor sweep + its solver
+    params) and [ldos] (density of states) sections; the flag selects which runs.
     """
     resolved_path = Path(config_path).expanduser()
     config = QXTIConfig.from_file(resolved_path)
-    # Standardize outputs to outputs/<model_name>/{cmd,xtp,hamiltonian}. Guarded
-    # with hasattr so SimpleNamespace test mocks (which patch from_file) still work.
+    # Standardize outputs to outputs/<model_name>/{cmd,xtp,ldos,hamiltonian}.
+    # Guarded with hasattr so SimpleNamespace test mocks (which patch from_file)
+    # still work.
     if hasattr(config, "with_standard_output_dirs"):
         config = config.with_standard_output_dirs()
 
     forced = mode is not None
+    # Accept the deprecated "hhg" spelling as an alias of "cmd".
+    if mode == "hhg":
+        mode = "cmd"
     if mode is None:
-        mode = "xtp" if config.xtp.susceptibility_enabled else "hhg"
+        mode = "xtp" if config.xtp.susceptibility_enabled else "cmd"
+
+    if mode == "ldos":
+        if forced and not getattr(getattr(config, "ldos", None), "enabled", True):
+            config = replace(config, ldos=replace(config.ldos, enabled=True))
+        method = getattr(getattr(config, "ldos", None), "method", "eigenvalues")
+        print(f"[main] Mode: -ldos -> density of states (method={method}).")
+        return LDOSRunner(config=config).run()
 
     if mode == "xtp":
         # An explicit -xtp flag enables the sweep even if the config left
@@ -75,11 +94,11 @@ def run_from_config_path(
         print(f"[main] Mode: -xtp -> conductivity/susceptibility tensor sweep (method={method}).")
         return SusceptibilityScanRunner(config=config).run()
 
-    # mode == "hhg"
+    # mode == "cmd"
     if forced and not getattr(getattr(config, "cmd", None), "enabled", True):
         config = replace(config, cmd=replace(config.cmd, enabled=True))
     method = getattr(getattr(config, "cmd", None), "response_method", "simulation")
-    print(f"[main] Mode: -hhg -> time-domain / HHG current spectrum (method={method}).")
+    print(f"[main] Mode: -cmd -> time-domain / HHG current spectrum (method={method}).")
     return QXTISimulation(config=config).run()
 
 
@@ -87,7 +106,7 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
-    mode = "hhg" if args.hhg else ("xtp" if args.xtp else None)
+    mode = "cmd" if args.cmd else ("xtp" if args.xtp else ("ldos" if args.ldos else None))
     config_path = Path(args.config).expanduser()
     outputs = run_from_config_path(config_path, mode=mode)
 

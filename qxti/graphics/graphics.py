@@ -767,6 +767,99 @@ def _deep_update_local(target: dict[str, object], updates: dict[str, object]) ->
             target[key] = value
 
 
+def plot_ldos_graphics_from_saved_data(
+    config_path: str | Path,
+) -> dict[str, Path]:
+    """Generate the density-of-states figures from a saved ``ldos.npz`` dataset.
+
+    Produces the total DOS (with cumulative N(E)), the orbital-projected PDOS
+    (when present) and the momentum-resolved spectral map (when present). Reads
+    from the standardized ``outputs/<model>/ldos/data/ldos.npz`` path.
+    """
+    from qxti.graphics.plot_dos import (
+        plot_dos_projected,
+        plot_dos_surface_bulk,
+        plot_dos_total,
+        plot_finite_ldos_map,
+        plot_finite_spectrum,
+        plot_spectral_map,
+        plot_spectral_plane,
+    )
+
+    config = _load_standardized_config(config_path)
+    lcfg = config.ldos
+    output_dir = Path(lcfg.output_dir)
+    dataset_path = output_dir / "data" / "ldos.npz"
+    if not dataset_path.exists():
+        raise FileNotFoundError(
+            f"Missing density-of-states dataset '{dataset_path}'. "
+            f"Run `python main.py {Path(config_path).name} -ldos` first."
+        )
+
+    data = load_dataset_npz(dataset_path)
+    if str(data.get("method", "")) == "surface" and "surface_compare_layers" not in data:
+        data = dict(data)
+        normal = str(data.get("surface_normal", getattr(lcfg, "surface_normal", "auto"))).strip().lower()
+        explicit_layers = int(getattr(lcfg, "surface_compare_layers", 0) or 0)
+        if explicit_layers > 0:
+            compare_layers = explicit_layers
+        elif normal == "x":
+            compare_layers = max(int(getattr(lcfg, "finite_nx", 1)), 1)
+        elif normal == "y":
+            compare_layers = max(int(getattr(lcfg, "finite_ny", 1)), 1)
+        else:
+            compare_layers = max(
+                int(getattr(lcfg, "finite_nx", 1)),
+                int(getattr(lcfg, "finite_ny", 1)),
+                1,
+            )
+        data["surface_compare_layers"] = compare_layers
+    print(f"[graphics] plotting density-of-states dataset '{dataset_path.name}'.")
+    dpi = int(getattr(lcfg, "plot_dpi", 300))
+    outputs: dict[str, Path] = {}
+
+    outputs["dos_total"] = plot_dos_total(data, output_dir / "dos_total.png", dpi=dpi)
+    if str(data.get("method", "")) == "surface":
+        legacy_surface_bulk = plot_dos_surface_bulk(data, output_dir / "dos_surface_bulk.png", dpi=dpi)
+        if legacy_surface_bulk is not None:
+            outputs["dos_surface_bulk"] = legacy_surface_bulk
+    projected = plot_dos_projected(data, output_dir / "dos_projected.png", dpi=dpi)
+    if projected is not None:
+        outputs["dos_projected"] = projected
+        if str(data.get("method", "")) == "surface":
+            legacy_projected_bulk = plot_dos_projected(
+                data,
+                output_dir / "dos_projected_bulk.png",
+                dpi=dpi,
+            )
+            if legacy_projected_bulk is not None:
+                outputs["dos_projected_bulk"] = legacy_projected_bulk
+    surface_projected = plot_dos_projected(
+        data,
+        output_dir / "dos_projected_surface.png",
+        dpi=dpi,
+        pdos_key="surface_pdos",
+        total_key="surface_dos",
+        total_label=r"surface total $g_\mathrm{surf}(E)$",
+        x_label_override=r"$g_{\alpha}^{\mathrm{surf}}(E)\;(\mathrm{states}/\mathrm{eV})$",
+    )
+    if surface_projected is not None:
+        outputs["dos_projected_surface"] = surface_projected
+    spectral = plot_spectral_map(data, output_dir / "spectral_map.png", dpi=dpi)
+    if spectral is not None:
+        outputs["spectral_map"] = spectral
+    plane = plot_spectral_plane(data, output_dir / "spectral_plane.png", dpi=dpi)
+    if plane is not None:
+        outputs["spectral_plane"] = plane
+    finite_spectrum = plot_finite_spectrum(data, output_dir / "finite_spectrum.png", dpi=dpi)
+    if finite_spectrum is not None:
+        outputs["finite_spectrum"] = finite_spectrum
+    finite_ldos_map = plot_finite_ldos_map(data, output_dir / "finite_ldos_map.png", dpi=dpi)
+    if finite_ldos_map is not None:
+        outputs["finite_ldos_map"] = finite_ldos_map
+    return outputs
+
+
 def plot_all_graphics_from_saved_data(
     config_path: str | Path,
 ) -> dict[str, Path]:
@@ -774,13 +867,15 @@ def plot_all_graphics_from_saved_data(
 
     Families whose datasets are missing are skipped (not fatal), so a
     susceptibility-only config produces only its susceptibility plots, an
-    HHG-only config produces only its harmonic/response plots, and so on.
+    HHG-only config produces only its harmonic/response plots, an LDOS-only
+    config produces only its DOS plots, and so on.
     """
     outputs: dict[str, Path] = {}
     families = (
         ("hamiltonian", plot_hamiltonian_graphics_from_saved_data),
         ("harmonics", plot_harmonic_graphics_from_saved_data),
         ("susceptibility", plot_susceptibility_graphics_from_saved_data),
+        ("ldos", plot_ldos_graphics_from_saved_data),
         ("response", plot_response_graphics_from_saved_data),
     )
     for name, plotter in families:
@@ -803,25 +898,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--family",
-        choices=("all", "hamiltonian", "response", "harmonics", "susceptibility"),
+        choices=("all", "hamiltonian", "response", "harmonics", "susceptibility", "ldos"),
         default="all",
         help="Choose which graphics family to generate from saved data.",
     )
+    # Convenience flags so the SAME flag used to run a calculation in main.py also
+    # selects its plots here (e.g. `graphics.py -ldos <config>` == `--family ldos`).
+    shortcuts = parser.add_mutually_exclusive_group()
+    shortcuts.add_argument("-cmd", "--cmd", "-hhg", "--hhg", dest="shortcut",
+                           action="store_const", const="harmonics",
+                           help="Shortcut for --family harmonics (the -cmd calculation's plots). "
+                           "-hhg is a deprecated alias.")
+    shortcuts.add_argument("-xtp", "--xtp", dest="shortcut", action="store_const", const="susceptibility",
+                           help="Shortcut for --family susceptibility (the -xtp calculation's plots).")
+    shortcuts.add_argument("-ldos", "--ldos", dest="shortcut", action="store_const", const="ldos",
+                           help="Shortcut for --family ldos (the -ldos calculation's plots).")
     return parser
 
 
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    # A -hhg/-xtp/-ldos shortcut, if given, overrides --family.
+    family = args.shortcut if getattr(args, "shortcut", None) else args.family
 
-    if args.family == "all":
+    if family == "all":
         outputs = plot_all_graphics_from_saved_data(args.config)
-    elif args.family == "hamiltonian":
+    elif family == "hamiltonian":
         outputs = plot_hamiltonian_graphics_from_saved_data(args.config)
-    elif args.family == "harmonics":
+    elif family == "harmonics":
         outputs = plot_harmonic_graphics_from_saved_data(args.config)
-    elif args.family == "susceptibility":
+    elif family == "susceptibility":
         outputs = plot_susceptibility_graphics_from_saved_data(args.config)
+    elif family == "ldos":
+        outputs = plot_ldos_graphics_from_saved_data(args.config)
     else:
         outputs = plot_response_graphics_from_saved_data(args.config)
 
