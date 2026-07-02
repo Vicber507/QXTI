@@ -299,6 +299,154 @@ class XTPConfig:
     susceptibility_plot_ev_axis: bool = True
 
 @dataclass(slots=True)
+class LDOSConfig:
+    """Configuration for the density-of-states branch (``main.py ... -ldos``).
+
+    Computes the bulk density of states g(E) of H(k) over the [kgrid] mesh by
+    diagonalizing every k-point and broadening the eigenvalues. It is the third
+    calculation family, next to ``-hhg`` ([cmd]) and ``-xtp`` ([xtp]).
+
+    Quantities produced (all from the same k-grid pass):
+      * total DOS g(E)                         -> integrates to ``basis_size``
+      * orbital-projected PDOS g_alpha(E)      -> sum_alpha g_alpha = g
+      * cumulative N(E) = \\int_{-inf}^{E} g    -> band filling
+      * optional momentum-resolved spectral function, in two display modes that
+        mirror the original surface-Green example:
+          - E vs k    : A(k, E) along a straight k-path (broadened band structure)
+          - kx vs ky  : A(kx, ky; E0) at a fixed energy (constant-energy / Fermi map)
+        Both are -Im Tr G/pi for finite H(k) and are drawn with the example's
+        Blues + linear-alpha colormap, log scale and fixed log color range.
+
+    All input values in ``[ldos]`` stay in atomic units: energies in Hartree and
+    momenta in inverse Bohr. The graphics layer converts them to eV and 1/Ang
+    only for visualization.
+
+    Engines now available through ``ldos.method``:
+      * ``eigenvalues`` -> periodic bulk DOS / PDOS / A(k,E)
+      * ``surface``     -> semi-infinite surface/edge Green function; ``surface_side``
+                           selects one face or ``both`` (both faces at once, the
+                           exact + fast replacement for a finite-slab/ribbon)
+      * ``finite``      -> finite plaque in two directions (no good k; use LDOS(r,E))
+    """
+
+    enabled: bool = False
+    output_dir: str = "outputs/ldos"
+    # Engine:
+    #   "eigenvalues" = BULK DOS: diagonalize the fully periodic H(k) and broaden
+    #                   (Lorentzian = Green trace -Im Tr[(E+i*eta-H)^-1]/pi).
+    #   "surface"     = SURFACE/EDGE: make the crystal semi-infinite along one
+    #                   direction (Lopez-Sancho decimation) and compute the
+    #                   surface Green function. Reveals surface states (3D) and
+    #                   edge states (2D, e.g. the Haldane chiral edge mode) inside
+    #                   the projected bulk gap. ``surface_side = both`` returns the
+    #                   two opposite faces at once (e.g. all Weyl Fermi arcs),
+    #                   which is the exact, fast replacement for a finite slab.
+    #   "finite"      = FINITE PLAQUE: build a finite 2-D sample with open
+    #                   boundaries in both lattice directions, diagonalize it in
+    #                   real space, and produce a finite-system DOS together with
+    #                   a site-resolved LDOS map. No good crystal momentum exists
+    #                   in this mode, so the relevant observable is LDOS(r, E)
+    #                   rather than A(k, E). Configured by the finite_* keys.
+    method: str = "eigenvalues"
+    # --- Surface/edge mode (method = surface) ---
+    # Direction made semi-infinite: "x"|"y"|"z" or "auto" (z in 3D, y in 2D).
+    surface_normal: str = "auto"
+    # Which termination of the semi-infinite stack to show:
+    #   "bottom" / "top" = the two opposite faces (their surface states are
+    #                      complementary -- e.g. a Weyl slab's Fermi arcs route
+    #                      differently on each face);
+    #   "both"           = sum of both faces (shows ALL arcs at once -- this is
+    #                      the natural replacement for a finite-slab calculation).
+    surface_side: str = "both"
+    # Lopez-Sancho decimation controls.
+    surface_max_iter: int = 80
+    surface_tol: float = 1.0e-8
+    # k-points used to Fourier-transform H along the normal into principal-layer
+    # blocks H00 (intra-layer) and H01 (inter-layer). Assumes nearest-layer
+    # coupling along the normal (the standard principal-layer approximation).
+    surface_kn_points: int = 200
+    # Also integrate the surface spectral function over the in-plane grid to get
+    # the surface LDOS g_surf(E) (peaks = surface/edge states in the bulk gap).
+    surface_ldos_enabled: bool = True
+    # Effective slab/ribbon thickness used only when plotting the surface
+    # contribution against the bulk DOS. 0 = infer from finite_nx/finite_ny when
+    # possible. This turns a local surface LDOS into an O(surface/bulk) contribution.
+    surface_compare_layers: int = 0
+    # --- Finite-plaque mode (method = finite) ---
+    # Number of Bravais cells along the two open directions of the finite 2-D
+    # sample. The Hilbert-space size is basis_size * finite_nx * finite_ny, so
+    # these should stay moderate for dense diagonalization.
+    finite_nx: int = 24
+    finite_ny: int = 24
+    # Energy where the site-resolved LDOS map is evaluated (a.u.). None -> use
+    # fermi_level.
+    finite_ldos_energy: float | None = None
+    # Number of outermost unit-cell layers classified as "edge" when coloring
+    # the finite-state spectrum by edge localization.
+    finite_edge_cells: int = 1
+    # Broadening kernel applied to each level: "lorentzian" or "gaussian".
+    broadening: str = "lorentzian"
+    # Broadening width eta (a.u.). 0 -> auto (a few energy-grid steps).
+    eta: float = 0.0
+    # Energy window (a.u.). None -> auto from the band extrema with padding.
+    e_min: float | None = None
+    e_max: float | None = None
+    num_energies: int = 600
+    # Orbital/sublattice-projected PDOS (cheap; needs eigenvectors).
+    projected: bool = True
+    # Fermi level (a.u.), drawn as a reference line and used for the filling note.
+    fermi_level: float = 0.0
+    # --- Spectral function mode 1: E vs k along a k-path ---
+    spectral_enabled: bool = False
+    # Simple single-axis path in a.u.: choose the axis and the scalar endpoints.
+    # Example:
+    #   spectral_axis = kx
+    #   spectral_axis_start = -0.5
+    #   spectral_axis_end = 0.5
+    # Optional aliases accepted in inputs:
+    #   spectral_line_axis, spectral_line_start, spectral_line_end
+    spectral_axis: str = ""
+    spectral_axis_start: float | None = None
+    spectral_axis_end: float | None = None
+    # Optional fixed point for the non-varying coordinates in the simple-axis mode.
+    # Alias accepted: spectral_line_origin
+    spectral_axis_origin: tuple[float, ...] = field(default_factory=tuple)
+    # Two-point straight path in a.u. (1/Bohr); used when no multi-segment path
+    # is given.
+    spectral_k0: tuple[float, ...] = field(default_factory=tuple)
+    spectral_k1: tuple[float, ...] = field(default_factory=tuple)
+    # Multi-segment high-symmetry path in a.u. (1/Bohr): a list of vertices
+    # (each a 3-vector) and optional labels, e.g.
+    # spectral_path = 0,0,0 ; 1.28,0,0 ; 0.96,0.55,0  and
+    # spectral_path_labels = \Gamma, K, M. Takes precedence over spectral_k0/k1.
+    spectral_path: tuple[tuple[float, ...], ...] = field(default_factory=tuple)
+    spectral_path_labels: tuple[str, ...] = field(default_factory=tuple)
+    # Total number of k-points along the whole path.
+    spectral_num_k: int = 200
+    # --- Spectral function mode 2: kx vs ky at a fixed energy ---
+    spectral_plane_enabled: bool = False
+    # Fixed energy of the cut (a.u.). None -> use fermi_level (Fermi-surface map).
+    spectral_plane_energy: float | None = None
+    # kx/ky window in a.u. (1/Bohr). None -> auto from the BZ box.
+    spectral_plane_kx_min: float | None = None
+    spectral_plane_kx_max: float | None = None
+    spectral_plane_ky_min: float | None = None
+    spectral_plane_ky_max: float | None = None
+    spectral_plane_kz: float = 0.0
+    spectral_plane_nkx: int = 160
+    spectral_plane_nky: int = 160
+    # --- Spectral plot style (defaults copied from the original example) ---
+    spectral_cmap: str = "Blues"
+    spectral_log_scale: bool = True
+    spectral_log_vmin: float | None = -1.5
+    spectral_log_vmax: float | None = 3.3
+    spectral_alpha_min: float = 0.0
+    spectral_alpha_max: float = 1.0
+    # Plot dots-per-inch. (Figures are always drawn in eV vs 1/Angstrom.)
+    plot_dpi: int = 300
+
+
+@dataclass(slots=True)
 class QXTIConfig:
     hamiltonian: HamiltonianConfig
     hamiltonian_plots: HamiltonianPlotsConfig = field(default_factory=HamiltonianPlotsConfig)
@@ -308,12 +456,16 @@ class QXTIConfig:
     cmd: CMDConfig = field(default_factory=CMDConfig)
     cmd_plots: CMDPlotsConfig = field(default_factory=CMDPlotsConfig)
     xtp: XTPConfig = field(default_factory=XTPConfig)
+    ldos: LDOSConfig = field(default_factory=LDOSConfig)
     susceptibility_solver: CMDConfig = field(default_factory=CMDConfig)
     source_path: Path | None = None
 
     @classmethod
     def from_file(cls, config_path: str | Path) -> QXTIConfig:
-        parser = configparser.ConfigParser()
+        # inline_comment_prefixes lets values carry trailing "# ..." comments
+        # (e.g. `eta = 0.0   # auto`), so the heavily-documented reference inputs
+        # parse. A '#' only starts an inline comment when preceded by whitespace.
+        parser = configparser.ConfigParser(inline_comment_prefixes=("#",))
         parser.optionxform = str
         path = Path(config_path).expanduser()
         if not parser.read(path):
@@ -330,16 +482,22 @@ class QXTIConfig:
         cmd = cls._parse_cmd_section(parser["cmd"]) if "cmd" in parser else CMDConfig()
         cmd_plots = cls._parse_cmd_plots_section(parser["cmd_plots"]) if "cmd_plots" in parser else CMDPlotsConfig()
         xtp = cls._parse_xtp_section(parser["xtp"]) if "xtp" in parser else XTPConfig()
+        ldos = cls._parse_ldos_section(parser["ldos"]) if "ldos" in parser else LDOSConfig()
         if "susceptibility_scan" in parser:
             xtp = replace(
                 xtp,
                 **cls._parse_legacy_susceptibility_scan_section(parser["susceptibility_scan"]),
             )
-        susceptibility_solver = (
-            cls._parse_cmd_section(parser["susceptibility_solver"])
-            if "susceptibility_solver" in parser
-            else CMDConfig()
-        )
+        # Susceptibility-sweep solver parameters now live INSIDE [xtp] (read with
+        # the same CMD parser, since [xtp] and [cmd] share no key names). The
+        # standalone [susceptibility_solver] section is still accepted for
+        # backward compatibility and takes precedence when present.
+        if "susceptibility_solver" in parser:
+            susceptibility_solver = cls._parse_cmd_section(parser["susceptibility_solver"])
+        elif "xtp" in parser:
+            susceptibility_solver = cls._parse_cmd_section(parser["xtp"])
+        else:
+            susceptibility_solver = CMDConfig()
         return cls(
             hamiltonian=hamiltonian,
             hamiltonian_plots=hamiltonian_plots,
@@ -349,6 +507,7 @@ class QXTIConfig:
             cmd=cmd,
             cmd_plots=cmd_plots,
             xtp=xtp,
+            ldos=ldos,
             susceptibility_solver=susceptibility_solver,
             source_path=path.resolve(),
         )
@@ -392,7 +551,10 @@ class QXTIConfig:
         ham_plots = self.hamiltonian_plots
         if ham_plots.output_dir == "outputs/hamiltonian":
             ham_plots = replace(ham_plots, output_dir=f"{root}/hamiltonian")
-        return replace(self, cmd=cmd, xtp=xtp, hamiltonian_plots=ham_plots)
+        ldos = self.ldos
+        if ldos.output_dir == "outputs/ldos":
+            ldos = replace(ldos, output_dir=f"{root}/ldos")
+        return replace(self, cmd=cmd, xtp=xtp, ldos=ldos, hamiltonian_plots=ham_plots)
 
     @staticmethod
     def _parse_hamiltonian_section(section: configparser.SectionProxy) -> HamiltonianConfig:
@@ -716,6 +878,88 @@ class QXTIConfig:
                 "susceptibility_plot_ev_axis",
                 fallback=True,
             ),
+        )
+
+    @staticmethod
+    def _parse_ldos_section(section: configparser.SectionProxy) -> LDOSConfig:
+        def _opt_float(key: str) -> float | None:
+            raw = section.get(key, fallback="").strip()
+            return None if not raw else float(_parse_scalar(raw))
+
+        axis_origin_raw = section.get("spectral_axis_origin", fallback="").strip() or section.get(
+            "spectral_line_origin",
+            fallback="",
+        ).strip()
+        axis_origin = tuple(_parse_float_list(axis_origin_raw, default=[]))
+        spectral_axis = section.get("spectral_axis", fallback="").strip().lower() or section.get(
+            "spectral_line_axis",
+            fallback="",
+        ).strip().lower()
+        spectral_axis_start = _opt_float("spectral_axis_start")
+        if spectral_axis_start is None:
+            spectral_axis_start = _opt_float("spectral_line_start")
+        spectral_axis_end = _opt_float("spectral_axis_end")
+        if spectral_axis_end is None:
+            spectral_axis_end = _opt_float("spectral_line_end")
+        k0 = tuple(_parse_float_list(section.get("spectral_k0", fallback=""), default=[]))
+        k1 = tuple(_parse_float_list(section.get("spectral_k1", fallback=""), default=[]))
+        # Multi-segment path: vertices separated by ';', coordinates by ','.
+        path_raw = section.get("spectral_path", fallback="").strip()
+        spectral_path: tuple[tuple[float, ...], ...] = tuple(
+            tuple(float(x) for x in vertex.replace("[", "").replace("]", "").split(",") if x.strip())
+            for vertex in path_raw.split(";")
+            if vertex.strip()
+        )
+        labels_raw = section.get("spectral_path_labels", fallback="").strip()
+        spectral_path_labels = tuple(s.strip() for s in labels_raw.split(",") if s.strip())
+        return LDOSConfig(
+            enabled=section.getboolean("enabled", fallback=False),
+            output_dir=section.get("output_dir", fallback="outputs/ldos").strip() or "outputs/ldos",
+            method=section.get("method", fallback="eigenvalues").strip().lower() or "eigenvalues",
+            surface_normal=section.get("surface_normal", fallback="auto").strip().lower() or "auto",
+            surface_side=section.get("surface_side", fallback="both").strip().lower() or "both",
+            surface_max_iter=section.getint("surface_max_iter", fallback=80),
+            surface_tol=section.getfloat("surface_tol", fallback=1.0e-8),
+            surface_kn_points=section.getint("surface_kn_points", fallback=200),
+            surface_ldos_enabled=section.getboolean("surface_ldos_enabled", fallback=True),
+            surface_compare_layers=section.getint("surface_compare_layers", fallback=0),
+            finite_nx=section.getint("finite_nx", fallback=24),
+            finite_ny=section.getint("finite_ny", fallback=24),
+            finite_ldos_energy=_opt_float("finite_ldos_energy"),
+            finite_edge_cells=section.getint("finite_edge_cells", fallback=1),
+            broadening=section.get("broadening", fallback="lorentzian").strip().lower() or "lorentzian",
+            eta=section.getfloat("eta", fallback=0.0),
+            e_min=_opt_float("e_min"),
+            e_max=_opt_float("e_max"),
+            num_energies=section.getint("num_energies", fallback=600),
+            projected=section.getboolean("projected", fallback=True),
+            fermi_level=section.getfloat("fermi_level", fallback=0.0),
+            spectral_enabled=section.getboolean("spectral_enabled", fallback=False),
+            spectral_axis=spectral_axis,
+            spectral_axis_start=spectral_axis_start,
+            spectral_axis_end=spectral_axis_end,
+            spectral_axis_origin=axis_origin,
+            spectral_k0=k0,
+            spectral_k1=k1,
+            spectral_path=spectral_path,
+            spectral_path_labels=spectral_path_labels,
+            spectral_num_k=section.getint("spectral_num_k", fallback=200),
+            spectral_plane_enabled=section.getboolean("spectral_plane_enabled", fallback=False),
+            spectral_plane_energy=_opt_float("spectral_plane_energy"),
+            spectral_plane_kx_min=_opt_float("spectral_plane_kx_min"),
+            spectral_plane_kx_max=_opt_float("spectral_plane_kx_max"),
+            spectral_plane_ky_min=_opt_float("spectral_plane_ky_min"),
+            spectral_plane_ky_max=_opt_float("spectral_plane_ky_max"),
+            spectral_plane_kz=section.getfloat("spectral_plane_kz", fallback=0.0),
+            spectral_plane_nkx=section.getint("spectral_plane_nkx", fallback=160),
+            spectral_plane_nky=section.getint("spectral_plane_nky", fallback=160),
+            spectral_cmap=section.get("spectral_cmap", fallback="Blues").strip() or "Blues",
+            spectral_log_scale=section.getboolean("spectral_log_scale", fallback=True),
+            spectral_log_vmin=_opt_float("spectral_log_vmin") if section.get("spectral_log_vmin", fallback="").strip() else -1.5,
+            spectral_log_vmax=_opt_float("spectral_log_vmax") if section.get("spectral_log_vmax", fallback="").strip() else 3.3,
+            spectral_alpha_min=section.getfloat("spectral_alpha_min", fallback=0.0),
+            spectral_alpha_max=section.getfloat("spectral_alpha_max", fallback=1.0),
+            plot_dpi=section.getint("plot_dpi", fallback=300),
         )
 
     @staticmethod

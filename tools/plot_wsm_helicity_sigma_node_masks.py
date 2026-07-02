@@ -17,6 +17,7 @@ en la base de helicidad ``(+,-,z)``.
 """
 
 import argparse
+from dataclasses import replace
 import importlib.util
 import os
 from pathlib import Path
@@ -122,6 +123,29 @@ def _resolve_omega_axis(config: QXTIConfig) -> np.ndarray:
     if np.any(omega_axis <= 0.0):
         raise ValueError("Las frecuencias del barrido deben ser estrictamente positivas.")
     return np.asarray(omega_axis, dtype=np.float64)
+
+
+def _delta_tag(delta: float) -> str:
+    value = f"{float(delta):+.6f}"
+    return value.replace("+", "p").replace("-", "m").replace(".", "p")
+
+
+def _resolved_output_dir(raw_output_dir: str, *, delta_override: float | None) -> Path:
+    base = Path(raw_output_dir)
+    if delta_override is None:
+        return base
+    return base / f"delta_{_delta_tag(delta_override)}"
+
+
+def _config_with_delta_override(config: QXTIConfig, *, delta_override: float | None) -> QXTIConfig:
+    if delta_override is None:
+        return config
+    params = dict(config.hamiltonian.params)
+    params["Delta"] = float(delta_override)
+    return replace(
+        config,
+        hamiltonian=replace(config.hamiltonian, params=params),
+    )
 
 
 def _min_nonzero_pair_distance(points: np.ndarray) -> float:
@@ -751,6 +775,15 @@ def parse_args() -> argparse.Namespace:
         help="Directorio de salida base para datos y plots.",
     )
     parser.add_argument(
+        "--delta",
+        type=float,
+        default=None,
+        help=(
+            "Sobrescribe el parametro hamiltonian.Delta solo para esta corrida. "
+            "Los nodos de Weyl y las mascaras se recalculan con ese Delta."
+        ),
+    )
+    parser.add_argument(
         "--mask-radius",
         type=float,
         default=None,
@@ -781,7 +814,10 @@ def main() -> int:
     args = parse_args()
     apply_paper_style()
 
-    config = QXTIConfig.from_file(args.config)
+    config = _config_with_delta_override(
+        QXTIConfig.from_file(args.config),
+        delta_override=args.delta,
+    )
     module, module_path = _load_model_module(config)
     if not hasattr(module, "weyl_nodes_with_chirality"):
         raise AttributeError(
@@ -811,18 +847,27 @@ def main() -> int:
     requested_orders = {int(order) for order in getattr(config.xtp, "susceptibility_orders", (1,))}
     compute_order2 = 2 in requested_orders
 
-    output_dir = Path(args.output_dir)
+    output_dir = _resolved_output_dir(
+        args.output_dir,
+        delta_override=args.delta,
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(
+    summary_lines: list[str] = []
+    effective_delta = float(config.hamiltonian.params.get("Delta", 0.0))
+
+    header = (
         f"[node-mask] modelo: {module_path.name} | dimension={dim} | Nk={kgrid.total_points} | "
-        f"Nomega={omega_axis.size} | radio_mascara={mask_radius:.6f}",
-        flush=True,
+        f"Nomega={omega_axis.size} | Delta={effective_delta:.6f} | radio_mascara={mask_radius:.6f}"
     )
+    summary_lines.append(header)
+    print(header, flush=True)
     for index, node in enumerate(tagged_nodes, start=1):
         position = np.asarray(node["k"], dtype=np.float64)
         coords = ", ".join(f"{value:.6f}" for value in position[:dim])
-        print(f"[node-mask] nodo {index}: chi={int(node['chirality']):+d}, k=({coords})", flush=True)
+        line = f"[node-mask] nodo {index}: chi={int(node['chirality']):+d}, k=({coords})"
+        summary_lines.append(line)
+        print(line, flush=True)
 
     base_weights = build_k_integration_weights(config, hamiltonian=hamiltonian, kgrid=kgrid)
     total_weight = float(np.sum(base_weights)) if base_weights.size else 1.0
@@ -850,13 +895,14 @@ def main() -> int:
         removed_fraction_points = removed_points / max(int(kgrid.total_points), 1)
         removed_fraction_weight = 1.0 - float(np.sum(active_weight) / total_weight) if total_weight > 0 else 0.0
 
-        print(
+        line = (
             f"[node-mask] caso '{case_name}': {case_label} | centros={len(removed_centers)} | "
             f"radio_efectivo={effective_radius:.6f} | "
             f"puntos_excluidos={removed_points}/{kgrid.total_points} ({100.0*removed_fraction_points:.2f}%) | "
-            f"peso_excluido={100.0*removed_fraction_weight:.2f}%",
-            flush=True,
+            f"peso_excluido={100.0*removed_fraction_weight:.2f}%"
         )
+        summary_lines.append(line)
+        print(line, flush=True)
 
         case_start = time.perf_counter()
         result = compute_linear_response_spectrum(
@@ -937,6 +983,10 @@ def main() -> int:
                     + (", ".join(selected_names) if selected_names else "none"),
                     flush=True,
                 )
+                summary_lines.append(
+                    "[node-mask] order 2 helicity components with z kept for plots: "
+                    + (", ".join(selected_names) if selected_names else "none")
+                )
             _save_case_outputs_order2(
                 case_dir=case_dir,
                 omega_axis_au=omega_axis,
@@ -947,10 +997,12 @@ def main() -> int:
                 selected_components=order2_selected_components or [],
                 dpi=int(config.xtp.susceptibility_plot_dpi),
             )
-        print(
-            f"[node-mask] caso '{case_name}' listo en {format_duration(time.perf_counter() - case_start)} -> {case_dir}",
-            flush=True,
+        line = (
+            f"[node-mask] caso '{case_name}' listo en "
+            f"{format_duration(time.perf_counter() - case_start)} -> {case_dir}"
         )
+        summary_lines.append(line)
+        print(line, flush=True)
 
     if hel_labels_ref is not None:
         comparison_dir = output_dir / "comparison" / "helicity"
@@ -968,8 +1020,11 @@ def main() -> int:
             hel_labels=hel_labels_ref,
         )
         for line in _summarize_case_differences(case_tensors=case_tensors_hel, hel_labels=hel_labels_ref):
+            summary_lines.append(line)
             print(line, flush=True)
-        print(f"[node-mask] plot comparativo guardado en {comparison_grid}", flush=True)
+        line = f"[node-mask] plot comparativo guardado en {comparison_grid}"
+        summary_lines.append(line)
+        print(line, flush=True)
 
     if compute_order2 and hel_labels_ref_order2 is not None and order2_selected_components is not None:
         comparison_dir_order2 = output_dir / "comparison" / "helicity_with_z" / "order_2"
@@ -993,15 +1048,22 @@ def main() -> int:
             hel_labels=hel_labels_ref_order2,
             selected_components=order2_selected_components,
         ):
+            summary_lines.append(line)
             print(line, flush=True)
         if comparison_grid_order2 is not None:
-            print(f"[node-mask] plot comparativo de order 2 guardado en {comparison_grid_order2}", flush=True)
+            line = f"[node-mask] plot comparativo de order 2 guardado en {comparison_grid_order2}"
+            summary_lines.append(line)
+            print(line, flush=True)
 
-    print(
+    final_line = (
         f"[node-mask] terminado: 3 casos en {format_duration(time.perf_counter() - overall_start)}. "
-        f"Salida: {output_dir}",
-        flush=True,
+        f"Salida: {output_dir}"
     )
+    summary_lines.append(final_line)
+    print(final_line, flush=True)
+    summary_path = output_dir / "study_summary.txt"
+    summary_path.write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+    print(f"[node-mask] resumen guardado en {summary_path}", flush=True)
     return 0
 
 

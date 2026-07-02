@@ -667,7 +667,6 @@ def _order2_gridbased(hamiltonian, kgrid, omega_axis, weights, ccfg, *, progress
     Returns (sigma2_tensor[nw, dim, dim, dim], available_indices).
     """
     import time as _time
-    from qxti.analytics.rho_analytic import _band_frame  # noqa
     dim = hamiltonian.dimension
     nb = hamiltonian.basis_size
     shape = tuple(kgrid.shape[a] for a in range(3))      # (Nx,Ny,Nz)
@@ -687,17 +686,46 @@ def _order2_gridbased(hamiltonian, kgrid, omega_axis, weights, ccfg, *, progress
     if progress:
         print(f"[theory-susc] order 2 (grid-based): diagonalizing {nk} k-points (batched) ...", flush=True)
 
-    # --- batched band data over the whole grid ---
+    # --- batched band data over the whole grid (memory-safe precompute) ---
     def _Hbatch(kc):
-        return np.array([Hf(float(k[0]), float(k[1]), float(k[2])) for k in kc], dtype=np.complex128)
-    H0 = _Hbatch(k_points)
-    energies, U = np.linalg.eigh(H0)                     # (nk,nb),(nk,nb,nb)
-    Udag = np.conj(np.transpose(U, (0, 2, 1)))
-    vel = []
+        out = np.empty((kc.shape[0], nb, nb), dtype=np.complex128)
+        for index, k in enumerate(kc):
+            out[index] = Hf(float(k[0]), float(k[1]), float(k[2]))
+        return out
+
+    k_chunk = max(512, min(8192, nk))
+    energies = np.empty((nk, nb), dtype=np.float64)
+    U = np.empty((nk, nb, nb), dtype=np.complex128)
+    for start in range(0, nk, k_chunk):
+        stop = min(start + k_chunk, nk)
+        H0 = _Hbatch(k_points[start:stop])
+        evals_chunk, U_chunk = np.linalg.eigh(H0)
+        energies[start:stop] = evals_chunk
+        U[start:stop] = U_chunk
+        if progress and (stop == nk or stop % max(k_chunk, nk // 10 or 1) == 0):
+            print(
+                f"[theory-susc] order 2 (grid-based): eig {stop}/{nk} "
+                f"({100 * stop // nk}%)",
+                flush=True,
+            )
+
+    vel = [np.empty((nk, nb, nb), dtype=np.complex128) for _ in range(dim)]
     for axis in range(dim):
-        sh = np.zeros(3); sh[axis] = dk
-        dH = (_Hbatch(k_points + sh) - _Hbatch(k_points - sh)) / (2 * dk)
-        vel.append(Udag @ dH @ U)                        # (nk,nb,nb) band basis
+        if progress:
+            print(
+                f"[theory-susc] order 2 (grid-based): velocity operator along "
+                f"{('x', 'y', 'z')[axis]} ...",
+                flush=True,
+            )
+        sh = np.zeros(3, dtype=np.float64)
+        sh[axis] = dk
+        for start in range(0, nk, k_chunk):
+            stop = min(start + k_chunk, nk)
+            kc = k_points[start:stop]
+            dH = (_Hbatch(kc + sh) - _Hbatch(kc - sh)) / (2 * dk)
+            U_chunk = U[start:stop]
+            Udag_chunk = np.conj(np.transpose(U_chunk, (0, 2, 1)))
+            vel[axis][start:stop] = Udag_chunk @ dH @ U_chunk
     f = np.asarray(distribution(energies, mu, T_au), dtype=np.float64)  # (nk,nb)
     eps = energies[:, :, None] - energies[:, None, :]    # (nk,n,m)=e_n-e_m
     fmn = f[:, None, :] - f[:, :, None]                  # (nk,n,m)=f_m-f_n
@@ -706,51 +734,166 @@ def _order2_gridbased(hamiltonian, kgrid, omega_axis, weights, ccfg, *, progress
     with np.errstate(divide="ignore", invalid="ignore"):
         inv_eps = np.where(valid, 1.0 / eps, 0.0)
         dfde = (-f * (1.0 - f) / T_au) if T_au > 1e-15 else np.zeros_like(f)
-    A = [1j * vel[a] * inv_eps for a in range(dim)]      # Berry connection (nk,n,m)
 
     U_mesh = U.reshape(*shape, nb, nb)
-    Udag_mesh = Udag.reshape(*shape, nb, nb)
-    ow1 = omega_axis[:, None, None] + 1j * gamma         # (nw,1,1)
-    ow2 = 2.0 * omega_axis[:, None, None] + 1j * gamma
-    inv_d2 = np.where(valid[:, None],
-                      1.0 / (ow2[None] - eps[:, None, :, :]), 0.0)  # (nk,nw,n,m)
+    vel_mesh = [item.reshape(*shape, nb, nb) for item in vel]
+    eps_mesh = eps.reshape(*shape, nb, nb)
+    fmn_mesh = fmn.reshape(*shape, nb, nb)
+    valid_mesh = valid.reshape(*shape, nb, nb)
+    inv_eps_mesh = inv_eps.reshape(*shape, nb, nb)
+    dfde_mesh = dfde.reshape(*shape, nb)
+    weights_mesh = np.asarray(weights, dtype=np.float64).reshape(*shape)
+
+    max_slice_points = max(int(nk // max(shape[axis], 1)) for axis in range(dim))
+    bytes_per_frequency = max_slice_points * nb * nb * 16 * 8
+    omega_chunk = max(1, min(nw, 16, int(1.5e8 / max(bytes_per_frequency, 1))))
+    if progress:
+        print(
+            f"[theory-susc] order 2 (grid-based): using k-chunk={k_chunk} and "
+            f"omega-chunk={omega_chunk} to keep RAM bounded.",
+            flush=True,
+        )
+
+    def _take_matrix(mesh_array, axis: int, idx: int) -> ComplexArray:
+        return np.asarray(np.take(mesh_array, int(idx) % shape[axis], axis=axis), dtype=np.complex128).reshape(-1, nb, nb)
+
+    def _take_vector(mesh_array, axis: int, idx: int) -> ComplexArray:
+        return np.asarray(np.take(mesh_array, int(idx) % shape[axis], axis=axis), dtype=np.complex128).reshape(-1, nb)
+
+    def _take_weights(axis: int, idx: int) -> FloatArray:
+        return np.asarray(np.take(weights_mesh, int(idx) % shape[axis], axis=axis), dtype=np.float64).reshape(-1)
+
+    def _rho1_flat(
+        *,
+        vel_j_flat: ComplexArray,
+        inv_eps_flat: ComplexArray,
+        fmn_flat: FloatArray,
+        valid_flat: NDArray[np.bool_],
+        eps_flat: FloatArray,
+        diag_src_flat: ComplexArray,
+        ow1_flat: ComplexArray,
+    ) -> tuple[ComplexArray, ComplexArray]:
+        Aj_flat = 1j * vel_j_flat * inv_eps_flat
+        drive = Aj_flat * fmn_flat
+        denom1 = ow1_flat[None, :, None, None] - eps_flat[:, None, :, :]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rho1 = np.where(
+                valid_flat[:, None, :, :],
+                drive[:, None, :, :] / denom1,
+                0.0 + 0.0j,
+            )
+        rho1[:, :, np.arange(nb), np.arange(nb)] += diag_src_flat[:, None, :] / ow1_flat[None, :, None]
+        return np.asarray(rho1, dtype=np.complex128), np.asarray(Aj_flat, dtype=np.complex128)
+
     sig2 = np.full((nw, dim, dim, dim), np.nan + 1j * np.nan, dtype=np.complex128)
 
     for j in range(dim):                                  # input direction
         if progress:
-            print(f"[theory-susc] order 2 (grid-based): input dir {('x','y','z')[j]} "
-                  f"({j+1}/{dim}) ...", flush=True)
-        # rho^(1)(k,omega) driven by E_j=1: interband + intraband
-        rho1 = np.zeros((nk, nw, nb, nb), dtype=np.complex128)
-        rho1 += (A[j][:, None, :, :] * fmn[:, None, :, :]) / (ow1[None] - eps[:, None, :, :])
-        # intraband diagonal: rho1_nn = (-i * dfde_n * v_j,nn) / omega_bar
-        diag_src = (-1j) * dfde * np.real(np.diagonal(vel[j], axis1=1, axis2=2))  # (nk,nb)
-        if np.any(diag_src):
-            di = np.arange(nb)
-            rho1[:, :, di, di] += diag_src[:, None, :] / ow1[None, :, 0, :]
-        rho1 = np.where(valid[:, None] | np.eye(nb, dtype=bool)[None, None], rho1, 0.0)
+            print(
+                f"[theory-susc] order 2 (grid-based): input dir {('x','y','z')[j]} "
+                f"({j+1}/{dim}) ...",
+                flush=True,
+            )
+        sig2[:, :, j, j] = 0.0 + 0.0j
+        diag_src_mesh = np.asarray(
+            (-1j) * dfde_mesh * np.real(np.diagonal(vel_mesh[j], axis1=-2, axis2=-1)),
+            dtype=np.complex128,
+        )
+        n_slices = int(shape[j])
+        n_omega_chunks = (nw + omega_chunk - 1) // omega_chunk
 
-        # covariant gradient D_j rho1 = d_kj rho1 - i[A_j, rho1], mesh Wilson FD
-        rho1_mesh = rho1.reshape(*shape, nw, nb, nb)
-        Up = np.roll(U_mesh, -1, axis=j); Um = np.roll(U_mesh, +1, axis=j)
-        Wp = Udag_mesh @ Up; Wm = Udag_mesh @ Um         # (*shape,nb,nb)
-        Wp_d = np.conj(np.swapaxes(Wp, -1, -2)); Wm_d = np.conj(np.swapaxes(Wm, -1, -2))
-        rp = np.roll(rho1_mesh, -1, axis=j); rm = np.roll(rho1_mesh, +1, axis=j)
-        tp = Wp[..., None, :, :] @ rp @ Wp_d[..., None, :, :]
-        tm = Wm[..., None, :, :] @ rm @ Wm_d[..., None, :, :]
-        dpart = (tp - tm) / (2.0 * dks[j])
-        Aj = A[j].reshape(*shape, nb, nb)[..., None, :, :]
-        comm = Aj @ rho1_mesh - rho1_mesh @ Aj
-        Dj_rho1 = (dpart - 1j * comm).reshape(nk, nw, nb, nb)
+        for omega_chunk_index, wstart in enumerate(range(0, nw, omega_chunk), start=1):
+            wstop = min(wstart + omega_chunk, nw)
+            omega_chunk_values = np.asarray(omega_axis[wstart:wstop], dtype=np.float64)
+            ow1_flat = np.asarray(omega_chunk_values + 1j * gamma, dtype=np.complex128)
+            ow2_flat = np.asarray(2.0 * omega_chunk_values + 1j * gamma, dtype=np.complex128)
+            if progress:
+                print(
+                    f"[theory-susc] order 2 (grid-based):   omega chunk "
+                    f"{omega_chunk_index}/{n_omega_chunks} "
+                    f"({wstart + 1}-{wstop}/{nw}) for input {('x','y','z')[j]}",
+                    flush=True,
+                )
 
-        # rho^(2)(k,2omega) = E_j * D_j rho1 / (2omega_bar - eps), E_j = 1
-        rho2 = Dj_rho1 * inv_d2                           # (nk,nw,nb,nb)
-        # J^(2)_i = sum_k w_k Tr[(-v_i) rho2]
-        for i in range(dim):
-            Ji = -vel[i]                                  # (nk,nb,nb)
-            # Tr[Ji rho2] over (n,m): sum_nm Ji[k,m,n] rho2[k,w,n,m]
-            tr = np.einsum("kmn,kwnm->wk", Ji, rho2, optimize=True)  # (nw,nk)
-            sig2[:, i, j, j] = np.conj(tr @ weights)      # sum over k with BZ weights
+            for slice_index in range(n_slices):
+                U_curr = _take_matrix(U_mesh, j, slice_index)
+                U_plus = _take_matrix(U_mesh, j, slice_index + 1)
+                U_minus = _take_matrix(U_mesh, j, slice_index - 1)
+                U_curr_dag = np.conj(np.swapaxes(U_curr, -1, -2))
+                W_plus = U_curr_dag @ U_plus
+                W_minus = U_curr_dag @ U_minus
+                W_plus_dag = np.conj(np.swapaxes(W_plus, -1, -2))
+                W_minus_dag = np.conj(np.swapaxes(W_minus, -1, -2))
+
+                vel_curr = _take_matrix(vel_mesh[j], j, slice_index)
+                inv_eps_curr = _take_matrix(inv_eps_mesh, j, slice_index)
+                fmn_curr = np.asarray(np.take(fmn_mesh, slice_index % shape[j], axis=j), dtype=np.float64).reshape(-1, nb, nb)
+                valid_curr = np.asarray(np.take(valid_mesh, slice_index % shape[j], axis=j), dtype=bool).reshape(-1, nb, nb)
+                eps_curr = np.asarray(np.take(eps_mesh, slice_index % shape[j], axis=j), dtype=np.float64).reshape(-1, nb, nb)
+                diag_curr = _take_vector(diag_src_mesh, j, slice_index)
+                rho1_curr, Aj_curr = _rho1_flat(
+                    vel_j_flat=vel_curr,
+                    inv_eps_flat=inv_eps_curr,
+                    fmn_flat=fmn_curr,
+                    valid_flat=valid_curr,
+                    eps_flat=eps_curr,
+                    diag_src_flat=diag_curr,
+                    ow1_flat=ow1_flat,
+                )
+
+                vel_plus = _take_matrix(vel_mesh[j], j, slice_index + 1)
+                inv_eps_plus = _take_matrix(inv_eps_mesh, j, slice_index + 1)
+                fmn_plus = np.asarray(np.take(fmn_mesh, (slice_index + 1) % shape[j], axis=j), dtype=np.float64).reshape(-1, nb, nb)
+                valid_plus = np.asarray(np.take(valid_mesh, (slice_index + 1) % shape[j], axis=j), dtype=bool).reshape(-1, nb, nb)
+                eps_plus = np.asarray(np.take(eps_mesh, (slice_index + 1) % shape[j], axis=j), dtype=np.float64).reshape(-1, nb, nb)
+                diag_plus = _take_vector(diag_src_mesh, j, slice_index + 1)
+                rho1_plus, _ = _rho1_flat(
+                    vel_j_flat=vel_plus,
+                    inv_eps_flat=inv_eps_plus,
+                    fmn_flat=fmn_plus,
+                    valid_flat=valid_plus,
+                    eps_flat=eps_plus,
+                    diag_src_flat=diag_plus,
+                    ow1_flat=ow1_flat,
+                )
+
+                vel_minus = _take_matrix(vel_mesh[j], j, slice_index - 1)
+                inv_eps_minus = _take_matrix(inv_eps_mesh, j, slice_index - 1)
+                fmn_minus = np.asarray(np.take(fmn_mesh, (slice_index - 1) % shape[j], axis=j), dtype=np.float64).reshape(-1, nb, nb)
+                valid_minus = np.asarray(np.take(valid_mesh, (slice_index - 1) % shape[j], axis=j), dtype=bool).reshape(-1, nb, nb)
+                eps_minus = np.asarray(np.take(eps_mesh, (slice_index - 1) % shape[j], axis=j), dtype=np.float64).reshape(-1, nb, nb)
+                diag_minus = _take_vector(diag_src_mesh, j, slice_index - 1)
+                rho1_minus, _ = _rho1_flat(
+                    vel_j_flat=vel_minus,
+                    inv_eps_flat=inv_eps_minus,
+                    fmn_flat=fmn_minus,
+                    valid_flat=valid_minus,
+                    eps_flat=eps_minus,
+                    diag_src_flat=diag_minus,
+                    ow1_flat=ow1_flat,
+                )
+
+                transported_plus = W_plus[:, None, :, :] @ rho1_plus @ W_plus_dag[:, None, :, :]
+                transported_minus = W_minus[:, None, :, :] @ rho1_minus @ W_minus_dag[:, None, :, :]
+                dpart = (transported_plus - transported_minus) / (2.0 * dks[j])
+                commutator = (
+                    Aj_curr[:, None, :, :] @ rho1_curr
+                    - rho1_curr @ Aj_curr[:, None, :, :]
+                )
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    inv_d2_curr = np.where(
+                        valid_curr[:, None, :, :],
+                        1.0 / (ow2_flat[None, :, None, None] - eps_curr[:, None, :, :]),
+                        0.0 + 0.0j,
+                    )
+                rho2 = (dpart - 1j * commutator) * inv_d2_curr
+                weights_curr = _take_weights(j, slice_index)
+
+                for i in range(dim):
+                    Ji_curr = -_take_matrix(vel_mesh[i], j, slice_index)
+                    sig2[wstart:wstop, i, j, j] += np.conj(
+                        np.einsum("pmn,pwnm,p->w", Ji_curr, rho2, weights_curr, optimize=True)
+                    )
     if progress:
         print(f"[theory-susc] order 2 (grid-based) done in {_time.perf_counter()-t0:.1f}s", flush=True)
     idx = np.asarray(_susc_available_indices(2, dim), dtype=np.int16)

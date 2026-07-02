@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-"""Mapa de fase de Haldane coloreado por Re[sigma_xy(omega -> 0)].
+"""Plot de Re[sigma_xy^(1)(omega)] del modelo de Haldane para varios phi0.
 
-Usa la formula de Kubo lineal de primer orden sobre un grid k desplazado
-(Monkhorst-Pack) y dibuja el mapa sobre el espacio de fase canonico
-(phi0, M0/t2). El estilo grafico reutiliza la estetica paper-like del
-plotter de susceptibilidad/conductividad de QXTI.
+Genera un barrido en ``phi0`` entre ``-pi/2`` y ``pi/2`` (incluyendo 0) y
+dibuja las curvas de la parte real de ``sigma_xy`` con un colorbar continuo en
+``phi0``. El calculo usa la misma formulacion lineal de Kubo empleada en la
+tool del mapa de fase, pero aqui produce el espectro completo en frecuencia.
 
 Ejemplo:
-    python tools/plot_haldane_sigma_xy_phase_diagram.py \
-        --nphi 81 --nm 81 --kpoints 61 \
-        --omega-dc 1.0e-4 --gamma 5.0e-4
+    python tools/plot_haldane_sigma_xy_vs_phi.py \
+        --nphi 21 --kpoints 101 --omega-max 0.12 --nomega 300
 """
 
 import argparse
@@ -29,7 +28,8 @@ import matplotlib
 
 matplotlib.use("Agg")
 from matplotlib import pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import LinearSegmentedColormap, Normalize
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -39,12 +39,13 @@ if str(PROJECT_ROOT) not in sys.path:
 from qxti.graphics.plot_susceptibility_tensor import apply_paper_style
 from qxti.utils.progress import ProgressTimer, format_duration
 
-DEFAULT_OUTPUT_DIR = Path("outputs") / "haldane_sigma_xy_phase_diagram"
+DEFAULT_OUTPUT_DIR = Path("outputs") / "haldane_sigma_xy_phi_sweep"
+AU_TO_EV = 27.211386245988
 
 
 def _load_haldane_module():
     module_path = PROJECT_ROOT / "models" / "haldane.py"
-    spec = importlib.util.spec_from_file_location("qxti_haldane_model_phase_map", module_path)
+    spec = importlib.util.spec_from_file_location("qxti_haldane_model_sigma_phi", module_path)
     if spec is None or spec.loader is None:
         raise ImportError(f"No se pudo cargar el modelo de Haldane desde {module_path}.")
     module = importlib.util.module_from_spec(spec)
@@ -117,20 +118,19 @@ def _build_precomputed_k_cache(
     }
 
 
-def _sigma_xy_low_frequency_haldane(
+def _sigma_xy_spectrum_haldane(
     *,
     t1: float,
     t2: float,
     phi0: float,
-    m_over_t2: float,
-    omega_dc: float,
+    m0: float,
+    omega_axis: np.ndarray,
     gamma: float,
     mu: float,
     temperature_au: float,
     spin_deg: int,
     cache: dict[str, np.ndarray | float],
-) -> complex:
-    m0 = float(m_over_t2) * float(t2)
+) -> np.ndarray:
     cos_phi = float(np.cos(phi0))
     sin_phi = float(np.sin(phi0))
 
@@ -191,148 +191,130 @@ def _sigma_xy_low_frequency_haldane(
     occupations = _fermi_occupations(energies, mu=mu, temperature_au=temperature_au)
     dfde = _dfde(occupations, temperature_au=temperature_au)
 
-    omega_complex = complex(float(omega_dc), float(gamma))
+    omega_complex = np.asarray(omega_axis, dtype=np.float64) + 1j * float(gamma)
     eps_mn = energies[:, :, None] - energies[:, None, :]
     f_nm = occupations[:, None, :] - occupations[:, :, None]
     valid = (~np.eye(2, dtype=bool))[None, :, :] & (np.abs(eps_mn) > 1.0e-20)
 
     with np.errstate(divide="ignore", invalid="ignore"):
-        interband = np.where(
-            valid,
-            np.transpose(vx_band, (0, 2, 1)) * vy_band * f_nm / eps_mn / (omega_complex - eps_mn),
-            0.0 + 0.0j,
+        interband_prefactor = np.where(valid, f_nm / eps_mn, 0.0)
+        interband_numer = (
+            np.transpose(vx_band, (0, 2, 1)) * vy_band * interband_prefactor
         )
 
     diagonal_vx = np.diagonal(vx_band, axis1=1, axis2=2)
     diagonal_vy = np.diagonal(vy_band, axis1=1, axis2=2).real
-    intraband = (-1j / omega_complex) * np.sum(diagonal_vx * (dfde * diagonal_vy), axis=1)
-    s_k = np.sum(interband, axis=(1, 2)) + intraband
+    intraband_sum = np.sum(diagonal_vx * (dfde * diagonal_vy), axis=1)
 
-    sigma_xy = -1j * float(spin_deg) * np.sum((weight_per_k / bz_area) * s_k)
-    return complex(sigma_xy)
+    sigma_xy = np.zeros(omega_complex.size, dtype=np.complex128)
+    for iw, omega in enumerate(omega_complex):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            denom = omega - eps_mn
+            interband = np.where(valid, interband_numer / denom, 0.0 + 0.0j)
+        intraband = (-1j / omega) * intraband_sum
+        s_k = np.sum(interband, axis=(1, 2)) + intraband
+        sigma_xy[iw] = -1j * float(spin_deg) * np.sum((weight_per_k / bz_area) * s_k)
+
+    return np.asarray(sigma_xy, dtype=np.complex128)
 
 
-def _build_phase_map(
+def _build_sigma_phi_sweep(
     *,
     t1: float,
     t2: float,
+    m0: float,
     a0: float,
-    omega_dc: float,
+    omega_axis: np.ndarray,
     gamma: float,
     mu: float,
     temperature_au: float,
     spin_deg: int,
     phi_values: np.ndarray,
-    m_over_t2_values: np.ndarray,
     nkx: int,
     nky: int,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     haldane_module = _load_haldane_module()
     vec_a = np.asarray(haldane_module._nn_vectors(a0), dtype=np.float64)
     vec_b = np.asarray(haldane_module._nnn_vectors(a0), dtype=np.float64)
     cache = _build_precomputed_k_cache(a0=a0, nkx=nkx, nky=nky, vec_a=vec_a, vec_b=vec_b)
 
-    sigma_map = np.zeros((m_over_t2_values.size, phi_values.size), dtype=np.complex128)
-    timer = ProgressTimer(total=int(m_over_t2_values.size * phi_values.size), min_completed_for_eta=max(4, phi_values.size))
-
-    for im, m_over_t2 in enumerate(m_over_t2_values):
+    sigma_curves = np.zeros((phi_values.size, omega_axis.size), dtype=np.complex128)
+    timer = ProgressTimer(total=int(phi_values.size), min_completed_for_eta=max(4, min(phi_values.size, 8)))
+    for ip, phi0 in enumerate(phi_values):
         row_start = timer.elapsed_seconds
-        for ip, phi0 in enumerate(phi_values):
-            sigma_map[im, ip] = _sigma_xy_low_frequency_haldane(
-                t1=t1,
-                t2=t2,
-                phi0=float(phi0),
-                m_over_t2=float(m_over_t2),
-                omega_dc=omega_dc,
-                gamma=gamma,
-                mu=mu,
-                temperature_au=temperature_au,
-                spin_deg=spin_deg,
-                cache=cache,
-            )
-            timer.advance()
+        sigma_curves[ip] = _sigma_xy_spectrum_haldane(
+            t1=t1,
+            t2=t2,
+            phi0=float(phi0),
+            m0=m0,
+            omega_axis=omega_axis,
+            gamma=gamma,
+            mu=mu,
+            temperature_au=temperature_au,
+            spin_deg=spin_deg,
+            cache=cache,
+        )
+        timer.advance()
         print(
-            f"[haldane-phase] row {im + 1}/{m_over_t2_values.size} "
-            f"(M0/t2={m_over_t2:+.3f}) done in {format_duration(timer.elapsed_seconds - row_start)}; "
+            f"[haldane-sigma-phi] phi {ip + 1}/{phi_values.size} "
+            f"(phi0={phi0:+.4f} rad) in {format_duration(timer.elapsed_seconds - row_start)}; "
             f"elapsed {format_duration(timer.elapsed_seconds)}, ETA {timer.eta_text()}",
             flush=True,
         )
 
-    return sigma_map, np.asarray(cache["kx_values"]), np.asarray(cache["ky_values"])
+    return sigma_curves, np.asarray(cache["kx_values"]), np.asarray(cache["ky_values"])
 
 
-def _plot_phase_map(
-    *,
-    phi_values: np.ndarray,
-    m_over_t2_values: np.ndarray,
-    sigma_map: np.ndarray,
-    output_path: Path,
-    omega_dc: float,
-    gamma: float,
-    nkx: int,
-    nky: int,
-) -> None:
-    apply_paper_style()
-
-    phase_cmap = LinearSegmentedColormap.from_list(
-        "haldane_phase",
+def _phi_colormap() -> LinearSegmentedColormap:
+    return LinearSegmentedColormap.from_list(
+        "haldane_phi_sweep",
         [
-            "#163B5C",  # azul profundo
-            "#2F6C8F",  # azul petroleo
-            "#8DB7B5",  # salvia fria
-            "#F3E9D2",  # marfil calido
-            "#E7B97A",  # arena dorada
-            "#C96B4B",  # terracota
-            "#7A1F2B",  # vino oscuro
+            "#163B5C",
+            "#2F6C8F",
+            "#8DB7B5",
+            "#F3E9D2",
+            "#E7B97A",
+            "#C96B4B",
+            "#7A1F2B",
         ],
         N=256,
     )
 
-    # Always color by the REAL part: for Haldane, Re[sigma_xy(omega->0)] is the
-    # quantized Hall conductivity (~ Chern number), so its SIGN distinguishes the
-    # two topological phases (C = +1 vs C = -1). The modulus would hide that sign.
-    values = np.real(sigma_map)
-    colorbar_label = rf"$\Re\,\sigma_{{xy}}^{{(1)}}(\omega_{{\mathrm{{dc}}}})$"
+
+def _plot_sigma_phi_sweep(
+    *,
+    omega_axis: np.ndarray,
+    phi_values: np.ndarray,
+    sigma_curves: np.ndarray,
+    output_path: Path,
+) -> None:
+    apply_paper_style()
+
+    cmap = _phi_colormap()
+    norm = Normalize(vmin=float(phi_values.min()), vmax=float(phi_values.max()))
+    x_ev = np.asarray(omega_axis, dtype=np.float64) * AU_TO_EV
+    values = np.real(sigma_curves)
 
     figure, axis = plt.subplots(figsize=(7.2, 5.6))
-    x_grid, y_grid = np.meshgrid(phi_values, m_over_t2_values, indexing="xy")
+    for phi0, curve in zip(phi_values, values, strict=True):
+        axis.plot(
+            x_ev,
+            curve,
+            color=cmap(norm(float(phi0))),
+            linewidth=1.5,
+            alpha=0.95,
+        )
 
-    # Symmetric diverging norm centered at 0 so the sign reads off the colormap
-    # (warm = +, cool = -, ivory = 0), even when the map does not straddle zero.
-    vmax = float(np.nanmax(np.abs(values)))
-    norm = TwoSlopeNorm(vmin=-vmax, vcenter=0.0, vmax=vmax) if np.isfinite(vmax) and vmax > 0.0 else None
+    axis.axhline(0.0, color="0.35", linestyle="--", linewidth=1.0, alpha=0.8)
+    axis.set_xlabel(r"$\hbar\omega\;(\mathrm{eV})$")
+    axis.set_ylabel(r"$\Re\,\sigma_{xy}^{(1)}(\omega)\;(\mathrm{a.u.})$")
+    axis.set_title(r"Haldane: $\Re\,\sigma_{xy}^{(1)}(\omega)$ barrido en $\phi_0$")
+    axis.set_xlim(float(x_ev.min()), float(x_ev.max()))
 
-    image = axis.pcolormesh(
-        x_grid,
-        y_grid,
-        values,
-        shading="auto",
-        cmap=phase_cmap,
-        norm=norm,
-        alpha=0.84,
-    )
-
-    critical = 3.0 * np.sqrt(3.0) * np.sin(phi_values)
-    axis.plot(phi_values, critical, color="black", linewidth=1.35, linestyle="--", alpha=0.95)
-    axis.plot(phi_values, -critical, color="black", linewidth=1.35, linestyle="--", alpha=0.95)
-
-    axis.set_xlabel(r"$\phi_0\;(\mathrm{rad})$")
-    axis.set_ylabel(r"$M_0 / t_2$")
-    axis.set_title(rf"Haldane: {colorbar_label} near $\omega \to 0$")
-
-    colorbar = figure.colorbar(image, ax=axis, pad=0.02)
-    colorbar.set_label(colorbar_label + r"$\;(\mathrm{a.u.})$")
-
-    # The Chern number (hence the sign of Re sigma_xy) is set by sign(phi0):
-    # left lobe (phi0 < 0, warm) is C=+1, right lobe (phi0 > 0, cool) is C=-1.
-    phi_lo, phi_hi = float(phi_values.min()), float(phi_values.max())
-    axis.text(phi_lo + 0.22 * (phi_hi - phi_lo), 0.0, "C=+1",
-              fontsize=12, color="black", ha="center", va="center")
-    axis.text(phi_hi - 0.22 * (phi_hi - phi_lo), 0.0, "C=-1",
-              fontsize=12, color="black", ha="center", va="center")
-
-    axis.set_xlim(float(phi_values.min()), float(phi_values.max()))
-    axis.set_ylim(float(m_over_t2_values.min()), float(m_over_t2_values.max()))
+    sm = ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+    colorbar = figure.colorbar(sm, ax=axis, pad=0.02)
+    colorbar.set_label(r"$\phi_0\;(\mathrm{rad})$")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure.tight_layout()
@@ -342,69 +324,67 @@ def _plot_phase_map(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Plot de mapa de fase del modelo de Haldane usando sigma_xy(omega~0)."
+        description="Plot de Re[sigma_xy(omega)] del Haldane con curvas coloreadas por phi0."
     )
-    parser.add_argument("--nphi", type=int, default=81, help="Numero de puntos en phi0.")
-    parser.add_argument("--nm", type=int, default=81, help="Numero de puntos en M0/t2.")
-    parser.add_argument("--kpoints", type=int, default=61, help="Numero de puntos por eje del grid k desplazado.")
-    parser.add_argument("--phi-min", type=float, default=-np.pi, help="Limite inferior de phi0 (rad).")
-    parser.add_argument("--phi-max", type=float, default=np.pi, help="Limite superior de phi0 (rad).")
-    parser.add_argument("--m-over-t2-min", type=float, default=-6.0, help="Limite inferior de M0/t2.")
-    parser.add_argument("--m-over-t2-max", type=float, default=6.0, help="Limite superior de M0/t2.")
-    parser.add_argument("--omega-dc", type=float, default=1.0e-4, help="Frecuencia pequena que aproxima omega->0 (a.u.).")
+    parser.add_argument("--nphi", type=int, default=21, help="Numero de valores de phi0.")
+    parser.add_argument("--phi-min", type=float, default=-0.5 * np.pi, help="Limite inferior de phi0 (rad).")
+    parser.add_argument("--phi-max", type=float, default=0.5 * np.pi, help="Limite superior de phi0 (rad).")
+    parser.add_argument("--nomega", type=int, default=300, help="Numero de frecuencias del espectro.")
+    parser.add_argument("--omega-min", type=float, default=1.0e-3, help="Frecuencia minima (a.u.).")
+    parser.add_argument("--omega-max", type=float, default=0.12, help="Frecuencia maxima (a.u.).")
+    parser.add_argument("--kpoints", type=int, default=101, help="Numero de puntos por eje del grid k desplazado.")
     parser.add_argument("--gamma", type=float, default=5.0e-4, help="Ensanchamiento/decoherencia efectiva (a.u.).")
     parser.add_argument("--mu", type=float, default=0.0, help="Nivel de Fermi (a.u.).")
     parser.add_argument("--temperature-au", type=float, default=0.0, help="Temperatura en unidades atomicas.")
     parser.add_argument("--spin-deg", type=int, default=1, help="Degeneracion de spin del modelo de Haldane.")
     parser.add_argument("--t1", type=float, default=0.075, help="Hopping NN t1 (a.u.).")
     parser.add_argument("--t2", type=float, default=0.025, help="Hopping NNN t2 (a.u.).")
+    parser.add_argument("--m0", type=float, default=0.0, help="Masa de subred M0 (a.u.).")
     parser.add_argument("--a0", type=float, default=1.0 / 0.529177, help="Constante de red a0 (a.u.).")
     parser.add_argument(
         "--output",
-        default=str(DEFAULT_OUTPUT_DIR / "haldane_sigma_xy_dc.png"),
+        default=str(DEFAULT_OUTPUT_DIR / "haldane_sigma_xy_vs_phi.png"),
         help="Ruta del PNG de salida.",
     )
     parser.add_argument(
         "--data-output",
-        default=str(DEFAULT_OUTPUT_DIR / "haldane_sigma_xy_dc.npz"),
-        help="Ruta del dataset .npz con el mapa y ejes.",
+        default=str(DEFAULT_OUTPUT_DIR / "haldane_sigma_xy_vs_phi.npz"),
+        help="Ruta del dataset .npz con las curvas y ejes.",
     )
     args = parser.parse_args()
 
-    if args.nphi <= 1 or args.nm <= 1 or args.kpoints <= 1:
-        raise SystemExit("nphi, nm y kpoints deben ser mayores que 1.")
-    if args.omega_dc <= 0.0:
-        raise SystemExit("omega-dc debe ser estrictamente positivo.")
+    if args.nphi <= 1 or args.nomega <= 1 or args.kpoints <= 1:
+        raise SystemExit("nphi, nomega y kpoints deben ser mayores que 1.")
+    if args.omega_min <= 0.0 or args.omega_max <= args.omega_min:
+        raise SystemExit("Se requiere 0 < omega-min < omega-max.")
     if args.gamma < 0.0:
         raise SystemExit("gamma no puede ser negativo.")
-    if args.t2 == 0.0:
-        raise SystemExit("t2 no puede ser cero si el eje vertical es M0/t2.")
 
     phi_values = np.linspace(args.phi_min, args.phi_max, args.nphi, dtype=np.float64)
-    m_over_t2_values = np.linspace(args.m_over_t2_min, args.m_over_t2_max, args.nm, dtype=np.float64)
+    omega_axis = np.linspace(args.omega_min, args.omega_max, args.nomega, dtype=np.float64)
 
     print(
-        "[haldane-phase] construyendo mapa "
-        f"{args.nm}x{args.nphi} con grid k {args.kpoints}x{args.kpoints}, "
-        f"omega_dc={args.omega_dc:.2e}, gamma={args.gamma:.2e}",
+        "[haldane-sigma-phi] construyendo barrido "
+        f"nphi={args.nphi}, nomega={args.nomega}, grid k {args.kpoints}x{args.kpoints}, "
+        f"phi in [{args.phi_min:.4f}, {args.phi_max:.4f}]",
         flush=True,
     )
-    start = ProgressTimer(total=1)
-    sigma_map, kx_values, ky_values = _build_phase_map(
+    timer = ProgressTimer(total=1)
+    sigma_curves, kx_values, ky_values = _build_sigma_phi_sweep(
         t1=float(args.t1),
         t2=float(args.t2),
+        m0=float(args.m0),
         a0=float(args.a0),
-        omega_dc=float(args.omega_dc),
+        omega_axis=omega_axis,
         gamma=float(args.gamma),
         mu=float(args.mu),
         temperature_au=float(args.temperature_au),
         spin_deg=int(args.spin_deg),
         phi_values=phi_values,
-        m_over_t2_values=m_over_t2_values,
         nkx=int(args.kpoints),
         nky=int(args.kpoints),
     )
-    elapsed = start.elapsed_seconds
+    elapsed = timer.elapsed_seconds
 
     output_path = Path(args.output)
     data_output_path = Path(args.data_output)
@@ -414,14 +394,15 @@ def main() -> int:
     np.savez_compressed(
         data_output_path,
         phi0_axis=phi_values,
-        m_over_t2_axis=m_over_t2_values,
-        sigma_xy_map=sigma_map,
-        sigma_xy_real=np.real(sigma_map),
-        sigma_xy_imag=np.imag(sigma_map),
-        omega_dc=float(args.omega_dc),
+        omega_axis=omega_axis,
+        omega_axis_ev=omega_axis * AU_TO_EV,
+        sigma_xy_curves=sigma_curves,
+        sigma_xy_real=np.real(sigma_curves),
+        sigma_xy_imag=np.imag(sigma_curves),
         gamma=float(args.gamma),
         t1=float(args.t1),
         t2=float(args.t2),
+        m0=float(args.m0),
         a0=float(args.a0),
         mu=float(args.mu),
         temperature_au=float(args.temperature_au),
@@ -430,21 +411,17 @@ def main() -> int:
         ky_axis=ky_values,
     )
 
-    _plot_phase_map(
+    _plot_sigma_phi_sweep(
+        omega_axis=omega_axis,
         phi_values=phi_values,
-        m_over_t2_values=m_over_t2_values,
-        sigma_map=sigma_map,
+        sigma_curves=sigma_curves,
         output_path=output_path,
-        omega_dc=float(args.omega_dc),
-        gamma=float(args.gamma),
-        nkx=int(args.kpoints),
-        nky=int(args.kpoints),
     )
 
     print(
-        f"[haldane-phase] listo en {format_duration(elapsed)}.\n"
-        f"[haldane-phase] plot: {output_path}\n"
-        f"[haldane-phase] data: {data_output_path}",
+        f"[haldane-sigma-phi] listo en {format_duration(elapsed)}.\n"
+        f"[haldane-sigma-phi] plot: {output_path}\n"
+        f"[haldane-sigma-phi] data: {data_output_path}",
         flush=True,
     )
     return 0
