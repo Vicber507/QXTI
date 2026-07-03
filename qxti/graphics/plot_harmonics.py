@@ -34,6 +34,7 @@ except ImportError:  # pragma: no cover - environment dependent
 
 
 AU_TO_EV = 27.211386245988
+DEFAULT_MAX_HARMONIC_ORDER = 3.5
 
 
 DEFAULT_HARMONIC_PLOT_CONFIG = {
@@ -53,7 +54,7 @@ DEFAULT_HARMONIC_PLOT_CONFIG = {
         "omega_min": None,
         "omega_max": None,
         "use_harmonic_order": True,
-        "max_harmonic_order": 10.0,
+        "max_harmonic_order": DEFAULT_MAX_HARMONIC_ORDER,
         "log_scale": True,
     },
     "current_components_spectrum": {
@@ -65,7 +66,7 @@ DEFAULT_HARMONIC_PLOT_CONFIG = {
         "omega_min": None,
         "omega_max": None,
         "use_harmonic_order": True,
-        "max_harmonic_order": 10.0,
+        "max_harmonic_order": DEFAULT_MAX_HARMONIC_ORDER,
         "log_scale": True,
     },
     "current_inter_intra_spectrum": {
@@ -76,7 +77,7 @@ DEFAULT_HARMONIC_PLOT_CONFIG = {
         "omega_min": None,
         "omega_max": None,
         "use_harmonic_order": True,
-        "max_harmonic_order": 10.0,
+        "max_harmonic_order": DEFAULT_MAX_HARMONIC_ORDER,
         "log_scale": True,
     },
     "current_circular_spectrum": {
@@ -87,7 +88,7 @@ DEFAULT_HARMONIC_PLOT_CONFIG = {
         "omega_min": None,
         "omega_max": None,
         "use_harmonic_order": True,
-        "max_harmonic_order": 10.0,
+        "max_harmonic_order": DEFAULT_MAX_HARMONIC_ORDER,
         "log_scale": True,
     },
     "current_overview_spectrum": {
@@ -99,7 +100,7 @@ DEFAULT_HARMONIC_PLOT_CONFIG = {
         "omega_min": None,
         "omega_max": None,
         "use_harmonic_order": True,
-        "max_harmonic_order": 10.0,
+        "max_harmonic_order": DEFAULT_MAX_HARMONIC_ORDER,
         "log_scale": True,
     },
 }
@@ -808,40 +809,50 @@ class HarmonicGraphics:
         return output
 
     @staticmethod
-    @staticmethod
-    def _spectrum_edge_level(
+    def _spectrum_edge_floor(
         *,
         x_values: np.ndarray,
         valid_series: list[tuple[str, np.ndarray, str]],
         use_harmonic_order: bool,
         max_harmonic_order: float | None,
     ) -> float | None:
-        """Return the spectrum level near the highest visible harmonic.
+        """Return the minimum positive spectrum value at the visible edge.
 
-        Used to set the y-axis floor so the panel spans the visible harmonics
-        (H1..H_max) instead of the global noise floor. The level is taken as the
-        largest peak of any series within ``[max_harmonic_order - 1,
-        max_harmonic_order]`` (the last visible harmonic, e.g. H9 for a max of
-        10), which is robust against deep interference valleys exactly at the
-        edge. Returns ``None`` when the harmonic axis or window is unavailable.
+        The HHG panels are explicitly cropped at ``max_harmonic_order``. Their
+        logarithmic y-axis should therefore be set by the values that remain
+        visible, especially by the minimum positive value at the last displayed
+        harmonic order (currently H=3.5), not by peaks outside the cropped range.
         """
         if not use_harmonic_order or max_harmonic_order is None:
             return None
         x_arr = np.asarray(x_values, dtype=float)
-        lower = float(max_harmonic_order) - 1.0
-        upper = float(max_harmonic_order)
-        window = (x_arr >= lower) & (x_arr <= upper)
+        limit = float(max_harmonic_order)
+        window = np.isfinite(x_arr) & (x_arr >= 0.5) & (x_arr <= limit)
         if not np.any(window):
             return None
+        visible_indices = np.flatnonzero(window)
+        edge_index = int(visible_indices[np.argmin(np.abs(x_arr[visible_indices] - limit))])
         edge_values: list[float] = []
         for _label, y_values, _color in valid_series:
-            segment = np.asarray(y_values, dtype=float)[window]
+            value = float(np.asarray(y_values, dtype=float)[edge_index])
+            if np.isfinite(value) and value > 0.0:
+                edge_values.append(value)
+        if edge_values:
+            return min(edge_values)
+
+        # If the closest FFT bin to the edge happens to be exactly zero, fall
+        # back to the minimum positive value in the final visible interval.
+        lower = max(0.5, limit - 0.25)
+        edge_window = window & (x_arr >= lower)
+        fallback_values: list[float] = []
+        for _label, y_values, _color in valid_series:
+            segment = np.asarray(y_values, dtype=float)[edge_window]
             segment = segment[np.isfinite(segment) & (segment > 0.0)]
             if segment.size:
-                edge_values.append(float(np.max(segment)))
-        if not edge_values:
+                fallback_values.append(float(np.min(segment)))
+        if not fallback_values:
             return None
-        return max(edge_values)
+        return min(fallback_values)
 
     def _draw_multi_series_spectrum(
         axis: Any,
@@ -862,6 +873,12 @@ class HarmonicGraphics:
     ) -> None:
         axis.set_facecolor("white")
 
+        x_arr = np.asarray(x_values, dtype=float)
+        visible_mask = np.ones_like(x_arr, dtype=bool)
+        if use_harmonic_order and max_harmonic_order is not None:
+            visible_mask &= x_arr >= 0.5
+            visible_mask &= x_arr <= float(max_harmonic_order)
+
         valid_series: list[tuple[str, np.ndarray, str]] = []
         positive_minima: list[float] = []
         y_peak = 0.0
@@ -869,13 +886,13 @@ class HarmonicGraphics:
             y_values = np.asarray(values, dtype=float)
             if y_values.shape != x_values.shape:
                 raise ValueError("Each spectral series must match the x-axis shape.")
-            if not np.any(y_values > 0.0):
+            visible_values = y_values[visible_mask]
+            visible_positives = visible_values[np.isfinite(visible_values) & (visible_values > 0.0)]
+            if not visible_positives.size:
                 continue
             valid_series.append((label, y_values, color))
-            positives = y_values[np.isfinite(y_values) & (y_values > 0.0)]
-            if positives.size:
-                positive_minima.append(float(np.min(positives)))
-                y_peak = max(y_peak, float(np.max(positives)))
+            positive_minima.append(float(np.min(visible_positives)))
+            y_peak = max(y_peak, float(np.max(visible_positives)))
 
         if not valid_series:
             raise ValueError("The selected spectrum is zero over the requested range.")
@@ -883,18 +900,17 @@ class HarmonicGraphics:
         baseline = 0.0
         if log_scale:
             axis.set_yscale("log")
-            # Choose the y-axis floor at the spectrum level near the highest
-            # visible harmonic (x ~ max_harmonic_order) instead of the global
-            # noise floor. This fills the panel with the visible harmonics
-            # (H1..H_max) and crops the dead space below the last harmonic.
-            edge_level = HarmonicGraphics._spectrum_edge_level(
+            # Choose the y-axis floor from the minimum positive value at the
+            # highest visible harmonic (x ~ max_harmonic_order), instead of
+            # from the global spectrum or from a peak in the cropped-out region.
+            edge_floor = HarmonicGraphics._spectrum_edge_floor(
                 x_values=x_values,
                 valid_series=valid_series,
                 use_harmonic_order=use_harmonic_order,
                 max_harmonic_order=max_harmonic_order,
             )
-            if edge_level is not None and edge_level > 0.0:
-                baseline = max(edge_level * 0.5, 1.0e-16)  # a little headroom below H_max
+            if edge_floor is not None and edge_floor > 0.0:
+                baseline = max(edge_floor * 0.8, 1.0e-16)  # small headroom below the H_max floor
             else:
                 min_positive = min(positive_minima) if positive_minima else 1.0e-12
                 baseline = max(min_positive * 0.35, 1.0e-16)
@@ -903,7 +919,10 @@ class HarmonicGraphics:
             else:
                 axis.set_ylim(bottom=baseline)
         else:
-            axis.set_ylim(bottom=baseline)
+            if y_peak > 0.0:
+                axis.set_ylim(bottom=baseline, top=y_peak * 1.12)
+            else:
+                axis.set_ylim(bottom=baseline)
 
         if use_harmonic_order and max_harmonic_order is not None:
             limit = float(max_harmonic_order)

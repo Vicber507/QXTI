@@ -301,11 +301,90 @@ def compute_linear_response_spectrum(
     }
 
 
+def order2_tensor_at_omega(hamiltonian, kgrid, omega, weights, ccfg):
+    """Full second-order conductivity tensor sigma^(2)_{ijk}(2*omega) at ONE omega.
+
+    Grid-based covariant-gradient BZ integral (the CONVERGENT scheme, vectorized
+    with ``np.roll`` between mesh neighbours), extended to all off-diagonal input
+    components. Returns sigma[i, j, k] (dim^3, complex), symmetric in (j, k).
+
+    The current at the second harmonic for a field E (per Cartesian direction) is
+    ``J_i(2 omega) = sum_{jk} sigma[i,j,k] E_j E_k``.
+    """
+    dim = int(hamiltonian.dimension)
+    nb = int(hamiltonian.basis_size)
+    shape = tuple(int(kgrid.shape[a]) for a in range(3))
+    k_points = np.asarray(kgrid.points(), dtype=np.float64)
+    nk = k_points.shape[0]
+    Hf = hamiltonian._matrix_at
+    bounds = hamiltonian.reciprocal_box_bounds()
+    dks = [(float(bounds[a][1]) - float(bounds[a][0])) / shape[a] for a in range(dim)]
+    distribution = _resolve_distribution(ccfg.distribution)
+    mu = float(ccfg.fermi_level)
+    T = float(ccfg.temperature)
+    gamma = 0.0 if ccfg.coherence_time <= 0 else 1.0 / float(ccfg.coherence_time)
+    dk = 1.0e-4
+
+    def _Hbatch(kc):
+        return np.array([Hf(float(k[0]), float(k[1]), float(k[2])) for k in kc], dtype=np.complex128)
+
+    energies, U = np.linalg.eigh(_Hbatch(k_points))
+    Udag = np.conj(np.transpose(U, (0, 2, 1)))
+    vel = []
+    for a in range(dim):
+        sh = np.zeros(3); sh[a] = dk
+        vel.append(Udag @ ((_Hbatch(k_points + sh) - _Hbatch(k_points - sh)) / (2 * dk)) @ U)
+    f = np.asarray(distribution(energies, mu, T), dtype=np.float64)
+    eps = energies[:, :, None] - energies[:, None, :]
+    fmn = f[:, None, :] - f[:, :, None]
+    offdiag = ~np.eye(nb, dtype=bool)
+    valid = offdiag[None] & (np.abs(eps) > 1e-20)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        inv_eps = np.where(valid, 1.0 / eps, 0.0)
+        dfde = (-f * (1.0 - f) / T) if T > 1e-15 else np.zeros_like(f)
+    A = [1j * vel[a] * inv_eps for a in range(dim)]
+    ow1 = omega + 1j * gamma
+    ow2 = 2.0 * omega + 1j * gamma
+    diagidx = np.arange(nb)
+    valid_diag = valid | np.eye(nb, dtype=bool)[None]
+
+    rho1 = []
+    for c in range(dim):
+        r = np.where(valid, (A[c] * fmn) / (ow1 - eps), 0.0 + 0.0j)
+        diag_src = (-1j) * dfde * np.real(np.diagonal(vel[c], axis1=1, axis2=2))
+        r[:, diagidx, diagidx] += diag_src / ow1
+        rho1.append(np.where(valid_diag, r, 0.0))
+
+    U_mesh = U.reshape(*shape, nb, nb)
+    Udag_mesh = Udag.reshape(*shape, nb, nb)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        inv_d2 = np.where(valid, 1.0 / (ow2 - eps), 0.0 + 0.0j)
+    w = np.asarray(weights, dtype=np.float64).reshape(nk)
+
+    Tt = np.zeros((dim, dim, dim), dtype=np.complex128)
+    for b in range(dim):
+        Up = np.roll(U_mesh, -1, axis=b); Um = np.roll(U_mesh, +1, axis=b)
+        Wp = (Udag_mesh @ Up).reshape(nk, nb, nb); Wm = (Udag_mesh @ Um).reshape(nk, nb, nb)
+        Wp_d = np.conj(np.swapaxes(Wp, -1, -2)); Wm_d = np.conj(np.swapaxes(Wm, -1, -2))
+        for c in range(dim):
+            rc_mesh = rho1[c].reshape(*shape, nb, nb)
+            rp = np.roll(rc_mesh, -1, axis=b).reshape(nk, nb, nb)
+            rm = np.roll(rc_mesh, +1, axis=b).reshape(nk, nb, nb)
+            dpart = (Wp @ rp @ Wp_d - Wm @ rm @ Wm_d) / (2.0 * dks[b])
+            comm = A[b] @ rho1[c] - rho1[c] @ A[b]
+            rho2 = (dpart - 1j * comm) * inv_d2
+            for i in range(dim):
+                tr = np.einsum("kmn,knm->k", -vel[i], rho2, optimize=True)
+                Tt[i, b, c] = np.conj(np.sum(tr * w))
+    return 0.5 * (Tt + np.transpose(Tt, (0, 2, 1)))
+
+
 def compute_hhg_spectrum(
     config: QXTIConfig,
     *,
     max_order: int | None = None,
     progress: bool = True,
+    extra_k_weight_mask: FloatArray | None = None,
 ) -> dict[str, Any]:
     """Perturbative (theory) HHG current spectrum J(omega), comparable to the CMD run.
 
@@ -397,37 +476,49 @@ def compute_hhg_spectrum(
     J_harm_t = np.zeros((Nt, dim), dtype=np.float64)
     if max_order >= 2:
         from qxti.analytics.rho_analytic import rho_order_s, _velocity_band
-        weights = build_k_integration_weights(config, hamiltonian=hamiltonian, kgrid=kgrid)
+        weights = build_k_integration_weights(config, hamiltonian=hamiltonian, kgrid=kgrid,
+                                              extra_k_weight_mask=extra_k_weight_mask)
         k_points = kgrid.points()
         T_au = temperature
         E_field = np.asarray(list(E_cw) + [0.0] * (3 - dim), dtype=complex)
 
         from qxti.utils.progress import ProgressTimer
+        Ef = E_field[:dim]
         for s in range(2, max_order + 1):
-            timer = ProgressTimer(total=nk)
-            hb = max(1, nk // 10)
-            Js = np.zeros(dim, dtype=np.complex128)
-            for ik in range(nk):
-                if progress and ik % hb == 0:
-                    print(
-                        f"[theory-HHG] order {s}: k-point {ik+1}/{nk} "
-                        f"({100*(ik+1)//nk}%), elapsed {timer.elapsed_seconds:.1f}s, "
-                        f"ETA {timer.eta_text()}",
-                        flush=True,
-                    )
-                kx, ky, kz = (float(k_points[ik, 0]), float(k_points[ik, 1]), float(k_points[ik, 2]))
-                vel = _velocity_band(hamiltonian._matrix_at, kx, ky, kz)
-                try:
-                    rhos = rho_order_s(hamiltonian._matrix_at, kx, ky, kz, E_field,
-                                       omega0, gamma, mu, T_au, max_order=s)
-                except Exception:
-                    timer.advance(); continue
-                rho_s = rhos.get(s)
-                if rho_s is None:
-                    timer.advance(); continue
-                for a in range(dim):
-                    Js[a] += weights[ik] * np.trace((-vel[a]) @ rho_s)
-                timer.advance()
+            if s == 2:
+                # CONVERGENT grid-based order-2 tensor (mesh covariant gradient),
+                # contracted with the CW field: J_i(2w) = sum_jk sigma2_ijk E_j E_k.
+                if progress:
+                    print("[theory-HHG] order 2: grid-based tensor (mesh gradient, "
+                          "convergent) ...", flush=True)
+                sigma2 = order2_tensor_at_omega(hamiltonian, kgrid, omega0, weights, config.cmd)
+                Js = np.einsum("ijk,j,k->i", sigma2, Ef, Ef, optimize=True)
+            else:
+                # Orders s>=3 (THG+): per-k analytic recursion (fallback).
+                timer = ProgressTimer(total=nk)
+                hb = max(1, nk // 10)
+                Js = np.zeros(dim, dtype=np.complex128)
+                for ik in range(nk):
+                    if progress and ik % hb == 0:
+                        print(
+                            f"[theory-HHG] order {s}: k-point {ik+1}/{nk} "
+                            f"({100*(ik+1)//nk}%), elapsed {timer.elapsed_seconds:.1f}s, "
+                            f"ETA {timer.eta_text()}",
+                            flush=True,
+                        )
+                    kx, ky, kz = (float(k_points[ik, 0]), float(k_points[ik, 1]), float(k_points[ik, 2]))
+                    vel = _velocity_band(hamiltonian._matrix_at, kx, ky, kz)
+                    try:
+                        rhos = rho_order_s(hamiltonian._matrix_at, kx, ky, kz, E_field,
+                                           omega0, gamma, mu, T_au, max_order=s)
+                    except Exception:
+                        timer.advance(); continue
+                    rho_s = rhos.get(s)
+                    if rho_s is None:
+                        timer.advance(); continue
+                    for a in range(dim):
+                        Js[a] += weights[ik] * np.trace((-vel[a]) @ rho_s)
+                    timer.advance()
             harmonic_peaks[s] = Js
             # Time-domain harmonic, modulated by the pulse envelope^s at s*omega0:
             #   J^(s)(t) = 2 Re[ J^(s)_+ * env_norm(t)^s * e^{-i s omega0 t} ]
@@ -435,7 +526,7 @@ def compute_hhg_spectrum(
             for a in range(dim):
                 J_harm_t[:, a] += 2.0 * np.real(Js[a] * (env_norm ** s) * phase)
             if progress:
-                print(f"[theory-HHG] order {s} harmonic done in {timer.elapsed_seconds:.1f}s", flush=True)
+                print(f"[theory-HHG] order {s} harmonic done.", flush=True)
 
     # --- Assemble a current_spectrum.npz-compatible dataset (for graphics) ---
     current_time = np.zeros((Nt, 3), dtype=np.float64)

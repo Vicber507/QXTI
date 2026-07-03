@@ -165,16 +165,55 @@ def H(kx: float, ky: float, kz: float, params: dict[str, object] | None = None) 
     return np.asarray(matrix, dtype=complex)
 
 
+def dH_dk(kx: float, ky: float, kz: float, direction: str,
+          params: dict[str, object] | None = None) -> np.ndarray:
+    """ANALYTIC velocity operator dH/dk along 'x'|'y'|'z' (exact, no finite diff).
+
+    Differentiating eq. (2) term by term (chain rule d(a k)/dk = a):
+        dH/dkx = t (-a sin kxa) sigma_x(x)I
+        dH/dky = t [ my a sin kya  sigma_x(x)I + a cos kya  sigma_y(x)I
+                     - Delta a sin kya  sigma_y(x)s_x ]
+        dH/dkz = t [ mz a sin kza  sigma_x(x)I + a cos kza  sigma_z(x)s_x ]
+
+    Detected automatically by the QXTI loader (CustomHamiltonian.dH_dk), so the
+    band velocities / Berry pieces use exact derivatives instead of finite
+    differences.
+    """
+    p = _resolved_params(params)
+    _validate_params(p)
+    t = float(p["t"]); my = float(p["my"]); mz = float(p["mz"])
+    delta = float(p["Delta"]); a = float(p["a"])
+    kxa, kya, kza = a * float(kx), a * float(ky), a * float(kz)
+
+    d = str(direction).lower()
+    if d in ("x", "kx", "0"):
+        matrix = t * (-a * np.sin(kxa)) * _SIGX_I
+    elif d in ("y", "ky", "1"):
+        matrix = t * (
+            my * a * np.sin(kya) * _SIGX_I
+            + a * np.cos(kya) * _SIGY_I
+            - delta * a * np.sin(kya) * _SIGY_SX
+        )
+    elif d in ("z", "kz", "2"):
+        matrix = t * (
+            mz * a * np.sin(kza) * _SIGX_I
+            + a * np.cos(kza) * _SIGZ_SX
+        )
+    else:
+        raise ValueError(f"direction invalido: {direction!r} (usa 'x'|'y'|'z').")
+    return np.asarray(matrix, dtype=complex)
+
+
 def band_energies(kx: float, ky: float, kz: float, params: dict[str, object] | None = None) -> np.ndarray:
     """Return the four band energies (sorted ascending)."""
     return np.linalg.eigvalsh(H(kx, ky, kz, params))
 
 
-def weyl_nodes(params: dict[str, object] | None = None) -> np.ndarray:
-    """Return the four Weyl-node positions in the kz = 0 plane.
+def _weyl_nodes_with_block(params: dict[str, object] | None = None) -> list[tuple[np.ndarray, int]]:
+    """Return the four Weyl nodes as (position, s_x-block eigenvalue) pairs.
 
-    For Delta = 0 the opposite-chirality nodes coincide at (+-pi/2a, 0, 0).
-    For Delta != 0 they split along ky:
+    The Hamiltonian is block-diagonal in ``s_x = +/-1``; each block hosts a pair
+    of opposite-position nodes:
 
     * s_x = +1 block: sin(ky a) + Delta cos(ky a) = 0  ->  ky a = -arctan(Delta)
     * s_x = -1 block: sin(ky a) - Delta cos(ky a) = 0  ->  ky a = +arctan(Delta)
@@ -198,38 +237,51 @@ def weyl_nodes(params: dict[str, object] | None = None) -> np.ndarray:
     kya_minus = +np.arctan(delta)  # s_x = -1
     kx_p = _kx_for(kya_plus)
     kx_m = _kx_for(kya_minus)
-    return np.array(
-        [
-            [+kx_p, kya_plus / a, 0.0],
-            [-kx_p, kya_plus / a, 0.0],
-            [+kx_m, kya_minus / a, 0.0],
-            [-kx_m, kya_minus / a, 0.0],
-        ],
-        dtype=float,
-    )
+    return [
+        (np.array([+kx_p, kya_plus / a, 0.0], dtype=float), +1),
+        (np.array([-kx_p, kya_plus / a, 0.0], dtype=float), +1),
+        (np.array([+kx_m, kya_minus / a, 0.0], dtype=float), -1),
+        (np.array([-kx_m, kya_minus / a, 0.0], dtype=float), -1),
+    ]
+
+
+def weyl_nodes(params: dict[str, object] | None = None) -> np.ndarray:
+    """Return the four Weyl-node positions in the kz = 0 plane (shape (4, 3))."""
+    return np.array([pos for pos, _s in _weyl_nodes_with_block(params)], dtype=float)
 
 
 def weyl_nodes_with_chirality(params: dict[str, object] | None = None) -> list[dict[str, object]]:
     """Return Weyl-node positions together with their chirality.
 
-    For the 2x2 Weyl blocks of this model the chirality is the sign of the
-    Jacobian ``det(∂d_i / ∂k_j)`` at the node. In this Hamiltonian the ``ky``
-    and ``kz`` derivatives contribute with the same positive sign at every node,
-    so the chirality is fixed by the sign of ``-sin(kx a)``:
+    The chirality is the sign of the Jacobian ``det(d d_i / d k_j)`` of the 2x2
+    Weyl block at the node. In the ``s_x = s`` block the d-vector is
 
-    * ``kx < 0``  -> chirality ``+1``
-    * ``kx > 0``  -> chirality ``-1``
+        d_x = t f_x
+        d_y = t [sin(ky a) + s Delta cos(ky a)]
+        d_z = t s sin(kz a)
 
-    This yields two positive-chirality nodes and two negative-chirality nodes,
-    as required by Nielsen-Ninomiya.
+    so at kz = 0 the Jacobian determinant is proportional to
+
+        -s sin(kx a) [cos(ky a) - s Delta sin(ky a)].
+
+    The ``s`` factor in ``d_z`` (the sign flip between the two s_x blocks) is what
+    makes the chirality follow the DIAGONAL pattern chi = sign(kx * ky), i.e. two
+    +1 and two -1 nodes as required by Nielsen-Ninomiya. (An earlier version keyed
+    chirality on sign(kx) alone and mislabelled the two ky>0 nodes; verified here
+    against the numerical Berry-flux Chern number.)
     """
-    nodes = np.asarray(weyl_nodes(params), dtype=float)
+    p = _resolved_params(params)
+    a = float(p["a"])
+    delta = float(p["Delta"])
     tagged: list[dict[str, object]] = []
-    for node in nodes:
-        chirality = +1 if float(node[0]) < 0.0 else -1
+    for pos, s in _weyl_nodes_with_block(params):
+        kxa = a * float(pos[0])
+        kya = a * float(pos[1])
+        det_j = -s * np.sin(kxa) * (np.cos(kya) - s * delta * np.sin(kya))
+        chirality = 1 if det_j > 0.0 else -1
         tagged.append(
             {
-                "k": np.asarray(node, dtype=float),
+                "k": np.asarray(pos, dtype=float),
                 "chirality": int(chirality),
             }
         )

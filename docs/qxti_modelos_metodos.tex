@@ -1,0 +1,276 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[spanish]{babel}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{physics}
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{braket}
+\usepackage{hyperref}
+
+% \Tr, \Im, \norm ya vienen del paquete physics
+\newcommand{\kk}{\bm{k}}
+\newcommand{\bE}{\bm{E}}
+\newcommand{\sig}{\bm{\sigma}}
+\newcommand{\rhoeq}{\rho^{(0)}}
+
+\title{QXTI: modelos y m\'etodos\\
+\large Haldane, semimetal de Weyl (Orenstein), matrices densidad
+perturbativas y funci\'on de Green de superficie de L\'opez-Sancho}
+\author{Notas de trabajo}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\noindent
+Todo en unidades at\'omicas ($\hbar=e=1$). Las energ\'ias se miden en
+Hartree y los vectores de onda en $a_0^{-1}$ (Bohr$^{-1}$).
+
+%======================================================================
+\section{Modelo de Haldane}
+%======================================================================
+Red \emph{honeycomb} con dos subredes $A,B$, hopping a primeros vecinos
+$t_1$ y a segundos vecinos con fase compleja $t_2 e^{i\phi_0}$. Es un
+aislante de Chern sin campo magn\'etico neto
+\cite{Haldane1988}. El Hamiltoniano $2\times2$ se escribe en la base
+$\{\ket{A,\kk},\ket{B,\kk}\}$ como
+\begin{equation}
+  H(\kk) = B_0(\kk)\,\sigma_0 + \bm{B}(\kk)\cdot\sig,
+  \qquad
+  \bm{B}=(B_1,B_2,B_3),
+\end{equation}
+con
+\begin{align}
+  B_0(\kk) &= 2 t_2\cos\phi_0 \sum_{i} \cos(\kk\cdot\bm{b}_i), \\
+  B_1(\kk) &= t_1 \sum_{i}\cos(\kk\cdot\bm{a}_i), \qquad
+  B_2(\kk) = t_1 \sum_{i}\sin(\kk\cdot\bm{a}_i), \\
+  B_3(\kk) &= M_0 - 2 t_2\sin\phi_0 \sum_{i}\sin(\kk\cdot\bm{b}_i).
+\end{align}
+Los $\bm{a}_i$ son los tres vectores a primeros vecinos ($A\!\to\!B$) y
+los $\bm{b}_i$ los de segundos vecinos ($A\!\to\!A$). Expl\'icitamente,
+con constante de red $a_0$,
+\begin{equation}
+  \bm{a}_i \in \Big\{ (0,a_0),\ \big(\!-\tfrac{\sqrt3}{2}a_0,-\tfrac{a_0}{2}\big),\
+  \big(\tfrac{\sqrt3}{2}a_0,-\tfrac{a_0}{2}\big)\Big\},
+  \quad
+  \bm{b}_i \in \Big\{ (\sqrt3 a_0,0),\ \big(\!-\tfrac{\sqrt3}{2}a_0,\tfrac{3}{2}a_0\big),\
+  \big(\!-\tfrac{\sqrt3}{2}a_0,-\tfrac{3}{2}a_0\big)\Big\}.
+\end{equation}
+El t\'ermino $B_0$ (par en $\kk$) desplaza r\'igidamente las bandas; la
+masa efectiva $B_3$ contiene la masa de subred $M_0$ (rompe inversi\'on)
+y el t\'ermino de Haldane $\propto t_2\sin\phi_0$ (rompe TRS). El signo
+relativo de $M_0$ y $t_2\sin\phi_0$ en los dos valles $K,K'$ fija el
+n\'umero de Chern $C=\pm1$ frente a $C=0$. Par\'ametros por defecto:
+$t_1=2.7$~eV, $t_2=0.30$~eV, $M_0=0$, $\phi_0=\pi/2$,
+$a_0=2.46$~\AA\ (grafeno realista).
+
+%======================================================================
+\section{Semimetal de Weyl de Wu/Orenstein (TaAs)}
+%======================================================================
+Modelo m\'inimo de cuatro nodos de Weyl que rompe inversi\'on, usado para
+la respuesta SHG gigante de TaAs \cite{Wu2017}. Base $4\times4$ =
+orbital $\otimes$ esp\'in, con matrices de Pauli $\sigma_i$ (orbital) y
+$s_i$ (esp\'in):
+\begin{equation}
+  H(\kk) = t\Big[ f_x\,(\sigma_x\!\otimes\! I)
+    + \sin(k_y a)\,(\sigma_y\!\otimes\! I)
+    + \Delta\cos(k_y a)\,(\sigma_y\!\otimes\! s_x)
+    + \sin(k_z a)\,(\sigma_z\!\otimes\! s_x)\Big],
+\end{equation}
+\begin{equation}
+  f_x(\kk) = \cos(k_x a) + m_y\big(1-\cos(k_y a)\big) + m_z\big(1-\cos(k_z a)\big).
+\end{equation}
+Como $s_x$ conmuta con $H$, el Hamiltoniano es bloque-diagonal en
+$s_x=\pm1$; cada bloque $2\times2$ aloja un par de nodos. En el bloque
+$s_x=s$ el vector $\bm{d}$ es
+\begin{equation}
+  d_x = t f_x,\quad
+  d_y = t\big[\sin(k_y a) + s\,\Delta\cos(k_y a)\big],\quad
+  d_z = t\, s\,\sin(k_z a).
+\end{equation}
+\paragraph{Nodos y quiralidad.} Los ceros de $\bm{d}$ dan cuatro nodos en
+$k_z=0$: $s_x=+1$ en $k_y a=-\arctan\Delta$ y $s_x=-1$ en
+$k_y a=+\arctan\Delta$ (separaci\'on en $k_y$ $\Rightarrow$ ruptura de
+inversi\'on $\Rightarrow$ SHG $\neq0$); $k_x$ se obtiene de $f_x=0$,
+$\cos(k_x a)=-m_y(1-\cos k_y a)$. La quiralidad es el signo del
+Jacobiano $\det(\partial d_i/\partial k_j)$, que en $k_z=0$ vale
+\begin{equation}
+  \chi = \operatorname{sgn}\!\Big[-s\,\sin(k_x a)\,
+        \big(\cos(k_y a) - s\,\Delta\sin(k_y a)\big)\Big]
+      = \operatorname{sgn}(k_x k_y).
+\end{equation}
+El factor $s$ en $d_z$ (que cambia de signo entre los dos bloques de
+$s_x$) es lo que hace que la quiralidad siga el patr\'on \emph{diagonal}
+$\chi=\operatorname{sgn}(k_x k_y)$: dos nodos $+1$ y dos $-1$
+(Nielsen--Ninomiya). Se ha verificado num\'ericamente contra el n\'umero
+de Chern por flujo de Berry (Fukui--Hatsugai--Suzuki) en una esfera
+alrededor de cada nodo. Par\'ametros: $t=0.8$~eV, $m_y=1$, $m_z=5$,
+$\Delta=0.5$, $a=1$.
+
+%======================================================================
+\section{Matrices densidad en el motor \emph{theory} (dominio de frecuencia)}
+%======================================================================
+El motor anal\'itico resuelve la ecuaci\'on de Liouville en gauge de
+longitud en el dominio de frecuencia, orden a orden en el campo
+\cite{Hipolito2018}. Se parte del equilibrio (matriz diagonal de
+Fermi--Dirac en la base de bandas)
+\begin{equation}
+  \rhoeq_{mn}(\kk) = f\big(\varepsilon_n(\kk)\big)\,\delta_{mn},
+  \qquad
+  f(\varepsilon) = \frac{1}{e^{(\varepsilon-\mu)/T}+1},
+\end{equation}
+y se aplica la recursi\'on (el arm\'onico $s$ sale a la frecuencia
+$s\omega$):
+\begin{equation}
+  \boxed{\;
+  \rho^{(s)}_{mn}(s\omega) =
+    \frac{\big[\bE\cdot D_{\kk}\,\rho^{(s-1)}\big]_{mn}}
+         {\,s\omega - \omega_{mn} + i\gamma\,},
+  \qquad \omega_{mn}=\varepsilon_m-\varepsilon_n. \;}
+\end{equation}
+Aqu\'i $D_{\kk}$ es el \textbf{gradiente covariante} (gauge-invariante)
+\begin{equation}
+  D_{\kk}\rho = \nabla_{\kk}\rho - i\,[\mathcal{A},\rho],
+  \qquad
+  \mathcal{A}^{\alpha}_{mn} = i\,\frac{v^{\alpha}_{mn}}{\varepsilon_m-\varepsilon_n}\ (m\neq n),\quad
+  \mathcal{A}^{\alpha}_{nn}=0,
+\end{equation}
+con $v^{\alpha}=\partial H/\partial k_\alpha$ la velocidad y
+$\mathcal{A}$ la conexi\'on de Berry inter-banda. En la pr\'actica
+$\nabla_{\kk}$ se calcula por diferencias finitas alineadas por enlaces
+de Wilson (transporte paralelo), lo que combina las dos piezas
+($\nabla_{\kk}\rho$ y $-i[\mathcal{A},\rho]$) de forma individualmente
+gauge-invariante. Expl\'icitamente, el primer orden es
+\begin{equation}
+  \rho^{(1)}_{mn}(\omega) =
+    \frac{E_\alpha\,\mathcal{A}^{\alpha}_{mn}\,\big(f_n-f_m\big)}
+         {\omega-\omega_{mn}+i\gamma}.
+\end{equation}
+La corriente arm\'onica y las susceptibilidades se obtienen de la traza
+\begin{equation}
+  J^{(s)}_{\alpha}(s\omega) = \sum_{\kk} w_{\kk}\,
+      \Tr\!\big[(-v^{\alpha})\,\rho^{(s)}(\kk,s\omega)\big],
+  \qquad
+  \sigma^{(s)} = \frac{J^{(s)}}{\text{(campos)}},\quad
+  \chi^{(s)}=\frac{\sigma^{(s)}}{(2i\,s\omega)}\ \text{(convenci\'on)} .
+\end{equation}
+Para orden 2 se implementa adem\'as una versi\'on \emph{grid-based}:
+$\rho^{(1)}(\kk,\omega)$ se vectoriza sobre toda la malla, el gradiente
+covariante se toma con \texttt{np.roll} sobre el \emph{mesh}, y se
+ensambla $\rho^{(2)}(2\omega)$ simetrizado en $(j,k)$; es 50--100$\times$
+m\'as r\'apido y preserva las simetr\'ias del cristal.
+
+%======================================================================
+\section{Matrices densidad perturbativas del motor CMD (dominio del tiempo)}
+%======================================================================
+El motor CMD resuelve la \emph{misma} f\'isica pero en el dominio del
+tiempo, propagando la ecuaci\'on de Liouville--von-Neumann en gauge de
+longitud orden a orden en la amplitud del campo:
+\begin{equation}
+  \boxed{\;
+  \frac{d\rho^{(s)}_{nm}}{dt} =
+    -\big(i\,\omega_{nm} + \gamma_{nm}\big)\,\rho^{(s)}_{nm}
+    + \big[\bE(t)\cdot D_{\kk}\,\rho^{(s-1)}\big]_{nm}. \;}
+\end{equation}
+El gradiente covariante $D_{\kk}\rho=\nabla_{\kk}\rho-i[\mathcal{A},\rho]$
+es el mismo que en \emph{theory} (transporte paralelo / enlaces de
+Wilson); las tasas $\gamma_{nm}$ modelan la relajaci\'on ($T_1/T_2$). El
+orden cero es el equilibrio diagonal de Fermi--Dirac, y para
+$s=1,\dots,s_{\max}$ el t\'ermino fuente
+$\mathrm{src}^{(s)}(t)=[\bE(t)\cdot D_{\kk}\rho^{(s-1)}]$ se construye del
+orden anterior (parte intra-banda por $\nabla_{\kk}$ + parte inter-banda
+por el conmutador de Berry).
+
+\paragraph{Integrador.} Para cada elemento $nm$ la ODE es lineal y se
+propaga con un integrador exponencial trapezoidal exacto en la parte
+homog\'enea:
+\begin{equation}
+  \rho^{(s)}[t{+}1] = P(\Delta t)\,\rho^{(s)}[t]
+    + \frac{\Delta t}{2}\Big(P(\Delta t)\,\mathrm{src}[t] + \mathrm{src}[t{+}1]\Big),
+  \qquad
+  P(\Delta t) = e^{-(\gamma_{nm} + i\,\omega_{nm})\,\Delta t}.
+\end{equation}
+La corriente total es $J_\alpha(t)=\sum_{\kk}w_{\kk}\Tr[(-v^{\alpha})\rho(t)]$
+y los arm\'onicos se extraen por FFT. \emph{Relaci\'on con theory:} la
+recursi\'on de frecuencia de la Sec.~3 es exactamente la transformada de
+Fourier de esta recursi\'on temporal (el denominador
+$s\omega-\omega_{mn}+i\gamma$ es la respuesta estacionaria de $P$ ante un
+forzado $e^{-is\omega t}$). Por eso ambos motores deben coincidir, y
+coinciden ($\sim1.8\%$ en $\sigma^{(1)}$).
+
+%======================================================================
+\section{LDOS de superficie: L\'opez-Sancho}
+%======================================================================
+El DOS de volumen se obtiene por diagonalizaci\'on directa,
+\begin{equation}
+  g(E) = \sum_{\kk} w_{\kk}\sum_n L_\eta\big(E-\varepsilon_n(\kk)\big)
+       = -\frac{1}{\pi}\sum_{\kk} w_{\kk}\,\Im\,\Tr\big[(E+i\eta)I - H(\kk)\big]^{-1},
+\end{equation}
+es decir el DOS de la funci\'on de Green ensanchada. Para \emph{estados de
+superficie} (p.\,ej.\ los \emph{Fermi arcs}) hace falta un sistema
+semi-infinito; esto se resuelve con la \textbf{decimaci\'on iterativa de
+L\'opez-Sancho} \cite{Sancho1985}.
+
+\paragraph{Bloques de capa principal.} Se elige un eje normal a la
+superficie y se hace la transformada de Fourier de $H$ a lo largo de ese
+eje (aproximaci\'on de capa vecina):
+\begin{equation}
+  H(k_n) = H_{00} + H_{01}\,e^{i k_n c} + H_{01}^{\dagger}\,e^{-i k_n c},
+  \qquad
+  H_{00} = \big\langle H(k_n)\big\rangle_{k_n},\quad
+  H_{01} = \big\langle H(k_n)\,e^{-i k_n c}\big\rangle_{k_n},
+\end{equation}
+donde $H_{00}$ es el bloque intra-capa y $H_{01}$ el acoplo entre capas
+adyacentes, para cada $\kk_\parallel$ fijo.
+
+\paragraph{Decimaci\'on.} Con $z=E+i\eta$ se inicializa
+$\varepsilon_s=\varepsilon=H_{00}$, $\alpha=H_{01}$, $\beta=H_{01}^{\dagger}$
+y se itera
+\begin{align}
+  g &= \big(zI-\varepsilon\big)^{-1}, \\
+  \varepsilon_s &\leftarrow \varepsilon_s + \alpha\,g\,\beta, \\
+  \varepsilon   &\leftarrow \varepsilon + \alpha\,g\,\beta + \beta\,g\,\alpha, \\
+  \alpha &\leftarrow \alpha\,g\,\alpha, \qquad
+  \beta \leftarrow \beta\,g\,\beta,
+\end{align}
+hasta que $\norm{\alpha},\norm{\beta}\to0$ (convergencia exponencial:
+cada iteraci\'on duplica el n\'umero de capas efectivas). El t\'ermino
+$\varepsilon_s$ acumula $\alpha g\beta$ (superficie ``inferior'') mientras
+que una self-energy gemela $\varepsilon_s^{\text{top}}$ acumula
+$\beta g\alpha$ (superficie ``superior''); sus estados de superficie son
+complementarios (en un slab de Weyl, los \emph{Fermi arcs} conectan los
+nodos de una manera en una cara y de la manera complementaria en la otra).
+
+\paragraph{Funci\'on de Green y LDOS de superficie.}
+\begin{equation}
+  G_s(\kk_\parallel, z) = \big(zI - \varepsilon_s\big)^{-1},
+  \qquad
+  \boxed{\;
+  A_{\text{surf}}(\kk_\parallel, E) =
+    -\frac{1}{\pi}\,\Im\,\Tr\, G_s(\kk_\parallel, E+i\eta). \;}
+\end{equation}
+Barriendo $\kk_\parallel$ a energ\'ia fija $E=E_F$ se obtiene el mapa de
+arcos de Fermi; barriendo $E$ a $\kk_\parallel$ fijo, la LDOS de
+superficie. (En el modelo de Weyl de la Sec.~2 este mapa reproduce los
+arcos que conectan nodos de quiralidad opuesta.)
+
+%======================================================================
+\begin{thebibliography}{9}
+\bibitem{Haldane1988} F.\,D.\,M.\ Haldane, \emph{Model for a Quantum
+  Hall Effect without Landau Levels}, Phys.\ Rev.\ Lett.\ \textbf{61},
+  2015 (1988).
+\bibitem{Wu2017} L.\ Wu, S.\ Patankar, T.\ Morimoto, \dots\ J.\
+  Orenstein, \emph{Giant anisotropic nonlinear optical response in
+  transition metal monopnictide Weyl semimetals}, Nat.\ Phys.\
+  \textbf{13}, 350 (2017).
+\bibitem{Hipolito2018} F.\ Hip\'olito, A.\ Taghizadeh, T.\,G.\ Pedersen,
+  \emph{Nonlinear optical response of 2D materials\dots}, Phys.\ Rev.\ B
+  \textbf{98}, 205420 (2018); arXiv:1802.01430.
+\bibitem{Sancho1985} M.\,P.\ L\'opez Sancho, J.\,M.\ L\'opez Sancho,
+  J.\ Rubio, \emph{Highly convergent schemes for the calculation of bulk
+  and surface Green functions}, J.\ Phys.\ F \textbf{15}, 851 (1985).
+\end{thebibliography}
+
+\end{document}
