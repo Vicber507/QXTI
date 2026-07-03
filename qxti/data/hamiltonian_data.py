@@ -13,6 +13,44 @@ FloatArray = NDArray[np.float64]
 ComplexArray = NDArray[np.complex128]
 
 
+def degeneracy_resolved_diagonal(
+    eigenvalues: FloatArray,
+    operator_band_basis: ComplexArray,
+    *,
+    rel_tol: float = 1.0e-6,
+) -> FloatArray:
+    r"""Well-defined band-diagonal of an operator, robust to degeneracies.
+
+    The naive band velocity :math:`\langle n|O|n\rangle` is ill-defined wherever
+    bands are degenerate: ``eigh`` returns an arbitrary basis inside a degenerate
+    subspace, so the diagonal jumps around (numerical noise). The physically
+    meaningful values are the eigenvalues of the operator RESTRICTED to each
+    degenerate subspace (degenerate perturbation theory / Hellmann-Feynman); those
+    are gauge invariant and smooth.
+
+    ``eigenvalues`` must be sorted ascending (as returned by ``eigh``).
+    """
+    ev = np.asarray(eigenvalues, dtype=np.float64)
+    op = np.asarray(operator_band_basis, dtype=np.complex128)
+    nb = ev.size
+    scale = max(float(ev[-1] - ev[0]), 1.0) if nb else 1.0
+    tol = float(rel_tol) * scale
+    out = np.empty(nb, dtype=np.float64)
+    i = 0
+    while i < nb:
+        j = i + 1
+        while j < nb and (ev[j] - ev[j - 1]) <= tol:
+            j += 1
+        if j - i == 1:
+            out[i] = float(np.real(op[i, i]))
+        else:  # diagonalize O within the degenerate block -> unambiguous velocities
+            block = op[i:j, i:j]
+            block = 0.5 * (block + np.conj(block.T))
+            out[i:j] = np.sort(np.linalg.eigvalsh(block))
+        i = j
+    return out
+
+
 @dataclass(slots=True)
 class HamiltonianData:
     """Numerical data products derived from one equilibrium Hamiltonian."""
@@ -154,11 +192,15 @@ class HamiltonianData:
         }
 
         for index, (kx, ky, kz) in enumerate(band_data["k_points"]):
-            _, eigenvectors = self.hamiltonian.diagonalize(kx, ky, kz)
+            eigenvalues, eigenvectors = self.hamiltonian.diagonalize(kx, ky, kz)
             for label, direction in (("vx", "x"), ("vy", "y"), ("vz", "z")):
                 operator = self._velocity_operator_or_zero(kx, ky, kz, direction)
                 band_basis = eigenvectors.conj().T @ operator @ eigenvectors
-                velocities[label][index] = np.real(np.diag(band_basis))
+                # Degeneracy-robust: eigenvalues of v within each degenerate block,
+                # instead of the gauge-ambiguous naive diagonal.
+                velocities[label][index] = degeneracy_resolved_diagonal(
+                    eigenvalues, band_basis
+                )
 
         return {
             **band_data,
@@ -358,12 +400,13 @@ class HamiltonianData:
         kz: float,
         band_index: int,
     ) -> dict[str, float]:
-        _, eigenvectors = self.hamiltonian.diagonalize(kx, ky, kz)
+        eigenvalues, eigenvectors = self.hamiltonian.diagonalize(kx, ky, kz)
         values: dict[str, float] = {}
         for label, direction in (("vx", "x"), ("vy", "y"), ("vz", "z")):
             operator = self._velocity_operator_or_zero(kx, ky, kz, direction)
             projected = eigenvectors.conj().T @ operator @ eigenvectors
-            values[label] = float(np.real(projected[band_index, band_index]))
+            resolved = degeneracy_resolved_diagonal(eigenvalues, projected)
+            values[label] = float(resolved[band_index])
         return values
 
     def _velocity_operator_or_zero(

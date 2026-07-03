@@ -133,6 +133,19 @@ class CustomHamiltonian(Hamiltonian):
         matrix = self.user_function(float(kx), float(ky), float(kz), dict(self.params))
         return self.validate_matrix(np.asarray(matrix, dtype=complex))
 
+    def dH_dk(self, kx: float, ky: float, kz: float, direction: str) -> np.ndarray:
+        """Velocity operator dH/dk.
+
+        If the external model exposes an ANALYTIC derivative ``dH_dk(kx, ky, kz,
+        direction, params)``, use it (exact, faster, no finite-difference error);
+        otherwise fall back to the base centered finite difference.
+        """
+        provider = getattr(self._module, "dH_dk", None)
+        if callable(provider):
+            matrix = provider(float(kx), float(ky), float(kz), str(direction), dict(self.params))
+            return self.validate_matrix(np.asarray(matrix, dtype=complex))
+        return Hamiltonian.dH_dk(self, kx, ky, kz, direction)
+
     def summary(self) -> dict[str, Any]:
         """Return a serializable summary of the custom Hamiltonian loader."""
 
