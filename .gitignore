@@ -29,3 +29,6 @@ env/
 # Local data and logs
 *.log
 outputs/
+
+# Claude memory and plans
+.claude/
