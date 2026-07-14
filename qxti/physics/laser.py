@@ -102,6 +102,30 @@ class Laser:
         return self.ellip
 
     @property
+    def helicity(self) -> float:
+        """Physical optical helicity of the drive: photon spin projected on the
+        propagation direction ``zdir``.
+
+        The complex field amplitude is ``E_c = E0*(xdir + i*ellip*ydir)``, so the
+        helicity pseudoscalar ``h = Im(E_c^* x E_c).zdir / |E_c|^2`` evaluates to
+        ``h = 2*ellip/(1+ellip^2)``, i.e. ``sign(h) = sign(ellip)`` and
+        ``|h| = 1`` for circular drive (``ellip = +/-1``).
+
+        Convention (unambiguous, geometry-independent):
+          * ``ellip > 0``  -> positive helicity (spin PARALLEL to k, ``zdir``).
+          * ``ellip < 0``  -> negative helicity (spin ANTIPARALLEL to k).
+
+        Note on naming: "sigma+/RCP" vs "sigma-/LCP" is convention-dependent.
+        In the particle-physics convention positive helicity == RCP; in the
+        traditional optics convention (observer facing the source) positive
+        helicity == LCP. To compare with an experiment, map sigma+/- by this
+        physical helicity, not by the raw sign of ``ellip``.
+        """
+
+        e = self.ellip
+        return 2.0 * e / (1.0 + e * e)
+
+    @property
     def num_cycles(self) -> float:
         """Backward-compatible alias for the dimensionless cycle count."""
 

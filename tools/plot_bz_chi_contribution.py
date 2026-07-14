@@ -112,11 +112,15 @@ def _abs_cmap() -> LinearSegmentedColormap:
 
 
 def _signed_cmap() -> LinearSegmentedColormap:
-    return LinearSegmentedColormap.from_list(
-        "qxti_bz_chi_signed",
-        ["#174A7C", "#4FA3C8", "#F7F3E8", "#E59B48", "#9E2F3D"],
-        N=256,
-    )
+    try:
+        from qxti.graphics.custom_cmap import custom_cmap_div
+        return custom_cmap_div
+    except Exception:
+        return LinearSegmentedColormap.from_list(
+            "qxti_bz_chi_signed",
+            ["#174A7C", "#4FA3C8", "#F7F3E8", "#E59B48", "#9E2F3D"],
+            N=256,
+        )
 
 
 def _slice_contribution_summary(values: FloatArray, x_axis: FloatArray, y_axis: FloatArray) -> dict[str, float]:
@@ -335,7 +339,35 @@ def _value_to_plot(values: ComplexArray, part: str) -> FloatArray:
     raise ValueError("part debe ser abs, real o imag.")
 
 
-def _overlay_weyl_nodes(axis: Any, module: Any, params: dict[str, Any], plane_axis: int, fixed: float, unit_scale: float) -> None:
+def _pi_ticks(ax, axis_values: FloatArray, which: str = "x") -> None:
+    """Set ticks at multiples of π/2 with LaTeX labels (axis in k·a units)."""
+    lo, hi = float(axis_values[0]), float(axis_values[-1])
+    step = np.pi / 2.0
+    import math
+    first = math.ceil((lo - 1e-9) / step) * step
+    ticks = np.arange(first, hi + step * 0.5, step)
+    ticks = ticks[(ticks >= lo - 1e-9) & (ticks <= hi + 1e-9)]
+
+    _tex = {0.0: r"$0$", np.pi / 2: r"$\pi/2$", np.pi: r"$\pi$",
+            3 * np.pi / 2: r"$3\pi/2$", 2 * np.pi: r"$2\pi$",
+            -np.pi / 2: r"$-\pi/2$", -np.pi: r"$-\pi$"}
+
+    def _label(v: float) -> str:
+        for ref, tex in _tex.items():
+            if abs(v - ref) < 1e-9:
+                return tex
+        return rf"${v/np.pi:.2g}\pi$"
+
+    labels = [_label(t) for t in ticks]
+    if which == "x":
+        ax.set_xticks(ticks); ax.set_xticklabels(labels, fontsize=17)
+    else:
+        ax.set_yticks(ticks); ax.set_yticklabels(labels, fontsize=17)
+
+
+def _overlay_weyl_nodes(axis: Any, module: Any, params: dict[str, Any],
+                         plane_axis: int, fixed: float,
+                         unit_scale: float, k_offset: float = 0.0) -> None:
     if module is None or not hasattr(module, "weyl_nodes_with_chirality"):
         return
     try:
@@ -343,25 +375,32 @@ def _overlay_weyl_nodes(axis: Any, module: Any, params: dict[str, Any], plane_ax
     except Exception:
         return
     plane_axes = [axis_index for axis_index in range(3) if axis_index != plane_axis]
-    marker_style = {
-        +1: dict(marker="o", facecolor="white", edgecolor="black"),
-        -1: dict(marker="X", facecolor="black", edgecolor="white"),
-    }
+    col = {+1: "#E8000B", -1: "#1E64C8"}
+    mrk = {+1: "+", -1: "-"}
+    seen: set[int] = set()
+
+    xlim = axis.get_xlim()
+    ylim = axis.get_ylim()
+    bz_size = 2.0 * np.pi  # one full BZ in k·a units
+
     for item in tagged:
         k = np.asarray(item.get("k"), dtype=float)
-        if not np.isclose(k[plane_axis], fixed, atol=2.0e-3):
+        if abs(k[plane_axis] - fixed) > 0.35:
             continue
         chirality = int(item.get("chirality", 0))
-        style = marker_style.get(chirality, dict(marker="o", facecolor="white", edgecolor="black"))
-        axis.scatter(
-            k[plane_axes[0]] * unit_scale,
-            k[plane_axes[1]] * unit_scale,
-            s=74,
-            linewidth=1.2,
-            zorder=6,
-            label=rf"Weyl $\chi={chirality:+d}$",
-            **style,
-        )
+        kx0 = k[plane_axes[0]] * unit_scale + k_offset
+        ky0 = k[plane_axes[1]] * unit_scale + k_offset
+
+        # Generate periodic copies that fall within the visible range
+        for nx in range(-3, 4):
+            for ny in range(-3, 4):
+                kx_p = kx0 + nx * bz_size
+                ky_p = ky0 + ny * bz_size
+                if not (xlim[0] - 0.1 <= kx_p <= xlim[1] + 0.1):
+                    continue
+                if not (ylim[0] - 0.1 <= ky_p <= ylim[1] + 0.1):
+                    continue
+                pass
 
 
 def _plot_map(
@@ -386,7 +425,7 @@ def _plot_map(
 ) -> None:
     apply_paper_style()
     cmap = _abs_cmap() if part == "abs" else _signed_cmap()
-    fig, axis = plt.subplots(figsize=(7.2, 5.8))
+    fig, axis = plt.subplots(figsize=(7.4, 6.2))
     x_grid, y_grid = np.meshgrid(x_axis, y_axis, indexing="ij")
 
     if part == "abs" and log_abs:
@@ -409,40 +448,77 @@ def _plot_map(
     _overlay_weyl_nodes(axis, module, params, plane_axis, fixed, unit_scale)
 
     plane_axes = [axis_index for axis_index in range(3) if axis_index != plane_axis]
-    axis.set_xlabel(rf"$k_{LABELS[plane_axes[0]]}\;({unit_label})$")
-    axis.set_ylabel(rf"$k_{LABELS[plane_axes[1]]}\;({unit_label})$")
-    part_tex = {"abs": r"|", "real": r"\Re\,", "imag": r"\Im\,"}[part]
-    if part == "abs":
-        title_quantity = rf"$|\chi^{{(2)}}_{{{component_label}}}(\mathbf{{k}})|$"
-    else:
-        title_quantity = rf"${part_tex}\chi^{{(2)}}_{{{component_label}}}(\mathbf{{k}})$"
-    axis.set_title(
-        title_quantity
-        + rf", $\hbar\omega={omega * AU_TO_EV:.3f}\,\mathrm{{eV}}$, "
-        + rf"${plane_label}={fixed * unit_scale:.3f}\,{unit_label}$"
-    )
-    if summary is not None and part in {"real", "imag"}:
-        axis.text(
-            0.02,
-            0.98,
-            "slice sum\n"
-            + rf"$+={summary['weighted_positive']:.2e}$" "\n"
-            + rf"$-={summary['weighted_negative']:.2e}$" "\n"
-            + rf"$net={summary['weighted_net']:.2e}$",
-            transform=axis.transAxes,
-            ha="left",
-            va="top",
-            fontsize=7.5,
-            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="none", alpha=0.78),
-        )
+    axis.set_xlabel(rf"$k_{LABELS[plane_axes[0]]}\;({unit_label})$", fontsize=20)
+    axis.set_ylabel(rf"$k_{LABELS[plane_axes[1]]}\;({unit_label})$", fontsize=20)
+    axis.tick_params(axis="both", which="major", labelsize=17)
+
+    part_tex = {"abs": "", "real": r"\mathrm{Re}\,", "imag": r"\mathrm{Im}\,"}[part]
+    cbar_label = rf"${part_tex}\mathcal{{I}}^{{(2)}}_{{{component_label}}}(\mathbf{{k}})$"
+
     colorbar = fig.colorbar(image, ax=axis, pad=0.02)
-    colorbar.set_label(rf"{title_quantity} local integrand")
+    colorbar.set_label(cbar_label, fontsize=18)
+    colorbar.ax.tick_params(labelsize=15)
+
     handles, labels = axis.get_legend_handles_labels()
     if handles:
         dedup: dict[str, Any] = {}
         for handle, label in zip(handles, labels, strict=False):
             dedup.setdefault(label, handle)
-        axis.legend(dedup.values(), dedup.keys(), loc="upper right", frameon=True, fontsize=8)
+        axis.legend(dedup.values(), dedup.keys(), loc="upper right", frameon=True, fontsize=11)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=dpi, facecolor="white")
+    plt.close(fig)
+
+
+def _plot_map_both(
+    x_axis: FloatArray,
+    y_axis: FloatArray,
+    chi_map: ComplexArray,
+    component_label: str,
+    omega: float,
+    plane_label: str,
+    fixed: float,
+    output_path: Path,
+    unit_label: str,
+    module: Any,
+    params: dict[str, Any],
+    plane_axis: int,
+    unit_scale: float,
+    dpi: int,
+    k_offset: float = 0.0,
+) -> None:
+    """2-panel figure: Re and Im side by side with custom colormap."""
+    apply_paper_style()
+    cmap = _signed_cmap()
+    fig, axes = plt.subplots(1, 2, figsize=(14.0, 5.8))
+    x_grid, y_grid = np.meshgrid(x_axis, y_axis, indexing="ij")
+    plane_axes = [axis_index for axis_index in range(3) if axis_index != plane_axis]
+
+    parts = [("real", r"\mathrm{Re}"), ("imag", r"\mathrm{Im}")]
+    for ax, (part_key, part_tex) in zip(axes, parts):
+        values = np.real(chi_map) if part_key == "real" else np.imag(chi_map)
+        vmax = float(np.nanmax(np.abs(values))) if values.size else 1.0
+        norm = TwoSlopeNorm(vmin=-vmax, vcenter=0.0, vmax=vmax) if np.isfinite(vmax) and vmax > 0.0 else None
+        im = ax.pcolormesh(x_grid, y_grid, values, shading="auto", cmap=cmap, norm=norm)
+        _overlay_weyl_nodes(ax, module, params, plane_axis, fixed, unit_scale,
+                            k_offset=k_offset)
+        ax.set_xlabel(rf"$k_{LABELS[plane_axes[0]]}\,a$", fontsize=20)
+        ax.set_ylabel(rf"$k_{LABELS[plane_axes[1]]}\,a$", fontsize=20)
+        _pi_ticks(ax, x_axis, "x")
+        _pi_ticks(ax, y_axis, "y")
+        ax.tick_params(axis="both", which="major", labelsize=17)
+        cbar_label = rf"${part_tex}\,\mathcal{{I}}^{{(2)}}_{{{component_label}}}(\mathbf{{k}})$"
+        cb = fig.colorbar(im, ax=ax, pad=0.02)
+        cb.set_label(cbar_label, fontsize=18)
+        cb.ax.tick_params(labelsize=15)
+        handles, lbls = ax.get_legend_handles_labels()
+        if handles:
+            dedup: dict[str, Any] = {}
+            for handle, label in zip(handles, lbls, strict=False):
+                dedup.setdefault(label, handle)
+            ax.legend(dedup.values(), dedup.keys(), loc="upper right", frameon=True, fontsize=11)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
@@ -471,15 +547,18 @@ def main() -> int:
     parser.add_argument("--velocity-step", type=float, default=1.0e-4, help="Paso de derivada para velocidades en 1/Bohr.")
     parser.add_argument(
         "--part",
-        choices=("abs", "real", "imag"),
-        default="real",
-        help="Parte graficada. Default: real, para ver que regiones suman/restan.",
+        choices=("abs", "real", "imag", "both"),
+        default="both",
+        help="Parte graficada: real, imag, abs, o both (Re+Im en 2 paneles). Default: both.",
     )
     parser.add_argument("--linear-abs", action="store_true", help="Usa escala lineal para |chi|.")
     parser.add_argument("--unshifted", action="store_true", help="Usa grilla no desplazada en los dos ejes del plano.")
     parser.add_argument("--units", choices=("angstrom", "au"), default="angstrom", help="Unidades del plot.")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="Carpeta de salida.")
     parser.add_argument("--dpi", type=int, default=320, help="Resolucion PNG.")
+    parser.add_argument("--krange", type=float, default=None,
+                        help="Rango simetrico del plano en a.u. (ej. 4.71 para -3pi/2..3pi/2). "
+                             "Por defecto usa los bounds de la BZ.")
     args = parser.parse_args()
 
     if args.points <= 1:
@@ -501,8 +580,13 @@ def main() -> int:
     plane_axis = AXES[args.plane[-1]]
     plane_axes = [axis for axis in range(3) if axis != plane_axis]
     bounds = hamiltonian.reciprocal_box_bounds()
-    x_internal = _axis_values(bounds[plane_axes[0]], int(args.points), shifted=not args.unshifted)
-    y_internal = _axis_values(bounds[plane_axes[1]], int(args.points), shifted=not args.unshifted)
+    if args.krange is not None:
+        r = float(args.krange)
+        x_internal = np.linspace(-r, r, int(args.points))
+        y_internal = np.linspace(-r, r, int(args.points))
+    else:
+        x_internal = _axis_values(bounds[plane_axes[0]], int(args.points), shifted=not args.unshifted)
+        y_internal = _axis_values(bounds[plane_axes[1]], int(args.points), shifted=not args.unshifted)
     source_name = str(config.hamiltonian.source_file).lower()
     if "wsm_orenstein" in source_name and plane_axis == AXES["z"] and np.isclose(float(args.fixed), 0.0, atol=1.0e-14):
         axes_by_index = {plane_axes[0]: x_internal, plane_axes[1]: y_internal}
@@ -593,6 +677,33 @@ def main() -> int:
     )
     chi_integrand = sigma_integrand / (-1j * (2.0 * omega))
     chi_map = chi_integrand.reshape(int(args.points), int(args.points))
+
+    a_lat = float(getattr(module, "default_params", lambda: {})().get("a", 1.0))
+    unit_scale = a_lat              # k·a  (BZ = [-π, π] → display [0, 2π])
+    k_offset = np.pi               # shift so Gamma at 0 → nodes near π/2, 3π/2
+    unit_label = r""               # unused; axes labelled inline
+    x_plot = x_internal * unit_scale + k_offset
+    y_plot = y_internal * unit_scale + k_offset
+    output_dir = Path(args.output_dir) / f"chi2_{component_label}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 2-panel Re+Im figure
+    if args.part == "both":
+        elapsed = time.perf_counter() - t0
+        fixed_str = f"{args.fixed:g}".replace("-", "m").replace(".", "p")
+        stem = f"chi2_{component_label}_{args.plane}_{fixed_str}_both"
+        plot_path = output_dir / f"{stem}.png"
+        _plot_map_both(
+            x_axis=x_plot, y_axis=y_plot, chi_map=chi_map,
+            component_label=component_label, omega=omega,
+            plane_label=str(args.plane), fixed=float(args.fixed),
+            output_path=plot_path, unit_label=unit_label,
+            module=module, params=params, plane_axis=plane_axis,
+            unit_scale=unit_scale, dpi=int(args.dpi), k_offset=k_offset,
+        )
+        print(f"[bz-chi] done in {format_duration(elapsed)}\n[bz-chi] plot: {plot_path}", flush=True)
+        return 0
+
     value_map = _value_to_plot(chi_map, args.part)
     contribution_summary = (
         _slice_contribution_summary(value_map, x_internal, y_internal)
@@ -601,13 +712,8 @@ def main() -> int:
     )
     elapsed = time.perf_counter() - t0
 
-    unit_scale = BOHR_INV_TO_ANGSTROM_INV if args.units == "angstrom" else 1.0
-    unit_label = r"\mathrm{\AA}^{-1}" if args.units == "angstrom" else r"a_0^{-1}"
-    x_plot = x_internal * unit_scale
-    y_plot = y_internal * unit_scale
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"chi2_{component_label}_{args.plane}_{args.fixed:g}_{args.part}".replace("-", "m").replace(".", "p")
+    fixed_str = f"{args.fixed:g}".replace("-", "m").replace(".", "p")
+    stem = f"chi2_{component_label}_{args.plane}_{fixed_str}_{args.part}"
     data_path = output_dir / f"{stem}.npz"
     plot_path = output_dir / f"{stem}.png"
     np.savez_compressed(

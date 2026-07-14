@@ -73,6 +73,7 @@ CASE_LABELS = {
     "no_positive_chirality": r"Without $\chi=+1$ nodes",
     "no_negative_chirality": r"Without $\chi=-1$ nodes",
 }
+TRANSVERSE_COMPONENTS = ("xy", "xz", "yz")
 ORDER2_OMEGA_CHUNK = 4
 
 
@@ -573,6 +574,277 @@ def _plot_case_comparison_components(
     return outputs
 
 
+def _cartesian_component_indices(component: str, labels: tuple[str, ...]) -> tuple[int, int]:
+    key = str(component).strip().lower()
+    if len(key) != 2:
+        raise ValueError(f"Componente cartesiana invalida: {component!r}.")
+    try:
+        return labels.index(key[0]), labels.index(key[1])
+    except ValueError as exc:
+        raise ValueError(
+            f"Componente {component!r} no disponible para etiquetas {labels}."
+        ) from exc
+
+
+def _sigma_quantity(values: np.ndarray, quantity: str) -> np.ndarray:
+    q = str(quantity).strip().lower()
+    z = np.asarray(values, dtype=np.complex128)
+    if q in {"abs", "mod", "modulus", "magnitude"}:
+        return np.abs(z)
+    if q in {"real", "re"}:
+        return np.real(z)
+    if q in {"imag", "im", "imaginary"}:
+        return np.imag(z)
+    raise ValueError(f"Cantidad no soportada para sigma: {quantity!r}.")
+
+
+def _sigma_quantity_label(quantity: str) -> str:
+    q = str(quantity).strip().lower()
+    if q in {"abs", "mod", "modulus", "magnitude"}:
+        return r"$|\sigma^{(1)}|$"
+    if q in {"real", "re"}:
+        return r"$\Re\,\sigma^{(1)}$"
+    if q in {"imag", "im", "imaginary"}:
+        return r"$\Im\,\sigma^{(1)}$"
+    raise ValueError(f"Cantidad no soportada para sigma: {quantity!r}.")
+
+
+def _sigma_component_ylabel(component: str, quantity: str) -> str:
+    q = str(quantity).strip().lower()
+    if q in {"abs", "mod", "modulus", "magnitude"}:
+        return rf"$|\sigma^{{(1)}}_{{{component}}}|$"
+    if q in {"real", "re"}:
+        return rf"$\Re\,\sigma^{{(1)}}_{{{component}}}$"
+    if q in {"imag", "im", "imaginary"}:
+        return rf"$\Im\,\sigma^{{(1)}}_{{{component}}}$"
+    raise ValueError(f"Cantidad no soportada para sigma: {quantity!r}.")
+
+
+def _save_figure_png_svg(fig, output_base: Path, *, dpi: int = 340) -> list[Path]:
+    import matplotlib as mpl
+
+    output_base.parent.mkdir(parents=True, exist_ok=True)
+    outputs = [output_base.with_suffix(".png"), output_base.with_suffix(".svg")]
+    # Preserve the square canvas requested for paper figures. Tight bounding
+    # boxes are pretty for drafts but change the final aspect ratio.
+    with mpl.rc_context({"savefig.bbox": "standard"}):
+        fig.savefig(outputs[0], dpi=int(dpi), facecolor="white")
+        fig.savefig(outputs[1], facecolor="white")
+    return outputs
+
+
+def _plot_cartesian_transverse_paper(
+    *,
+    output_dir: Path,
+    omega_axis_ev: np.ndarray,
+    case_tensors: dict[str, np.ndarray],
+    cart_labels: tuple[str, ...],
+    components: tuple[str, ...] = TRANSVERSE_COMPONENTS,
+    quantity: str = "abs",
+    dpi: int = 340,
+) -> list[Path]:
+    """Paper-style transverse sigma plots for node-mask comparisons.
+
+    Produces one square combined figure plus one square figure per component.
+    The combined figure stacks the three transverse components vertically inside
+    a square canvas; the individual figures keep each axis exactly square.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    omega_axis_ev = np.asarray(omega_axis_ev, dtype=np.float64)
+    qtag = str(quantity).strip().lower()
+    outputs: list[Path] = []
+
+    # Same strong, readable palette used for the node-mask case identity.
+    case_order = [case_name for case_name, _label, _chirality in CASE_SPECS if case_name in case_tensors]
+    line_width = 3.8
+    fill_alpha = {
+        "full": 0.11,
+        "no_positive_chirality": 0.18,
+        "no_negative_chirality": 0.18,
+    }
+
+    fig, axes = plt.subplots(
+        len(components),
+        1,
+        figsize=(10.8, 10.8),
+        sharex=True,
+        squeeze=False,
+    )
+    panel_letters = "abc"
+    global_ymin = np.inf
+    global_ymax = -np.inf
+    panel_values: dict[tuple[str, str], np.ndarray] = {}
+    for component in components:
+        i, j = _cartesian_component_indices(component, cart_labels)
+        for case_name in case_order:
+            values = _sigma_quantity(case_tensors[case_name][:, i, j], quantity)
+            panel_values[(component, case_name)] = values
+            global_ymin = min(global_ymin, float(np.nanmin(values)))
+            global_ymax = max(global_ymax, float(np.nanmax(values)))
+
+    if str(quantity).strip().lower() in {"abs", "mod", "modulus", "magnitude"}:
+        ylo, yhi = 0.0, global_ymax * 1.10 if global_ymax > 0.0 else 1.0
+    else:
+        span = max(abs(global_ymin), abs(global_ymax), 1.0e-30)
+        ylo, yhi = -1.12 * span, 1.12 * span
+
+    for idx, component in enumerate(components):
+        ax = axes[idx, 0]
+        for case_name in case_order:
+            values = panel_values[(component, case_name)]
+            color = CASE_COLORS[case_name]
+            ax.fill_between(
+                omega_axis_ev,
+                0.0,
+                values,
+                color=color,
+                alpha=fill_alpha.get(case_name, 0.16),
+                lw=0,
+                zorder=2,
+            )
+            ax.plot(
+                omega_axis_ev,
+                values,
+                color=color,
+                lw=line_width,
+                label=CASE_LABELS[case_name],
+                zorder=3,
+            )
+        ax.axhline(0.0, color="#B8C4D0", lw=1.0, zorder=1)
+        ax.set_xlim(float(omega_axis_ev[0]), float(omega_axis_ev[-1]))
+        ax.set_ylim(ylo, yhi)
+        ax.set_ylabel(_sigma_component_ylabel(component, quantity), fontsize=25, labelpad=13)
+        ax.tick_params(axis="both", which="major", labelsize=23, length=8, width=1.35)
+        ax.tick_params(axis="both", which="minor", length=4, width=1.0)
+        ax.ticklabel_format(axis="y", style="sci", scilimits=(-2, 3))
+        ax.yaxis.get_offset_text().set_fontsize(20)
+        ax.text(
+            0.025,
+            0.88,
+            rf"$\mathbf{{{panel_letters[idx]}}}$",
+            transform=ax.transAxes,
+            fontsize=28,
+            ha="left",
+            va="top",
+        )
+        for spine in ax.spines.values():
+            spine.set_linewidth(1.35)
+
+    axes[-1, 0].set_xlabel(r"$\hbar\omega\;(\mathrm{eV})$", fontsize=27, labelpad=11)
+    axes[0, 0].legend(
+        frameon=False,
+        fontsize=19,
+        loc="upper right",
+        handlelength=1.8,
+        labelspacing=0.45,
+    )
+    fig.subplots_adjust(left=0.21, right=0.965, bottom=0.105, top=0.975, hspace=0.16)
+    outputs.extend(
+        _save_figure_png_svg(
+            fig,
+            output_dir / f"sigma1_transverse_{'_'.join(components)}_{qtag}_node_masks_paper",
+            dpi=dpi,
+        )
+    )
+    plt.close(fig)
+
+    component_dir = output_dir / "components"
+    for component in components:
+        fig, ax = plt.subplots(figsize=(10.8, 10.8))
+        i, j = _cartesian_component_indices(component, cart_labels)
+        local_ymin = np.inf
+        local_ymax = -np.inf
+        local_values: dict[str, np.ndarray] = {}
+        for case_name in case_order:
+            values = _sigma_quantity(case_tensors[case_name][:, i, j], quantity)
+            local_values[case_name] = values
+            local_ymin = min(local_ymin, float(np.nanmin(values)))
+            local_ymax = max(local_ymax, float(np.nanmax(values)))
+
+        if str(quantity).strip().lower() in {"abs", "mod", "modulus", "magnitude"}:
+            local_ylim = (0.0, local_ymax * 1.10 if local_ymax > 0.0 else 1.0)
+        else:
+            span = max(abs(local_ymin), abs(local_ymax), 1.0e-30)
+            local_ylim = (-1.12 * span, 1.12 * span)
+
+        for case_name in case_order:
+            values = local_values[case_name]
+            color = CASE_COLORS[case_name]
+            ax.fill_between(
+                omega_axis_ev,
+                0.0,
+                values,
+                color=color,
+                alpha=fill_alpha.get(case_name, 0.16),
+                lw=0,
+                zorder=2,
+            )
+            ax.plot(
+                omega_axis_ev,
+                values,
+                color=color,
+                lw=4.2,
+                label=CASE_LABELS[case_name],
+                zorder=3,
+            )
+        ax.axhline(0.0, color="#B8C4D0", lw=1.0, zorder=1)
+        ax.set_xlim(float(omega_axis_ev[0]), float(omega_axis_ev[-1]))
+        ax.set_ylim(*local_ylim)
+        ax.set_box_aspect(1.0)
+        ax.set_xlabel(r"$\hbar\omega\;(\mathrm{eV})$", fontsize=36, labelpad=13)
+        ax.set_ylabel(_sigma_component_ylabel(component, quantity), fontsize=36, labelpad=15)
+        ax.tick_params(axis="both", which="major", labelsize=32, length=10, width=1.45)
+        ax.tick_params(axis="both", which="minor", length=5, width=1.1)
+        ax.ticklabel_format(axis="y", style="sci", scilimits=(-2, 3))
+        ax.yaxis.get_offset_text().set_fontsize(29)
+        ax.legend(
+            frameon=False,
+            fontsize=25,
+            loc="upper right",
+            handlelength=1.9,
+            labelspacing=0.45,
+        )
+        for spine in ax.spines.values():
+            spine.set_linewidth(1.45)
+        fig.subplots_adjust(left=0.22, right=0.96, bottom=0.16, top=0.96)
+        outputs.extend(
+            _save_figure_png_svg(
+                fig,
+                component_dir / f"sigma1_{component}_{qtag}_node_masks_paper",
+                dpi=dpi,
+            )
+        )
+        plt.close(fig)
+
+    print(
+        "[node-mask] transverse Cartesian paper plots saved: "
+        + ", ".join(str(path) for path in outputs),
+        flush=True,
+    )
+    return outputs
+
+
+def _load_saved_cartesian_node_mask_cases(
+    base_dir: Path,
+) -> tuple[np.ndarray, dict[str, np.ndarray], tuple[str, ...]]:
+    omega_axis_ev_ref: np.ndarray | None = None
+    case_tensors: dict[str, np.ndarray] = {}
+    for case_name, _label, _chirality in CASE_SPECS:
+        dataset_path = base_dir / case_name / "data" / "sigma_node_mask_case.npz"
+        if not dataset_path.exists():
+            raise FileNotFoundError(f"No existe el dataset de mascara: {dataset_path}")
+        data = np.load(dataset_path, allow_pickle=True)
+        omega_axis_ev = np.asarray(data["omega_axis_ev"], dtype=np.float64)
+        if omega_axis_ev_ref is None:
+            omega_axis_ev_ref = omega_axis_ev
+        elif omega_axis_ev.shape != omega_axis_ev_ref.shape or not np.allclose(omega_axis_ev, omega_axis_ev_ref):
+            raise ValueError(f"El eje de frecuencia de {dataset_path} no coincide con los otros casos.")
+        case_tensors[case_name] = np.asarray(data["sigma_order_1_tensor"], dtype=np.complex128)
+    if omega_axis_ev_ref is None:
+        raise ValueError(f"No se cargaron casos desde {base_dir}.")
+    return omega_axis_ev_ref, case_tensors, ("x", "y", "z")
+
+
 def _summarize_case_differences(
     *,
     case_tensors: dict[str, np.ndarray],
@@ -874,6 +1146,7 @@ def main() -> int:
 
     overall_start = time.perf_counter()
     case_tensors_hel: dict[str, np.ndarray] = {}
+    case_tensors_cart: dict[str, np.ndarray] = {}
     case_tensors_hel_order2: dict[str, np.ndarray] = {}
     hel_labels_ref: tuple[str, ...] | None = None
     hel_labels_ref_order2: tuple[str, ...] | None = None
@@ -913,6 +1186,7 @@ def main() -> int:
         )
         sigma_cart = np.asarray(result["sigma"], dtype=np.complex128)
         sigma_hel, hel_labels = to_helicity_basis(sigma_cart, dim)
+        case_tensors_cart[case_name] = np.asarray(sigma_cart, dtype=np.complex128)
         case_tensors_hel[case_name] = np.asarray(sigma_hel, dtype=np.complex128)
         if hel_labels_ref is None:
             hel_labels_ref = tuple(hel_labels)
@@ -1023,6 +1297,22 @@ def main() -> int:
             summary_lines.append(line)
             print(line, flush=True)
         line = f"[node-mask] plot comparativo guardado en {comparison_grid}"
+        summary_lines.append(line)
+        print(line, flush=True)
+
+        transverse_outputs = _plot_cartesian_transverse_paper(
+            output_dir=output_dir / "comparison" / "cartesian_transverse",
+            omega_axis_ev=omega_axis_ev,
+            case_tensors=case_tensors_cart,
+            cart_labels=cart_labels,
+            components=TRANSVERSE_COMPONENTS,
+            quantity="abs",
+            dpi=int(config.xtp.susceptibility_plot_dpi),
+        )
+        line = (
+            "[node-mask] plots transversales cartesianos guardados en "
+            + ", ".join(str(path) for path in transverse_outputs)
+        )
         summary_lines.append(line)
         print(line, flush=True)
 

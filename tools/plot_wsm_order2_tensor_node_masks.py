@@ -13,6 +13,7 @@ tools/plot_wsm_helicity_sigma_node_masks.py). Output: paper-ready PNGs + data np
 """
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import os
 import sys
@@ -36,8 +37,8 @@ from plot_wsm_helicity_sigma_node_masks import _build_local_node_mask, _min_nonz
 from _shg_tensor_gridbased import order2_full_tensor_spectrum
 
 _AU_TO_EV = 27.211386245988
-GRID = 40
-NUM_FREQ = 40
+GRID = 72
+NUM_FREQ = 200
 OMEGA_MIN, OMEGA_MAX = 0.006, 0.11          # a.u. (~0.16 - 3.0 eV incident)
 OMEGA_800NM = (1239.84159 / 800.0) / _AU_TO_EV
 XYZ = ("x", "y", "z")
@@ -58,17 +59,50 @@ def _load_nodes(config):
     return list(module.weyl_nodes_with_chirality(dict(config.hamiltonian.params)))
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Compute publication-quality order-2 WSM tensor with Weyl-node masks. "
+            "Use --num-freq for smoother paper plots."
+        )
+    )
+    parser.add_argument("--grid", type=int, default=GRID, help="k-grid points per direction.")
+    parser.add_argument("--num-freq", type=int, default=NUM_FREQ, help="number of frequency samples.")
+    parser.add_argument("--omega-min", type=float, default=OMEGA_MIN, help="minimum omega in a.u.")
+    parser.add_argument("--omega-max", type=float, default=OMEGA_MAX, help="maximum omega in a.u.")
+    parser.add_argument("--omega-chunk", type=int, default=6, help="frequency chunk size used internally.")
+    parser.add_argument("--progress", action="store_true", help="print progress for frequency chunks.")
+    parser.add_argument("--out", default=str(OUT), help="output directory.")
+    return parser.parse_args()
+
+
 def main() -> int:
+    args = parse_args()
+    grid = int(args.grid)
+    num_freq = int(args.num_freq)
+    omega_min = float(args.omega_min)
+    omega_max = float(args.omega_max)
+    omega_chunk = int(args.omega_chunk)
+    out = Path(args.out)
+    if grid <= 0:
+        raise ValueError("--grid must be positive.")
+    if num_freq <= 1:
+        raise ValueError("--num-freq must be greater than 1.")
+    if omega_chunk <= 0:
+        raise ValueError("--omega-chunk must be positive.")
+    if omega_min <= 0.0 or omega_max <= omega_min:
+        raise ValueError("Require 0 < --omega-min < --omega-max.")
+
     cfg0 = QXTIConfig.from_file("inputs/inputParams.wsm_orenstein.cfg")
-    config = replace(cfg0, kgrid=replace(cfg0.kgrid, k_points=[GRID, GRID, GRID]))
+    config = replace(cfg0, kgrid=replace(cfg0.kgrid, k_points=[grid, grid, grid]))
     nodes = _load_nodes(config)
     sim = QXTISimulation(config=config); ham = sim.build_hamiltonian(); kgrid = sim.build_kgrid(ham)
     k_points = np.asarray(kgrid.points(), dtype=np.float64)
     radius = 0.35 * _min_nonzero_pair_distance(
         np.asarray([np.asarray(n["k"], dtype=np.float64) for n in nodes]))
-    omega = np.linspace(OMEGA_MIN, OMEGA_MAX, NUM_FREQ)
+    omega = np.linspace(omega_min, omega_max, num_freq)
     E_eV = omega * _AU_TO_EV
-    print(f"[order2] grid {GRID}^3 -> {kgrid.total_points} pts, {NUM_FREQ} freqs "
+    print(f"[order2] grid {grid}^3 -> {kgrid.total_points} pts, {num_freq} freqs "
           f"({E_eV[0]:.2f}-{E_eV[-1]:.2f} eV), radio mascara={radius:.4f}")
 
     sigmas = {}
@@ -78,7 +112,7 @@ def main() -> int:
         wts = build_k_integration_weights(config, hamiltonian=ham, kgrid=kgrid, extra_k_weight_mask=mask)
         print(f"[order2] caso '{name}': excluidos {int(np.count_nonzero(mask==0.0))} pts ... computando tensor")
         sig = order2_full_tensor_spectrum(ham, kgrid, omega, wts, config.susceptibility_solver,
-                                          progress=False)
+                                          omega_chunk=omega_chunk, progress=bool(args.progress))
         sigmas[name] = sig                                   # (nw, 3,3,3) sigma
     # chi = sigma/(2 i omega)
     chis = {n: sigmas[n] / (2j * omega[:, None, None, None]) for n in sigmas}
@@ -91,7 +125,7 @@ def main() -> int:
         apply_paper_style()
     except Exception:
         pass
-    OUT.mkdir(parents=True, exist_ok=True)
+    out.mkdir(parents=True, exist_ok=True)
 
     # ---- (1) all nonzero independent components (j<=k) ----
     chi_full = chis["full"]
@@ -119,10 +153,10 @@ def main() -> int:
     for ax in axes.flat[ncomp:]:
         ax.axis("off")
     axes.flat[0].legend(frameon=False, fontsize=8.5, loc="upper right")
-    fig.suptitle(r"WSM $\chi^{(2)}_{ijk}(\omega)$ — full material vs Weyl-node removed",
+    fig.suptitle(r"WSM $\chi^{(2)}_{ijk}(\omega)$ - full material vs Weyl-node removed",
                  fontsize=13)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
-    f1 = OUT / "chi2_all_components_node_masks.png"
+    f1 = out / "chi2_all_components_node_masks.png"
     fig.savefig(f1, dpi=300, facecolor="white", bbox_inches="tight"); plt.close(fig)
     print(f"[order2] wrote {f1}  ({ncomp} componentes no nulas)")
 
@@ -141,19 +175,19 @@ def main() -> int:
         ax.plot(np.degrees(theta), (amps[name] / norm) * s2, color=color, lw=2.2, label=label)
     ax.set_xlabel(r"analyzer angle  $\theta_2$ (deg)  [from $[1,1,\bar1]$]")
     ax.set_ylabel("CD (normalized)")
-    ax.set_title(rf"SHG circular dichroism, TaAs (112) — {E_eV[iw]:.2f} eV")
+    ax.set_title(rf"SHG circular dichroism, TaAs (112) - {E_eV[iw]:.2f} eV")
     ax.set_xlim(0, 360); ax.set_xticks(range(0, 361, 45)); ax.set_ylim(-1.15, 1.15)
     ax.legend(frameon=False, loc="upper right")
     fig.tight_layout()
-    f2 = OUT / "shg_cd_node_masks.png"
+    f2 = out / "shg_cd_node_masks.png"
     fig.savefig(f2, dpi=300, facecolor="white", bbox_inches="tight"); plt.close(fig)
     print(f"[order2] wrote {f2}  (A_full={amps['full']:+.4f}, A_no+={amps['no_pos']:+.4f}, A_no-={amps['no_neg']:+.4f})")
 
-    np.savez_compressed(OUT / "order2_tensor_node_masks.npz",
+    np.savez_compressed(out / "order2_tensor_node_masks.npz",
                         omega=omega, energy_ev=E_eV, components=np.array(comps),
                         **{f"chi_{n}": chis[n] for n in chis},
                         cd_amp_full=amps["full"], cd_amp_no_pos=amps["no_pos"], cd_amp_no_neg=amps["no_neg"])
-    print(f"[order2] datos en {OUT/'order2_tensor_node_masks.npz'}")
+    print(f"[order2] datos en {out/'order2_tensor_node_masks.npz'}")
     return 0
 
 
