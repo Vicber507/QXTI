@@ -32,3 +32,6 @@ outputs/
 
 # Claude memory and plans
 .claude/
+
+# Local analysis / plotting scripts (not part of the published package)
+tools/
