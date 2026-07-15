@@ -159,6 +159,16 @@ def _fermi(E: FloatArray, mu: float, T_au: float) -> FloatArray:
     return 1.0 / (np.exp((E - mu) / T_au) + 1.0)
 
 
+def _occupation(E: FloatArray, mu: float, T_au: float, distribution=None) -> FloatArray:
+    """Band occupation f(E).  ``distribution(E, mu, T) -> f`` honors the CONFIGURED
+    filling (e.g. valence_occupation, which fills by band index to match antelope);
+    ``None`` falls back to the energy Fermi step so existing callers/tests are
+    unchanged.  Same convention as ``mesh_response.precompute_band_data``."""
+    if distribution is None:
+        return _fermi(E, mu, T_au)
+    return np.asarray(distribution(E, mu, T_au), dtype=np.float64)
+
+
 def _dfde(f: FloatArray, T_au: float) -> FloatArray:
     """∂f/∂ε for Fermi–Dirac."""
     if T_au < 1e-15:
@@ -211,7 +221,8 @@ def _berry_offdiag(vel: list[ComplexArray], evals: FloatArray) -> list[ComplexAr
 
 def _rho1_local(H_func: Callable, kx: float, ky: float, kz: float,
                 E_field: FloatArray, ow1: complex,
-                mu: float, T_au: float, dk_vel: float) -> ComplexArray:
+                mu: float, T_au: float, dk_vel: float,
+                distribution=None) -> ComplexArray:
     """ρ^(1)(k, ω) in the LOCAL band frame of k.  (No Wilson-link rotation applied.)
 
     This is the building block called by _drho_dk_numerical for the gradient.
@@ -219,7 +230,7 @@ def _rho1_local(H_func: Callable, kx: float, ky: float, kz: float,
     evals, _ = _band_frame(H_func, kx, ky, kz)
     vel = _velocity_band(H_func, kx, ky, kz, dk_vel)
     A = _berry_offdiag(vel, evals)
-    f = _fermi(evals, mu, T_au)
+    f = _occupation(evals, mu, T_au, distribution)
     dfde = _dfde(f, T_au)
     nb = len(evals)
 
@@ -309,7 +320,8 @@ def _drho_dk_numerical(H_func: Callable,
 def _rho_local_order(H_func: Callable, kx: float, ky: float, kz: float,
                      E: ComplexArray, omega: float, s: int,
                      gamma: float, mu: float, T_au: float,
-                     dk_grad: float, dk_vel: float) -> ComplexArray:
+                     dk_grad: float, dk_vel: float,
+                     distribution=None) -> ComplexArray:
     """ρ^(s)(k, s·ω) in the LOCAL band frame at (kx,ky,kz), for any order s ≥ 0.
 
     Recursive building block for the arbitrary-order recursion.  It is the value
@@ -323,19 +335,19 @@ def _rho_local_order(H_func: Callable, kx: float, ky: float, kz: float,
     """
     if s <= 0:
         evals, _ = _band_frame(H_func, kx, ky, kz)
-        f = _fermi(evals, mu, T_au)
+        f = _occupation(evals, mu, T_au, distribution)
         return np.diag(f.astype(np.complex128))
 
     ow_s = complex(s * omega + 1j * gamma)
     if s == 1:
-        return _rho1_local(H_func, kx, ky, kz, E, ow_s, mu, T_au, dk_vel)
+        return _rho1_local(H_func, kx, ky, kz, E, ow_s, mu, T_au, dk_vel, distribution)
 
     evals, U = _band_frame(H_func, kx, ky, kz)
     nb = len(evals)
 
     def prev_local(kx2, ky2, kz2):
         return _rho_local_order(H_func, kx2, ky2, kz2, E, omega,
-                                s - 1, gamma, mu, T_au, dk_grad, dk_vel)
+                                s - 1, gamma, mu, T_au, dk_grad, dk_vel, distribution)
 
     # _drho_dk_numerical parallel-transports each neighbour (Wilson links) before
     # differencing, so it already returns the FULL covariant derivative
@@ -362,7 +374,8 @@ def rho_order_s(H_func: Callable, kx: float, ky: float, kz: float,
                 gamma: float, mu: float, T_au: float,
                 max_order: int = 3,
                 dk_grad: float = 1e-3,
-                dk_vel: float = 1e-4) -> dict[int, ComplexArray]:
+                dk_vel: float = 1e-4,
+                distribution=None) -> dict[int, ComplexArray]:
     """Analytical ρ^(0..max_order)(k, s·ω) for one k-point.
 
     Implements Eqs. A1a–A1c of Hipolito+2018, generalized to any Hamiltonian AND
@@ -398,7 +411,7 @@ def rho_order_s(H_func: Callable, kx: float, ky: float, kz: float,
     evals, U = _band_frame(H_func, kx, ky, kz)
     vel = _velocity_band(H_func, kx, ky, kz, dk_vel)
     A = _berry_offdiag(vel, evals)
-    f = _fermi(evals, mu, T_au)
+    f = _occupation(evals, mu, T_au, distribution)
     dfde = _dfde(f, T_au)
     nb = len(evals)
     E = np.asarray(E_field, dtype=np.complex128)
@@ -416,7 +429,7 @@ def rho_order_s(H_func: Callable, kx: float, ky: float, kz: float,
     #   Off-diagonal (interband): -i[A^α, ρ^(0)]_mn = A^α_mn·(f_n−f_m)  m≠n
     # → ρ^(1)_mn = Σ_α E_α·source_mn^α / (ω̄ − ω_mn)
     ow1 = complex(omega + 1j * gamma)
-    rhos[1] = _rho1_local(H_func, kx, ky, kz, E, ow1, mu, T_au, dk_vel)
+    rhos[1] = _rho1_local(H_func, kx, ky, kz, E, ow1, mu, T_au, dk_vel, distribution)
     if max_order < 2:
         return rhos
 
@@ -436,7 +449,7 @@ def rho_order_s(H_func: Callable, kx: float, ky: float, kz: float,
 
         def prev_local(kx2, ky2, kz2, _s=s):
             return _rho_local_order(H_func, kx2, ky2, kz2, E, omega,
-                                    _s - 1, gamma, mu, T_au, dk_grad, dk_vel)
+                                    _s - 1, gamma, mu, T_au, dk_grad, dk_vel, distribution)
 
         Dk_prev = _drho_dk_numerical(H_func, kx, ky, kz, U, prev_local, dk_grad)
 
