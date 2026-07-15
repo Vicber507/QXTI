@@ -370,9 +370,12 @@ def order2_tensor_at_omega(hamiltonian, kgrid, omega, weights, ccfg):
             rc_mesh = rho1[c].reshape(*shape, nb, nb)
             rp = np.roll(rc_mesh, -1, axis=b).reshape(nk, nb, nb)
             rm = np.roll(rc_mesh, +1, axis=b).reshape(nk, nb, nb)
+            # dpart is the Wilson-TRANSPORTED mesh gradient = the FULL covariant
+            # derivative D_k rho^(1) = grad rho - i[A, rho] in one shot, so no
+            # separate commutator is subtracted (adding it double-counts the Berry
+            # connection and cancels the intraband/population channel).
             dpart = (Wp @ rp @ Wp_d - Wm @ rm @ Wm_d) / (2.0 * dks[b])
-            comm = A[b] @ rho1[c] - rho1[c] @ A[b]
-            rho2 = (dpart - 1j * comm) * inv_d2
+            rho2 = dpart * inv_d2
             for i in range(dim):
                 tr = np.einsum("kmn,knm->k", -vel[i], rho2, optimize=True)
                 Tt[i, b, c] = np.conj(np.sum(tr * w))
@@ -475,58 +478,32 @@ def compute_hhg_spectrum(
     harmonic_peaks: dict[int, np.ndarray] = {}
     J_harm_t = np.zeros((Nt, dim), dtype=np.float64)
     if max_order >= 2:
-        from qxti.analytics.rho_analytic import rho_order_s, _velocity_band
+        # Orders >= 2: single VECTORIZED mesh recursion (replaces the old per-k
+        # rho_order_s loop AND the double-counting order-2 tensor path).
+        from qxti.analytics.mesh_response import precompute_band_data, harmonic_currents
         weights = build_k_integration_weights(config, hamiltonian=hamiltonian, kgrid=kgrid,
                                               extra_k_weight_mask=extra_k_weight_mask)
         k_points = kgrid.points()
-        T_au = temperature
+        shape = tuple(int(kgrid.shape[a]) for a in range(3))
+        bounds = hamiltonian.reciprocal_box_bounds()
         E_field = np.asarray(list(E_cw) + [0.0] * (3 - dim), dtype=complex)
-
-        from qxti.utils.progress import ProgressTimer
-        Ef = E_field[:dim]
+        if progress:
+            print(f"[theory-HHG] orders >= 2: vectorized mesh recursion "
+                  f"({nk} k-points, batched eigh once) ...", flush=True)
+        band = precompute_band_data(hamiltonian._matrix_at, k_points, shape, bounds,
+                                    mu=mu, T_au=temperature, dimension=dim,
+                                    distribution=distribution)
+        J_all = harmonic_currents(band, weights, E_field, omega0, max_order,
+                                  gamma=gamma, gamma_pop=gamma)
         for s in range(2, max_order + 1):
-            if s == 2:
-                # CONVERGENT grid-based order-2 tensor (mesh covariant gradient),
-                # contracted with the CW field: J_i(2w) = sum_jk sigma2_ijk E_j E_k.
-                if progress:
-                    print("[theory-HHG] order 2: grid-based tensor (mesh gradient, "
-                          "convergent) ...", flush=True)
-                sigma2 = order2_tensor_at_omega(hamiltonian, kgrid, omega0, weights, config.cmd)
-                Js = np.einsum("ijk,j,k->i", sigma2, Ef, Ef, optimize=True)
-            else:
-                # Orders s>=3 (THG+): per-k analytic recursion (fallback).
-                timer = ProgressTimer(total=nk)
-                hb = max(1, nk // 10)
-                Js = np.zeros(dim, dtype=np.complex128)
-                for ik in range(nk):
-                    if progress and ik % hb == 0:
-                        print(
-                            f"[theory-HHG] order {s}: k-point {ik+1}/{nk} "
-                            f"({100*(ik+1)//nk}%), elapsed {timer.elapsed_seconds:.1f}s, "
-                            f"ETA {timer.eta_text()}",
-                            flush=True,
-                        )
-                    kx, ky, kz = (float(k_points[ik, 0]), float(k_points[ik, 1]), float(k_points[ik, 2]))
-                    vel = _velocity_band(hamiltonian._matrix_at, kx, ky, kz)
-                    try:
-                        rhos = rho_order_s(hamiltonian._matrix_at, kx, ky, kz, E_field,
-                                           omega0, gamma, mu, T_au, max_order=s)
-                    except Exception:
-                        timer.advance(); continue
-                    rho_s = rhos.get(s)
-                    if rho_s is None:
-                        timer.advance(); continue
-                    for a in range(dim):
-                        Js[a] += weights[ik] * np.trace((-vel[a]) @ rho_s)
-                    timer.advance()
+            Js = -np.asarray(J_all[s][:dim], dtype=np.complex128)   # sum_k w Tr[-v rho^(s)]
             harmonic_peaks[s] = Js
             # Time-domain harmonic, modulated by the pulse envelope^s at s*omega0:
-            #   J^(s)(t) = 2 Re[ J^(s)_+ * env_norm(t)^s * e^{-i s omega0 t} ]
             phase = np.exp(-1j * s * omega0 * t_axis)
             for a in range(dim):
                 J_harm_t[:, a] += 2.0 * np.real(Js[a] * (env_norm ** s) * phase)
-            if progress:
-                print(f"[theory-HHG] order {s} harmonic done.", flush=True)
+        if progress:
+            print("[theory-HHG] orders >= 2 done.", flush=True)
 
     # --- Assemble a current_spectrum.npz-compatible dataset (for graphics) ---
     current_time = np.zeros((Nt, 3), dtype=np.float64)
@@ -583,6 +560,62 @@ def _susc_available_indices(order: int, dimension: int) -> list[tuple[int, ...]]
     return [(i,) + (j,) * order for i in range(dimension) for j in range(dimension)]
 
 
+def _mesh_susceptibility(hamiltonian, kgrid, omega_axis, weights, ccfg, orders_ge2, *, progress=True):
+    """sigma^(s)_{i, j..j}(s*omega) tensors for orders >= 2 via the VECTORIZED mesh recursion.
+
+    Single fast path that replaces BOTH the old per-k ``rho_order_s`` loop (orders >= 3)
+    and the ``_order2_gridbased`` order-2 path (which double-counted the Berry
+    commutator).  Band data (batched eigh + velocities) is computed ONCE and reused
+    across the whole (frequency x drive-direction) sweep.  Returns the diagonal-input
+    components only (matches ``_susc_available_indices``); the SAME convention as the
+    old orders>=3 branch:  sigma = conj( sum_k w_k Tr[(-v_i) rho^(s)] ).
+    """
+    from qxti.analytics.mesh_response import precompute_band_data, harmonic_currents
+    dim = int(hamiltonian.dimension)
+    shape = tuple(int(kgrid.shape[a]) for a in range(3))
+    kpts = np.asarray(kgrid.points(), dtype=np.float64)
+    bounds = hamiltonian.reciprocal_box_bounds()
+    mu = float(ccfg.fermi_level)
+    T_au = float(ccfg.temperature)
+    distribution = _resolve_distribution(ccfg.distribution)
+    gamma = 0.0 if ccfg.coherence_time <= 0 else 1.0 / float(ccfg.coherence_time)
+    orders_ge2 = tuple(sorted(orders_ge2))
+    max_s = max(orders_ge2)
+    omega_axis = np.asarray(omega_axis, dtype=np.float64)
+    nw = omega_axis.size
+
+    if progress:
+        print(f"[theory-susc] orders {list(orders_ge2)}: vectorized mesh recursion "
+              f"({kpts.shape[0]} k-points, batched eigh once), {nw} frequencies x "
+              f"{dim} directions. Progress with ETA below.", flush=True)
+
+    from qxti.utils.progress import ProgressTimer, format_duration
+    timer = ProgressTimer(total=nw)
+    step = max(1, nw // 20)   # ~20 ETA updates over the sweep (don't spam huge nw)
+
+    band = precompute_band_data(hamiltonian._matrix_at, kpts, shape, bounds,
+                                mu=mu, T_au=T_au, dimension=dim,
+                                distribution=distribution)
+    sig = {s: np.full((nw,) + (dim,) * (s + 1), np.nan + 1j * np.nan, np.complex128)
+           for s in orders_ge2}
+    for iw, omega in enumerate(omega_axis):
+        for j in range(dim):
+            E_field = np.zeros(3, dtype=np.complex128)
+            E_field[j] = 1.0
+            J = harmonic_currents(band, weights, E_field, float(omega), max_s,
+                                  gamma=gamma, gamma_pop=gamma)
+            for s in orders_ge2:
+                for i in range(dim):
+                    sig[s][(iw, i) + (j,) * s] = np.conj(-J[s][i])
+        timer.advance()
+        if progress and (iw % step == 0 or iw == nw - 1):
+            print(f"[theory-susc] frequency {timer.completed}/{nw} "
+                  f"(omega={float(omega):.5f}) done -- elapsed "
+                  f"{format_duration(timer.elapsed_seconds)}, ETA {timer.eta_text()}.",
+                  flush=True)
+    return sig
+
+
 def compute_susceptibility_spectrum(
     config: QXTIConfig,
     omega_axis: FloatArray,
@@ -636,108 +669,15 @@ def compute_susceptibility_spectrum(
     ccfg = config.susceptibility_solver
     weights = build_k_integration_weights(config, hamiltonian=hamiltonian, kgrid=kgrid)
 
-    # Order 2: fast grid-based mesh covariant gradient.
-    if 2 in higher:
-        sig2, idx2 = _order2_gridbased(hamiltonian, kgrid, omega_axis, weights, ccfg, progress=progress)
-        omega_b = (2 * omega_axis)[(slice(None),) + (None,) * 3]
-        dataset["sigma_order_2_tensor"] = sig2
-        dataset["chi_order_2_tensor"] = sig2 / (-1j * omega_b)
-        dataset["sigma_order_2_available_indices"] = idx2
-        dataset["chi_order_2_available_indices"] = idx2
-        higher = [s for s in higher if s != 2]
-
-    # Orders >=3: closed-form rho^(s)(k, s*omega) per input direction (per-point).
+    # Orders >= 2: single VECTORIZED mesh recursion (replaces the old per-k
+    # rho_order_s loop AND the double-counting order-2 grid path).
     if higher:
-        from qxti.analytics.rho_analytic import rho_order_s, _band_frame, _velocity_band
-        from qxti.utils.progress import ProgressTimer
-        distribution = _resolve_distribution(ccfg.distribution)
-        mu = float(ccfg.fermi_level)
-        T_au = float(ccfg.temperature)
-        gamma = 0.0 if ccfg.coherence_time <= 0 else 1.0 / float(ccfg.coherence_time)
-
-        max_s = max(higher)
-        # sigma_s[s] has shape (nw,)+(dim,)*(s+1); only (i, j..j) filled, rest NaN.
-        sig_tensors = {s: np.full((nw,) + (dim,) * (s + 1), np.nan + 1j * np.nan, np.complex128)
-                       for s in higher}
-        total_steps = nw * dim * nk
-
-        # --- Up-front cost estimate (orders >=2 use the expensive covariant
-        # gradient per (freq, dir, k); calibrate on a few k-points and warn). ---
-        import time as _time
-        kx0, ky0, kz0 = (float(k_points[0, 0]), float(k_points[0, 1]), float(k_points[0, 2]))
-        E_cal = np.zeros(3, dtype=complex); E_cal[0] = 1.0
-        n_cal = min(20, nk)
-        t_cal0 = _time.perf_counter()
-        for ic in range(n_cal):
-            kc = k_points[ic % nk]
-            try:
-                rho_order_s(hamiltonian._matrix_at, float(kc[0]), float(kc[1]), float(kc[2]),
-                            E_cal, float(omega_axis[0]), gamma, mu, T_au, max_order=max_s)
-            except Exception:
-                pass
-        per_call = (_time.perf_counter() - t_cal0) / max(n_cal, 1)
-        est_seconds = per_call * total_steps
-        if progress:
-            from qxti.utils.progress import format_duration as _fmt
-            print(
-                f"[theory-susc] orders {higher}: {nw} freq x {dim} dirs x {nk} k-points "
-                f"= {total_steps:,} rho^(s) evaluations.\n"
-                f"[theory-susc] calibrated ~{per_call*1e3:.1f} ms/eval -> estimated "
-                f"~{_fmt(est_seconds)} total.",
-                flush=True,
-            )
-            if est_seconds > 600:
-                print(
-                    "[theory-susc] WARNING: this is a LONG order>=2 run. The closed-form "
-                    "rho^(s) uses the covariant k-gradient (neighbour diagonalizations) per "
-                    "frequency/direction, so cost ~ Nk x Nfreq x Ndim. Order>=2 converges with "
-                    f"a MODEST grid: try k_points ~ [12,12,12] (here {nk:,} points). Reduce the "
-                    "grid or susceptibility_num_frequencies to cut the time. (Order 1 is cheap "
-                    "and already done.) Ctrl-C to stop and adjust.",
-                    flush=True,
-                )
-
-        timer = ProgressTimer(total=total_steps)
-        step = 0
-        k_hb = max(1, nk // 10)
-        for iw, omega in enumerate(omega_axis):
-            for j in range(dim):                       # input direction
-                E_field = np.zeros(3, dtype=complex); E_field[j] = 1.0
-                Js = {s: np.zeros(dim, dtype=np.complex128) for s in higher}
-                if progress:
-                    print(f"[theory-susc] freq {iw+1}/{nw} (omega={float(omega):.4f}), "
-                          f"dir {('x','y','z')[j]}: {step:,}/{total_steps:,} "
-                          f"({100*step//total_steps}%), ETA {timer.eta_text()}", flush=True)
-                for ik in range(nk):
-                    if progress and ik and ik % k_hb == 0:
-                        print(f"[theory-susc]   ...k {ik}/{nk} (overall {100*step//total_steps}%, "
-                              f"ETA {timer.eta_text()})", flush=True)
-                    kx, ky, kz = (float(k_points[ik, 0]), float(k_points[ik, 1]), float(k_points[ik, 2]))
-                    vel = _velocity_band(hamiltonian._matrix_at, kx, ky, kz)
-                    try:
-                        rhos = rho_order_s(hamiltonian._matrix_at, kx, ky, kz, E_field,
-                                           float(omega), gamma, mu, T_au, max_order=max_s)
-                    except Exception:
-                        step += 1; timer.advance(); continue
-                    for s in higher:
-                        rho_s = rhos.get(s)
-                        if rho_s is None:
-                            continue
-                        for i in range(dim):
-                            Js[s][i] += weights[ik] * np.trace((-vel[i]) @ rho_s)
-                    step += 1; timer.advance()
-                # chi^(s)_{i j..j} = sigma / (-i * s*omega); E_j = 1 so sigma = J.
-                for s in higher:
-                    out_omega = s * float(omega)
-                    for i in range(dim):
-                        comp = (iw, i) + (j,) * s
-                        sig_tensors[s][comp] = np.conj(Js[s][i])
+        sig = _mesh_susceptibility(hamiltonian, kgrid, omega_axis, weights,
+                                   ccfg, tuple(higher), progress=progress)
         for s in higher:
-            # broadcast omega over the (s+1) trailing spatial axes of the tensor
             omega_b = (s * omega_axis)[(slice(None),) + (None,) * (s + 1)]
-            chi_t = sig_tensors[s] / (-1j * omega_b)
-            dataset[f"sigma_order_{s}_tensor"] = sig_tensors[s]
-            dataset[f"chi_order_{s}_tensor"] = chi_t
+            dataset[f"sigma_order_{s}_tensor"] = sig[s]
+            dataset[f"chi_order_{s}_tensor"] = sig[s] / (-1j * omega_b)
             idx = np.asarray(_susc_available_indices(s, dim), dtype=np.int16)
             dataset[f"sigma_order_{s}_available_indices"] = idx
             dataset[f"chi_order_{s}_available_indices"] = idx
@@ -966,18 +906,17 @@ def _order2_gridbased(hamiltonian, kgrid, omega_axis, weights, ccfg, *, progress
 
                 transported_plus = W_plus[:, None, :, :] @ rho1_plus @ W_plus_dag[:, None, :, :]
                 transported_minus = W_minus[:, None, :, :] @ rho1_minus @ W_minus_dag[:, None, :, :]
+                # dpart is the Wilson-TRANSPORTED mesh gradient = the FULL covariant
+                # derivative D_k rho^(1) in one shot; no separate commutator (that
+                # double-counts the Berry connection).
                 dpart = (transported_plus - transported_minus) / (2.0 * dks[j])
-                commutator = (
-                    Aj_curr[:, None, :, :] @ rho1_curr
-                    - rho1_curr @ Aj_curr[:, None, :, :]
-                )
                 with np.errstate(divide="ignore", invalid="ignore"):
                     inv_d2_curr = np.where(
                         valid_curr[:, None, :, :],
                         1.0 / (ow2_flat[None, :, None, None] - eps_curr[:, None, :, :]),
                         0.0 + 0.0j,
                     )
-                rho2 = (dpart - 1j * commutator) * inv_d2_curr
+                rho2 = dpart * inv_d2_curr
                 weights_curr = _take_weights(j, slice_index)
 
                 for i in range(dim):
