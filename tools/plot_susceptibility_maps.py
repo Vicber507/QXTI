@@ -114,6 +114,17 @@ def _chi1_component_label(component: str) -> str:
     return rf"$|\chi^{{(1)}}_{{{component}}}|$"
 
 
+def _sigma1_component_label(component: str) -> str:
+    return rf"$|\sigma^{{(1)}}_{{{component}}}|$"
+
+
+def _colors_for_components(components: tuple[str, ...]) -> dict[str, str]:
+    return {
+        component: PLOT_PALETTE[index % len(PLOT_PALETTE)]
+        for index, component in enumerate(components)
+    }
+
+
 def _set_energy_ticks(ax, e_ev: np.ndarray) -> None:
     lo = float(np.nanmin(e_ev))
     hi = float(np.nanmax(e_ev))
@@ -316,6 +327,11 @@ def main() -> int:
         default=",".join(SELECTED_COMPONENTS),
         help="Comma-separated chi^(2) components for the extra stacked/separate plots.",
     )
+    ap.add_argument(
+        "--selected-sigma1-components",
+        default="",
+        help="Comma-separated sigma^(1) components for extra modulus plots, e.g. xy or xy,yx.",
+    )
     args = ap.parse_args()
     orders = _parse_orders(args.orders)
 
@@ -384,6 +400,42 @@ def main() -> int:
             fig.savefig(f1, dpi=230, facecolor="white"); plt.close(fig)
             print(f"wrote {f1}")
 
+        stale_sigma1_single = out / f"{args.label}_sigma1_selected_components_single_panel.png"
+        if stale_sigma1_single.exists():
+            stale_sigma1_single.unlink()
+        stale_sigma1_dir = out / "selected_sigma1_components"
+        if stale_sigma1_dir.exists():
+            for stale_path in stale_sigma1_dir.glob("sigma1_*.png"):
+                stale_path.unlink()
+
+        selected_sigma1_components = tuple(
+            comp.strip().lower()
+            for comp in str(args.selected_sigma1_components).replace(";", ",").split(",")
+            if comp.strip()
+        )
+        if selected_sigma1_components:
+            sigma1_selected = _rank2_component_data(sigma1, selected_sigma1_components, dim)
+            sigma1_colors = _colors_for_components(selected_sigma1_components)
+            f1_sigma = out / f"{args.label}_sigma1_selected_components_single_panel.png"
+            _plot_selected_single_panel(
+                e_ev,
+                sigma1_selected,
+                f1_sigma,
+                colors=sigma1_colors,
+                labeler=_sigma1_component_label,
+                ylabel=r"$|\sigma^{(1)}|\;(\mathrm{arb.})$",
+            )
+            print(f"wrote {f1_sigma}")
+            for path in _plot_selected_separate(
+                e_ev,
+                sigma1_selected,
+                stale_sigma1_dir,
+                colors=sigma1_colors,
+                labeler=_sigma1_component_label,
+                file_prefix="sigma1",
+            ):
+                print(f"wrote {path}")
+
         # ================= chi^(1): diagonal susceptibility components =================
         for stale_path in (
             out / f"{args.label}_sigma1_unique_components_stack.png",
@@ -391,11 +443,6 @@ def main() -> int:
         ):
             if stale_path.exists():
                 stale_path.unlink()
-        stale_sigma1_dir = out / "selected_sigma1_components"
-        if stale_sigma1_dir.exists():
-            for stale_path in stale_sigma1_dir.glob("sigma1_*.png"):
-                stale_path.unlink()
-
         chi1_components = _available_chi1_components(dim)
         chi1_selected = _rank2_component_data(chi1, chi1_components, dim)
         f1_stack = out / f"{args.label}_chi1_diagonal_components_stack.png"

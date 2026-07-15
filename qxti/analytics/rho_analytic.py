@@ -11,6 +11,11 @@ A1b  ρ^(2)(2ω)   — SHG component only (ω₁=ω₂=ω, output at 2ω).
                     Optical rectification (output at 0) is NOT included.
 A1c  ρ^(3)(3ω)   — THG component only (ω₁=ω₂=ω₃=ω, output at 3ω).
                     Optical Kerr effect (output at ω) is NOT included.
+A1…  ρ^(s)(s·ω)  — the recursion is now generalized to ARBITRARY order s.
+                    Each driven order keeps ONLY the top harmonic s·ω (the
+                    "all-plus" channel ω+ω+…+ω), i.e. the χ^(s)(s·ω) component.
+                    Lower-harmonic mixing channels (e.g. ρ^(4) at 0, 2ω) are
+                    NOT included — they are not needed for χ^(s)(s·ω).
 
 This is sufficient to compare with QXTI's susceptibility sweep, which measures
 χ^(n) at the n-th harmonic frequency n·ω.
@@ -20,6 +25,17 @@ Recursion (same structure as QXTI's CMD, just in frequency instead of time):
     ρ^(1)(ω)       = E·D_kρ^(0) / (ω − ω_mn + iγ)
     ρ^(2)(2ω)      = E·D_kρ^(1)(ω) / (2ω − ω_mn + iγ)
     ρ^(3)(3ω)      = E·D_kρ^(2)(2ω) / (3ω − ω_mn + iγ)
+    ρ^(s)(s·ω)     = E·D_kρ^(s-1)((s-1)ω) / (s·ω − ω_mn + iγ)   [general s]
+
+Practical validity of the high-order recursion
+-----------------------------------------------
+The closed form is formally exact to all orders in the perturbative (weak-field)
+regime, but each extra order applies ONE more numerical covariant k-gradient to
+the previous order.  Those finite-difference gradients are nested, so BZ-grid /
+finite-difference noise and the powers of the resonant denominators grow with s.
+In practice orders s ≤ 3–4 are robust with the default steps; s = 5 needs a fine
+grid + small dk_grad + a sensible γ; s ≳ 6–7 is exploratory (use analytic
+derivatives or a much finer grid).  See ``rho_order_s`` for the cost scaling.
 
 D_k ρ = ∂_k ρ − i[A, ρ]  (covariant gradient; ∂_k via Wilson-link-aligned FD).
 
@@ -231,24 +247,21 @@ def _rho2_local(H_func: Callable, kx: float, ky: float, kz: float,
                 U_ref: ComplexArray,
                 E_field: FloatArray, ow1: complex, ow2: complex,
                 mu: float, T_au: float, dk_grad: float, dk_vel: float) -> ComplexArray:
-    """ρ^(2)(k, 2ω) in the LOCAL band frame of k.  (No Wilson-link rotation.)"""
+    """ρ^(2)(k, 2ω) in the LOCAL band frame of k.  (No Wilson-link rotation.)
+
+    Legacy helper — superseded by the generic ``_rho_local_order``; kept for any
+    external importer.  Uses the same one-shot covariant derivative (Wilson-link FD
+    already includes −i[A, ρ]; no separate commutator).
+    """
     evals, U = _band_frame(H_func, kx, ky, kz)
-    A = _berry_offdiag(_velocity_band(H_func, kx, ky, kz, dk_vel), evals)
     nb = len(evals)
 
-    # ∂ρ^(1)/∂k at this k, using Wilson-link-aligned FD
-    # rho1_local_func returns LOCAL frame (no pre-rotation) → _drho_dk_numerical rotates
+    # D_k ρ^(1) via Wilson-link-aligned FD — this IS the covariant derivative
+    # ∂ρ^(1)/∂k − i[A, ρ^(1)] in one shot (do not add the commutator again).
     def rho1_local_func(kx2, ky2, kz2):
         return _rho1_local(H_func, kx2, ky2, kz2, E_field, ow1, mu, T_au, dk_vel)
 
-    drho1_dk = _drho_dk_numerical(H_func, kx, ky, kz, U, rho1_local_func, dk_grad)
-
-    # ρ^(1) in reference frame (already at k, so just compute directly)
-    rho1 = _rho1_local(H_func, kx, ky, kz, E_field, ow1, mu, T_au, dk_vel)
-
-    # D_k ρ^(1) = ∂ρ^(1)/∂k − i[A, ρ^(1)]
-    Dk_rho1 = [dr - 1j * (A[a] @ rho1 - rho1 @ A[a])
-               for a, dr in enumerate(drho1_dk)]
+    Dk_rho1 = _drho_dk_numerical(H_func, kx, ky, kz, U, rho1_local_func, dk_grad)
 
     rho2 = np.zeros((nb, nb), dtype=np.complex128)
     for alpha in range(3):
@@ -291,6 +304,57 @@ def _drho_dk_numerical(H_func: Callable,
             (r_pz - r_mz) / (2*dq)]
 
 
+# ─── generic-order recursive building block ──────────────────────────────────
+
+def _rho_local_order(H_func: Callable, kx: float, ky: float, kz: float,
+                     E: ComplexArray, omega: float, s: int,
+                     gamma: float, mu: float, T_au: float,
+                     dk_grad: float, dk_vel: float) -> ComplexArray:
+    """ρ^(s)(k, s·ω) in the LOCAL band frame at (kx,ky,kz), for any order s ≥ 0.
+
+    Recursive building block for the arbitrary-order recursion.  It is the value
+    used to evaluate ρ^(s-1) at NEIGHBOUR k-points inside the covariant
+    k-gradient, so it must return ρ expressed in the eigenvector frame U(k) of
+    its OWN k-point (no Wilson-link pre-rotation); ``_drho_dk_numerical`` rotates
+    each neighbour into the reference frame.
+
+    For s = 1 and s = 2 this reproduces ``_rho1_local`` / ``_rho2_local``
+    bit-for-bit; it simply extends the same construction to any s.
+    """
+    if s <= 0:
+        evals, _ = _band_frame(H_func, kx, ky, kz)
+        f = _fermi(evals, mu, T_au)
+        return np.diag(f.astype(np.complex128))
+
+    ow_s = complex(s * omega + 1j * gamma)
+    if s == 1:
+        return _rho1_local(H_func, kx, ky, kz, E, ow_s, mu, T_au, dk_vel)
+
+    evals, U = _band_frame(H_func, kx, ky, kz)
+    nb = len(evals)
+
+    def prev_local(kx2, ky2, kz2):
+        return _rho_local_order(H_func, kx2, ky2, kz2, E, omega,
+                                s - 1, gamma, mu, T_au, dk_grad, dk_vel)
+
+    # _drho_dk_numerical parallel-transports each neighbour (Wilson links) before
+    # differencing, so it already returns the FULL covariant derivative
+    # D_k ρ = ∂_k ρ − i[A, ρ] in one shot — exactly the one-shot quantity CMD uses
+    # (see cmd._covariant_gradient_for_k_index, which returns it WITHOUT a separate
+    # commutator).  Do NOT subtract −i[A, ρ] again: that double-counts the Berry
+    # connection and spuriously cancels the intraband (population) channel.
+    Dk_prev = _drho_dk_numerical(H_func, kx, ky, kz, U, prev_local, dk_grad)
+
+    rho_s = np.zeros((nb, nb), dtype=np.complex128)
+    for alpha in range(3):
+        if abs(E[alpha]) < 1e-40:
+            continue
+        for m in range(nb):
+            for n in range(nb):
+                rho_s[m, n] += E[alpha] * Dk_prev[alpha][m, n] / (ow_s - (evals[m] - evals[n]))
+    return rho_s
+
+
 # ─── main public function ─────────────────────────────────────────────────────
 
 def rho_order_s(H_func: Callable, kx: float, ky: float, kz: float,
@@ -301,12 +365,19 @@ def rho_order_s(H_func: Callable, kx: float, ky: float, kz: float,
                 dk_vel: float = 1e-4) -> dict[int, ComplexArray]:
     """Analytical ρ^(0..max_order)(k, s·ω) for one k-point.
 
-    Implements Eqs. A1a–A1c of Hipolito+2018, generalized to any Hamiltonian.
+    Implements Eqs. A1a–A1c of Hipolito+2018, generalized to any Hamiltonian AND
+    to any perturbative order (the same recursion is applied s times).
 
     Scope:
       s=1: ρ^(1)(ω)    — complete (Eq. A1a)
       s=2: ρ^(2)(2ω)   — SHG component only (ω+ω→2ω)
       s=3: ρ^(3)(3ω)   — THG component only (ω+ω+ω→3ω)
+      s≥4: ρ^(s)(s·ω)  — top-harmonic component only (ω+…+ω→s·ω); this is the
+                          χ^(s)(s·ω) channel and the natural continuation of A1b/A1c.
+
+    Cost: order s makes ~7^(s-1) evaluations of the order-1 kernel per k-point
+    (7 = one on-site + 6 gradient neighbours, nested once per order), each a small
+    diagonalization.  s≤4 is cheap; s=5–6 is heavy; s=7 is expensive but works.
 
     Parameters
     ----------
@@ -345,57 +416,39 @@ def rho_order_s(H_func: Callable, kx: float, ky: float, kz: float,
     #   Off-diagonal (interband): -i[A^α, ρ^(0)]_mn = A^α_mn·(f_n−f_m)  m≠n
     # → ρ^(1)_mn = Σ_α E_α·source_mn^α / (ω̄ − ω_mn)
     ow1 = complex(omega + 1j * gamma)
-    rho1 = _rho1_local(H_func, kx, ky, kz, E, ow1, mu, T_au, dk_vel)
-    rhos[1] = rho1
+    rhos[1] = _rho1_local(H_func, kx, ky, kz, E, ow1, mu, T_au, dk_vel)
     if max_order < 2:
         return rhos
 
-    # ── ρ^(2)(2ω) — Eq. A1b, SHG component ──────────────────────────────────
-    # Source = D_k ρ^(1)(ω):
-    #   ∂ρ^(1)/∂k via Wilson-link FD  (rho1_local_func returns LOCAL frame)
-    #   −i[A, ρ^(1)] adds the Berry-commutator part
-    # → ρ^(2)_mn = Σ_α E_α·[D_k^α ρ^(1)]_mn / (2ω̄ − ω_mn)
-    ow2 = complex(2*omega + 1j * gamma)
+    # ── ρ^(s)(s·ω), s ≥ 2 — Eqs. A1b/A1c generalized to any order ────────────
+    # Each driven order is built from the previous one by the SAME recursion:
+    #     ρ^(s)_mn(s·ω) = Σ_α E_α · [D_k ρ^(s-1)((s-1)·ω)]_mn / (s·ω̄ − ω_mn)
+    #     D_k ρ = ∂_k ρ − i[A, ρ]   (covariant k-derivative)
+    # The covariant derivative is obtained in ONE shot from the Wilson-link
+    # (parallel-transport) finite difference — it already contains the −i[A, ρ]
+    # Berry term, so it must NOT be added a second time (that double-count cancels
+    # the intraband/population channel).  This matches CMD's covariant-gradient path.
+    # ρ^(s-1) at neighbour k-points is supplied by the recursive _rho_local_order.
+    # s=2 reproduces Eq. A1b (SHG) and s=3 reproduces Eq. A1c (THG); s≥4 is the
+    # natural continuation (ρ^(4) at 4ω, ρ^(5) at 5ω, …).
+    for s in range(2, max_order + 1):
+        ow_s = complex(s * omega + 1j * gamma)
 
-    def rho1_local_func(kx2, ky2, kz2):
-        return _rho1_local(H_func, kx2, ky2, kz2, E, ow1, mu, T_au, dk_vel)
+        def prev_local(kx2, ky2, kz2, _s=s):
+            return _rho_local_order(H_func, kx2, ky2, kz2, E, omega,
+                                    _s - 1, gamma, mu, T_au, dk_grad, dk_vel)
 
-    drho1 = _drho_dk_numerical(H_func, kx, ky, kz, U, rho1_local_func, dk_grad)
-    Dk_rho1 = [dr - 1j * (A[a] @ rho1 - rho1 @ A[a]) for a, dr in enumerate(drho1)]
+        Dk_prev = _drho_dk_numerical(H_func, kx, ky, kz, U, prev_local, dk_grad)
 
-    rho2 = np.zeros((nb, nb), dtype=np.complex128)
-    for alpha in range(3):
-        if abs(E[alpha]) < 1e-40:
-            continue
-        for m in range(nb):
-            for n in range(nb):
-                rho2[m, n] += E[alpha] * Dk_rho1[alpha][m, n] / (ow2 - (evals[m]-evals[n]))
+        rho_s = np.zeros((nb, nb), dtype=np.complex128)
+        for alpha in range(3):
+            if abs(E[alpha]) < 1e-40:
+                continue
+            for m in range(nb):
+                for n in range(nb):
+                    rho_s[m, n] += E[alpha] * Dk_prev[alpha][m, n] / (ow_s - (evals[m] - evals[n]))
+        rhos[s] = rho_s
 
-    rhos[2] = rho2
-    if max_order < 3:
-        return rhos
-
-    # ── ρ^(3)(3ω) — Eq. A1c, THG component ──────────────────────────────────
-    # Source = D_k ρ^(2)(2ω), computed the same way.
-    # ρ^(2) at neighbor k requires knowing ρ^(1) there → rho2_local_func.
-    ow3 = complex(3*omega + 1j * gamma)
-
-    def rho2_local_func(kx2, ky2, kz2):
-        return _rho2_local(H_func, kx2, ky2, kz2, U,
-                           E, ow1, ow2, mu, T_au, dk_grad, dk_vel)
-
-    drho2 = _drho_dk_numerical(H_func, kx, ky, kz, U, rho2_local_func, dk_grad)
-    Dk_rho2 = [dr - 1j * (A[a] @ rho2 - rho2 @ A[a]) for a, dr in enumerate(drho2)]
-
-    rho3 = np.zeros((nb, nb), dtype=np.complex128)
-    for alpha in range(3):
-        if abs(E[alpha]) < 1e-40:
-            continue
-        for m in range(nb):
-            for n in range(nb):
-                rho3[m, n] += E[alpha] * Dk_rho2[alpha][m, n] / (ow3 - (evals[m]-evals[n]))
-
-    rhos[3] = rho3
     return rhos
 
 
