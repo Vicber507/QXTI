@@ -512,7 +512,6 @@ def compute_hhg_spectrum(
     dt = (float(timegrid.tf) - float(timegrid.t0)) / max(Nt - 1, 1)
     t_axis = float(timegrid.t0) + np.arange(Nt) * dt
     E_t = np.array([laser_system.electric_field(t) for t in t_axis])  # (Nt, 3)
-    E_w = np.fft.fft(E_t, axis=0) * dt                                 # (Nt, 3)
     freq = np.fft.fftfreq(Nt, d=dt) * 2.0 * np.pi
 
     # Multi-laser / multi-frequency drive: the single-carrier harmonic peaks are
@@ -523,33 +522,13 @@ def compute_hhg_spectrum(
             config, hamiltonian, kgrid, dim, nk, max_order, gamma, mu, temperature,
             distribution, Nt, dt, t_axis, E_t, freq, progress, extra_k_weight_mask, t_start)
 
-    # --- Order 1: full linear current J^(1)(omega) = sigma^(1)(omega) E(omega) ---
-    if progress:
-        print(
-            f"[theory-HHG] order 1: linear sigma^(1)(omega) over {nk} k-points "
-            "(smooth -> coarse omega grid, interpolated to the FFT axis).",
-            flush=True,
-        )
-    # sigma(omega) is smooth, so a coarse omega axis is enough; it is interpolated
-    # onto the full FFT grid below. Keep it small so the k-pass stays fast.
-    omega_sigma = np.linspace(max(freq.min(), -3 * max_order * omega0 - 1.0),
-                              3 * max_order * omega0 + 1.0, 200)
-    lin = compute_linear_response_spectrum(config, omega_sigma, progress=progress)
-    sigma1 = lin["sigma"]  # (n_omega_sigma, dim, dim)
-    # Interpolate sigma(omega) onto the FFT freq grid (per component), then J=sigma*E
-    J_total = np.zeros((Nt, dim), dtype=np.complex128)
+    # --- Order 1: from the SAME mesh recursion as orders >=2 (single, consistent
+    #     path). J^(1) = sum_k w_k Tr[-v rho^(1)] is the FULL linear current --
+    #     interband AND intraband (Drude) -- and is dressed with env^1 below, exactly
+    #     like the higher harmonics. This is the physically complete order 1; the old
+    #     separate sigma^(1)(omega) pass was interband-only and re-diagonalized the grid.
     J_order: dict[int, np.ndarray] = {}
-    J1 = np.zeros((Nt, dim), dtype=np.complex128)
-    for a in range(dim):
-        for b in range(dim):
-            sig_re = np.interp(freq, omega_sigma, sigma1[:, a, b].real)
-            sig_im = np.interp(freq, omega_sigma, sigma1[:, a, b].imag)
-            J1[:, a] += (sig_re + 1j * sig_im) * E_w[:, b]
-    J_order[1] = J1
-    J_total += J1
-
-    # Linear current in time (exact): J^(1)(t) = IFFT[ sigma^(1)(omega) E(omega) ].
-    J1_t = np.fft.ifft(J1, axis=0).real  # (Nt, dim)
+    J1_t = np.zeros((Nt, dim), dtype=np.float64)   # order 1 lives in J_harm_t below
 
     # Pulse envelope and CW field amplitude from the analytic signal of E(t).
     analytic = np.zeros((Nt, dim), dtype=np.complex128)
@@ -567,12 +546,13 @@ def compute_hhg_spectrum(
     # +omega0 complex amplitude per direction (half the analytic amplitude at peak).
     E_cw = 0.5 * analytic[i_peak, :dim]
 
-    # --- Orders >=2: harmonic peaks via analytic rho^(s)(k, s*omega0) ---
+    # --- Orders 1..max: harmonic peaks via analytic rho^(s)(k, s*omega0) ---
     harmonic_peaks: dict[int, np.ndarray] = {}
     J_harm_t = np.zeros((Nt, dim), dtype=np.float64)
-    if max_order >= 2:
-        # Orders >= 2: single VECTORIZED mesh recursion (replaces the old per-k
-        # rho_order_s loop AND the double-counting order-2 tensor path).
+    if max_order >= 1:
+        # Single VECTORIZED mesh recursion for ALL orders (1..max) -- replaces the old
+        # per-k rho_order_s loop, the double-counting order-2 tensor path, AND the
+        # separate interband-only sigma^(1) pass for order 1.
         from qxti.analytics.mesh_response import precompute_band_data, harmonic_currents
         weights = build_k_integration_weights(config, hamiltonian=hamiltonian, kgrid=kgrid,
                                               extra_k_weight_mask=extra_k_weight_mask)
@@ -582,7 +562,7 @@ def compute_hhg_spectrum(
         E_field = np.asarray(list(E_cw) + [0.0] * (3 - dim), dtype=complex)
         from qxti.utils.progress import ProgressTimer, format_duration
         if progress:
-            print(f"[theory-HHG] orders 2..{max_order}: vectorized mesh recursion "
+            print(f"[theory-HHG] orders 1..{max_order}: vectorized mesh recursion "
                   f"({nk} k-points). Progress with ETA below.", flush=True)
         _t_band = time.perf_counter()
         band = precompute_band_data(hamiltonian._matrix_at, k_points, shape, bounds,
@@ -591,7 +571,7 @@ def compute_hhg_spectrum(
         if progress:
             print(f"[theory-HHG] band data ready (batched eigh over {nk} k-points): "
                   f"elapsed {format_duration(time.perf_counter() - _t_band)}.", flush=True)
-        _otimer = ProgressTimer(total=max_order - 1)   # orders 2..max_order
+        _otimer = ProgressTimer(total=max(1, max_order - 1))   # order callbacks 2..max_order
 
         def _order_cb(s):
             _otimer.advance()
@@ -602,15 +582,17 @@ def compute_hhg_spectrum(
 
         J_all = harmonic_currents(band, weights, E_field, omega0, max_order,
                                   gamma=gamma, gamma_pop=gamma, progress_cb=_order_cb)
-        for s in range(2, max_order + 1):
+        for s in range(1, max_order + 1):
             Js = -np.asarray(J_all[s][:dim], dtype=np.complex128)   # sum_k w Tr[-v rho^(s)]
             harmonic_peaks[s] = Js
+            if s == 1:
+                J_order[1] = Js                                     # order 1 (inter + intraband)
             # Time-domain harmonic, modulated by the pulse envelope^s at s*omega0:
             phase = np.exp(-1j * s * omega0 * t_axis)
             for a in range(dim):
                 J_harm_t[:, a] += 2.0 * np.real(Js[a] * (env_norm ** s) * phase)
         if progress:
-            print("[theory-HHG] orders >= 2 done.", flush=True)
+            print("[theory-HHG] orders 1..max done.", flush=True)
 
     # --- Assemble a current_spectrum.npz-compatible dataset (for graphics) ---
     current_time = np.zeros((Nt, 3), dtype=np.float64)
