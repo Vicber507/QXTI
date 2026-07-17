@@ -314,6 +314,12 @@ def plot_harmonic_graphics_from_saved_data(
     output_dir = Path(config.cmd.output_dir)
     data_dir = output_dir / "data"
     resolved_plot_config = resolve_harmonic_plot_config(plot_config)
+    # Show every harmonic that was actually computed: bump the display cap to the
+    # configured [cmd] max_order (the 3.5 default hides orders 4+ from a 7-order run).
+    _max_h = float(config.cmd.max_order) + 0.5
+    for _sec in resolved_plot_config.values():
+        if isinstance(_sec, dict) and _sec.get("max_harmonic_order") is not None:
+            _sec["max_harmonic_order"] = max(float(_sec["max_harmonic_order"]), _max_h)
     outputs: dict[str, Path] = {}
 
     if not bool(config.cmd.save_xtp_dataset):
