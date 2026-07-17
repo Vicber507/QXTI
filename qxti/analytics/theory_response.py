@@ -382,6 +382,91 @@ def order2_tensor_at_omega(hamiltonian, kgrid, omega, weights, ccfg):
     return 0.5 * (Tt + np.transpose(Tt, (0, 2, 1)))
 
 
+def _hhg_multilaser_result(config, hamiltonian, kgrid, dim, nk, max_order, gamma,
+                           mu, temperature, distribution, Nt, dt, t_axis, E_t, freq,
+                           progress, extra_k_weight_mask, t_start):
+    """Multi-laser HHG current spectrum via the TIME-DOMAIN perturbative engine.
+
+    When more than one laser/frequency is present the single-carrier closed form
+    (harmonic peaks at s*omega0) is ill-defined.  Here every order is integrated in
+    time with the FULL field E(t) (all lasers, over the union time window that spans
+    from the first pulse onset to the last pulse end), so every mixing frequency
+    (omega_i +/- omega_j +/- ...) appears automatically in the FFT of the current.
+    Reduces to the closed form for a single laser (validated in the study).
+    """
+    from qxti.analytics.mesh_response import precompute_band_data, time_domain_currents
+    from qxti.utils.progress import ProgressTimer, format_duration
+
+    weights = build_k_integration_weights(config, hamiltonian=hamiltonian, kgrid=kgrid,
+                                          extra_k_weight_mask=extra_k_weight_mask)
+    k_points = kgrid.points()
+    shape = tuple(int(kgrid.shape[a]) for a in range(3))
+    bounds = hamiltonian.reciprocal_box_bounds()
+    if progress:
+        print(f"[theory-HHG] MULTI-LASER ({int(getattr(kgrid,'total_points',nk))} k-points): "
+              f"time-domain perturbative recursion over the full E(t) "
+              f"({Nt} time steps, window [{t_axis[0]:.1f}, {t_axis[-1]:.1f}] a.u.). "
+              "Progress with ETA below.", flush=True)
+    _t_band = time.perf_counter()
+    band = precompute_band_data(hamiltonian._matrix_at, k_points, shape, bounds,
+                                mu=mu, T_au=temperature, dimension=dim,
+                                distribution=distribution)
+    if progress:
+        print(f"[theory-HHG] band data ready (batched eigh): "
+              f"elapsed {format_duration(time.perf_counter() - _t_band)}.", flush=True)
+    _otimer = ProgressTimer(total=max_order)
+
+    def _order_cb(s):
+        _otimer.advance()
+        if progress:
+            print(f"[theory-HHG] order {s}/{max_order} (time-domain) done -- elapsed "
+                  f"{format_duration(_otimer.elapsed_seconds)}, ETA {_otimer.eta_text()}.",
+                  flush=True)
+
+    td = time_domain_currents(band, weights, E_t[:, :3], dt, max_order,
+                              gamma=gamma, gamma_pop=gamma, progress_cb=_order_cb)
+
+    # Per-order physical current in time (real) and its spectrum.
+    J_order: dict[int, np.ndarray] = {}
+    current_dim = np.zeros((Nt, dim), dtype=np.float64)
+    for s in range(1, max_order + 1):
+        Js_t = td["J_t"][s][:, :dim].real
+        current_dim += Js_t
+        J_order[s] = np.fft.fft(Js_t, axis=0)
+
+    current_time = np.zeros((Nt, 3), dtype=np.float64)
+    current_time[:, :dim] = current_dim
+    field_time = np.zeros((Nt, 3), dtype=np.float64)
+    field_time[:, :dim] = E_t[:, :dim].real
+    current_spectrum = np.fft.fft(current_time, axis=0)
+    current_magnitude = np.abs(current_spectrum)
+    current_total_magnitude = np.sqrt(np.sum(current_magnitude ** 2, axis=1))
+    zeros3 = np.zeros((Nt, 3), dtype=np.float64)
+    zeros3c = np.zeros((Nt, 3), dtype=np.complex128)
+    dataset = {
+        "omega_axis": freq, "current_spectrum": current_spectrum,
+        "current_magnitude": current_magnitude,
+        "current_total_magnitude": current_total_magnitude,
+        "current_time": current_time, "current_time_total": current_time,
+        "current_spectrum_total": current_spectrum, "polarization_time": zeros3,
+        "equilibrium_current_time": zeros3, "equilibrium_polarization_time": zeros3,
+        "time_axis": t_axis, "electric_field_time": field_time,
+        "current_time_intraband": zeros3, "current_time_interband": current_time,
+        "current_spectrum_intraband": zeros3c, "current_spectrum_interband": current_spectrum,
+        "current_total_magnitude_intraband": np.zeros(Nt),
+        "current_total_magnitude_interband": current_total_magnitude,
+        "orders": np.asarray(tuple(range(1, max_order + 1))),
+    }
+    if progress:
+        print("[theory-HHG] multi-laser time-domain done.", flush=True)
+    return {
+        "omega_axis": freq, "J_total": current_spectrum[:, :dim], "J_order": J_order,
+        "harmonic_peaks": {}, "omega0": float(config.laser.omega), "max_order": max_order,
+        "runtime_seconds": time.perf_counter() - t_start, "dimension": dim,
+        "method": "theory-multilaser", "dataset": dataset,
+    }
+
+
 def compute_hhg_spectrum(
     config: QXTIConfig,
     *,
@@ -429,6 +514,14 @@ def compute_hhg_spectrum(
     E_t = np.array([laser_system.electric_field(t) for t in t_axis])  # (Nt, 3)
     E_w = np.fft.fft(E_t, axis=0) * dt                                 # (Nt, 3)
     freq = np.fft.fftfreq(Nt, d=dt) * 2.0 * np.pi
+
+    # Multi-laser / multi-frequency drive: the single-carrier harmonic peaks are
+    # ill-defined, so integrate the perturbative response in the TIME domain over
+    # the full multi-pulse field E(t).  Single laser keeps the fast closed form.
+    if int(laser_system.number_of_lasers()) > 1:
+        return _hhg_multilaser_result(
+            config, hamiltonian, kgrid, dim, nk, max_order, gamma, mu, temperature,
+            distribution, Nt, dt, t_axis, E_t, freq, progress, extra_k_weight_mask, t_start)
 
     # --- Order 1: full linear current J^(1)(omega) = sigma^(1)(omega) E(omega) ---
     if progress:
@@ -487,14 +580,28 @@ def compute_hhg_spectrum(
         shape = tuple(int(kgrid.shape[a]) for a in range(3))
         bounds = hamiltonian.reciprocal_box_bounds()
         E_field = np.asarray(list(E_cw) + [0.0] * (3 - dim), dtype=complex)
+        from qxti.utils.progress import ProgressTimer, format_duration
         if progress:
-            print(f"[theory-HHG] orders >= 2: vectorized mesh recursion "
-                  f"({nk} k-points, batched eigh once) ...", flush=True)
+            print(f"[theory-HHG] orders 2..{max_order}: vectorized mesh recursion "
+                  f"({nk} k-points). Progress with ETA below.", flush=True)
+        _t_band = time.perf_counter()
         band = precompute_band_data(hamiltonian._matrix_at, k_points, shape, bounds,
                                     mu=mu, T_au=temperature, dimension=dim,
                                     distribution=distribution)
+        if progress:
+            print(f"[theory-HHG] band data ready (batched eigh over {nk} k-points): "
+                  f"elapsed {format_duration(time.perf_counter() - _t_band)}.", flush=True)
+        _otimer = ProgressTimer(total=max_order - 1)   # orders 2..max_order
+
+        def _order_cb(s):
+            _otimer.advance()
+            if progress:
+                print(f"[theory-HHG] order {s}/{max_order} (rho^({s})({s}*omega)) done "
+                      f"-- elapsed {format_duration(_otimer.elapsed_seconds)}, "
+                      f"ETA {_otimer.eta_text()}.", flush=True)
+
         J_all = harmonic_currents(band, weights, E_field, omega0, max_order,
-                                  gamma=gamma, gamma_pop=gamma)
+                                  gamma=gamma, gamma_pop=gamma, progress_cb=_order_cb)
         for s in range(2, max_order + 1):
             Js = -np.asarray(J_all[s][:dim], dtype=np.complex128)   # sum_k w Tr[-v rho^(s)]
             harmonic_peaks[s] = Js
@@ -641,6 +748,36 @@ def compute_susceptibility_spectrum(
     omega_axis = np.asarray(omega_axis, dtype=np.float64)
     nw = omega_axis.size
     orders = tuple(sorted({int(o) for o in orders}))
+
+    # Multi-laser drive: a single-omega susceptibility sweep cannot represent the
+    # mixing of several frequencies.  Fall back to the TIME-DOMAIN perturbative
+    # engine on the actual multi-pulse field E(t) and return its current response
+    # (all mixing products), sharing the exact machinery of the HHG multi-laser
+    # path.  A single laser keeps the fast closed-form chi^(s)(s*omega) sweep.
+    laser_system = sim.build_laser_system()
+    if int(laser_system.number_of_lasers()) > 1:
+        ccfg = config.susceptibility_solver
+        max_order = max(orders) if orders else 2
+        gamma = 0.0 if ccfg.coherence_time <= 0 else 1.0 / float(ccfg.coherence_time)
+        mu = float(ccfg.fermi_level)
+        temperature = float(ccfg.temperature)
+        distribution = _resolve_distribution(ccfg.distribution)
+        timegrid = sim.build_timegrid(laser_system)
+        Nt = int(timegrid.Nt)
+        dt = (float(timegrid.tf) - float(timegrid.t0)) / max(Nt - 1, 1)
+        t_axis = float(timegrid.t0) + np.arange(Nt) * dt
+        E_t = np.array([laser_system.electric_field(t) for t in t_axis])
+        freq = np.fft.fftfreq(Nt, d=dt) * 2.0 * np.pi
+        if progress:
+            print("[theory-susc] MULTI-LASER: single-omega susceptibility is undefined; "
+                  "returning the time-domain multi-frequency current response.", flush=True)
+        res = _hhg_multilaser_result(
+            config, hamiltonian, kgrid, dim, nk, max_order, gamma, mu, temperature,
+            distribution, Nt, dt, t_axis, E_t, freq, progress, None, t_start)
+        res["dataset"]["scan_type"] = "multilaser_time_domain"
+        res["dataset"]["engine"] = "theory-multilaser"
+        return {"dataset": res["dataset"], "runtime_seconds": res["runtime_seconds"],
+                "method": "theory-multilaser", "orders": orders}
 
     direction_labels = tuple(("x", "y", "z")[:dim])
     dataset: dict[str, Any] = {

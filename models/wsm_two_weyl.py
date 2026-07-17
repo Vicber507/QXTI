@@ -34,9 +34,11 @@ Reglas de seleccion / fisica:
    lineal; QXTI la calcula por diferencias finitas. Aqui se incluye tambien la
    forma analitica en current_matrices() como referencia/validacion.
 
-Parametros por defecto (en atomic units), modelo tipo TaAs:
-    tx = 0.0041,  ty = tz = 0.0082,  M0 = 0.0164,  gamma = 0.0
-    a0 = a1 = a2 = 3.4 Ang = 6.4250683612 a.u.
+Parametros por defecto (en atomic units), modelo tipo TaAs TETRAGONAL, ajustados
+para reproducir la figura experimental del 4to armonico (tools/replica_paper_4th.py):
+    tx = 0.0041,  ty = tz = 0.0082,  M0 = 0.014,  gamma = 0.0
+    a0 = a1 = 3.4 Ang = 6.4250683612 a.u.,  a2 = 12.0 a.u. (distorsion tetragonal)
+Valores TaAs cubicos originales: M0 = 0.0164, a2 = a0.
 
 Referencias:
     McCormick, Kimchi, Trivedi, Phys. Rev. B 95, 075133 (2017).
@@ -72,12 +74,16 @@ DEFAULT_PARAMS = {
     "tx": 0.0041,        # hopping a lo largo de kx
     "ty": 0.0082,        # hopping a lo largo de ky
     "tz": 0.0082,        # hopping a lo largo de kz
-    "M0": 0.0164,        # termino de masa
+    "M0": 0.014,         # termino de masa   (TaAs original: 0.0164)
     "a0": _A_LATTICE_AU,  # constante de red eje x [a.u.]
     "a1": _A_LATTICE_AU,  # constante de red eje y [a.u.]
-    "a2": _A_LATTICE_AU,  # constante de red eje z [a.u.]
+    "a2": 12.0,          # eje z TETRAGONAL [a.u.]  (cubico original: _A_LATTICE_AU)
     "kw": None,          # posicion del nodo de Weyl; None -> pi/(2 a0)
 }
+# NOTA: M0=0.014, a2=12.0 son los parametros del barrido fino que reproducen la
+# figura del paper (replica 4to armonico TaAs: S conectada con verticales rectas
+# en eps~+-0.5, doble pico en +-90 grados).  Ver tools/replica_paper_4th.py.
+# Los valores TaAs originales (McCormick et al.): M0=0.0164, a2=_A_LATTICE_AU.
 
 
 DEFAULT_LATTICE = {

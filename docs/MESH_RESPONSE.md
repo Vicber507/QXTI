@@ -172,6 +172,50 @@ J = harmonic_currents(                           # reuse `band` across the sweep
 - `σ^(s)` follows by the usual prefactor (`(1j**s) · spin / V_BZ / E^s`), applied
   identically to whichever path you use.
 
+## Multi-frequency drives: the time-domain engine
+
+The closed form above assumes a **single carrier ω** and returns ρ^(s)(sω).  For a
+drive with **more than one laser/frequency** (e.g. two-colour, or a chirped/multi-
+pulse field) the harmonics mix: the response lives at every ω_i±ω_j±… and the
+single-ω peaks are ill-defined.  `time_domain_currents` solves the **same** A1
+recursion in the **time domain** with the FULL field E(t):
+
+```
+S^(N)(t) = Σ_α E_α(t) [D_k ρ^(N-1)(t)]_α          # Wilson covariant grad, per t
+ρ^(N)(ω) = FFT_t[S^(N)(t)] / (−ω − ω_mn + iΓ_mn)   # H_0 diagonal → per-element solve
+ρ^(N)(t) = IFFT_ω[ρ^(N)(ω)]
+```
+
+Every mixing product appears automatically in the FFT of the current — no
+enumeration of the ~F^N frequency channels.  Because H_0 is diagonal in the band
+basis the propagator is an exact per-element frequency denominator (no time-
+stepping error).  The observable current carries the documented per-order phase
+`i^(s-1)`, which makes `J^(s)(t)` **real** (physical, Hermitian spectrum).
+
+**Auto-dispatch (both engines).** `compute_hhg_spectrum` (cmd) and
+`compute_susceptibility_spectrum` (xtp) select automatically: **1 laser → the fast
+closed form**; **>1 laser → the time-domain engine**.  The time window is the union
+of all pulses (`laser_system.temporal_bounds()`: first onset → last end, plus the
+configured pre/post offsets), so two pulses with a temporal offset are integrated
+over their full span.
+
+**Validation** (`tools/study_time_domain_engine.py` →
+`outputs/time_domain_engine_study.png`):
+
+- **A. Correctness** — in the single-carrier limit the time-domain harmonics match
+  the closed form to **~1e-15** (every order, every time resolution) and `J(t)` is
+  real to ~1e-15.  (100% agreement — the two are the same physics.)
+- **B. Multi-frequency** — two lasers produce the mixing peaks ω1±ω2, 2ω1, 2ω2,
+  2ω1±ω2, … that the single-carrier path cannot.
+- **C. Timing** — the time integration is inherently costlier than the single-ω
+  closed form (Nt time steps), but is optimized to **~6× faster than the naive
+  version** (order-independent propagator `1/denom` built once → multiply not
+  divide; Wilson links precomputed once; BLAS batched matmul for the covariant
+  transport; a BLAS `tensordot` current trace; only the previous order's ρ(t) kept
+  in memory).  Sub-second on the test grids (0.1–0.7 s at Nk≈1.7k, Nt≈256–512).
+- **D. Window** — two temporally-offset pulses are both captured and integrated over
+  the full window.
+
 ## Status — wired into production
 
 The integration is **done**.  Orders ≥ 2 in both

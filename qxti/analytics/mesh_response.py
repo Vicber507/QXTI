@@ -78,10 +78,14 @@ class BandData:
                  "eps", "valid", "inv_eps", "dks", "shape", "nb", "nk", "dim", "diag")
 
     def __init__(self, H_func, kpts, shape, bounds, *, mu=0.0, T_au=0.0,
-                 dimension=3, dk_vel=1e-4, distribution=None):
+                 dimension=3, dk_vel=1e-4, distribution=None, h_batch=None):
         dim = int(dimension)
         nk = kpts.shape[0]
-        Hm = _build_H_mesh(H_func, kpts)
+        # ``h_batch(kpts)->(nk,nb,nb)`` (vectorized) avoids the per-k Python loop in
+        # ``_build_H_mesh`` — essential at large grids (150^3 = millions of points).
+        build = (lambda kp: np.asarray(h_batch(kp), dtype=np.complex128)) if h_batch is not None \
+            else (lambda kp: _build_H_mesh(H_func, kp))
+        Hm = build(kpts)
         nb = Hm.shape[1]
         energies, U = np.linalg.eigh(Hm)
         Udag = np.conj(np.swapaxes(U, -1, -2))
@@ -90,8 +94,8 @@ class BandData:
         for a in range(dim):
             sh = np.zeros(3)
             sh[a] = dk_vel
-            Hp = _build_H_mesh(H_func, kpts + sh)
-            Hmn = _build_H_mesh(H_func, kpts - sh)
+            Hp = build(kpts + sh)
+            Hmn = build(kpts - sh)
             vel.append(Udag @ ((Hp - Hmn) / (2 * dk_vel)) @ U)
             del Hp, Hmn
         # Occupation: honor the CONFIGURED distribution (e.g. valence_occupation,
@@ -122,24 +126,31 @@ class BandData:
 
 
 def precompute_band_data(H_func, kpts, shape, bounds, *, mu=0.0, T_au=0.0,
-                         dimension=3, dk_vel=1e-4, distribution=None) -> BandData:
+                         dimension=3, dk_vel=1e-4, distribution=None,
+                         h_batch=None) -> BandData:
     """Diagonalize H and build velocities/Berry connection on the mesh ONCE.
 
     ``distribution(E, mu, T) -> f`` sets the band occupation (default: energy
     Fermi step).  Pass the config's resolved distribution so orders >= 2 use the
     SAME filling as order 1 and as the configured engine (e.g. valence_occupation).
+    ``h_batch(kpts)->(nk,nb,nb)`` is an optional VECTORIZED Hamiltonian builder
+    (skips the per-k Python loop; needed for large grids).
     """
     return BandData(H_func, kpts, shape, bounds, mu=mu, T_au=T_au,
-                    dimension=dimension, dk_vel=dk_vel, distribution=distribution)
+                    dimension=dimension, dk_vel=dk_vel, distribution=distribution,
+                    h_batch=h_batch)
 
 
 def harmonic_currents(band: BandData, weights, E_field, omega, max_order, *,
-                      gamma=1e-3, gamma_pop=None) -> dict[int, ComplexArray]:
+                      gamma=1e-3, gamma_pop=None, progress_cb=None) -> dict[int, ComplexArray]:
     """BZ-summed J^(s)_i = Σ_k w_k Tr[v_i ρ^(s)] from precomputed band data.
 
     ρ^(s) is the length-gauge A1 recursion with the one-shot Wilson covariant
     gradient (no double-count).  Reuses ``band`` across the whole ω/direction
     sweep — the eigh/velocity are NOT recomputed here.
+
+    ``progress_cb(s)``, if given, is called after each order s>=2 is built (used by
+    the single-shot HHG path to report per-order progress/ETA).
     """
     E = np.asarray(E_field, dtype=np.complex128)
     if gamma_pop is None:
@@ -186,6 +197,8 @@ def harmonic_currents(band: BandData, weights, E_field, omega, max_order, *,
         with np.errstate(divide="ignore", invalid="ignore"):
             denom = s * omega + iGamma - eps
             rhos[s] = np.where(np.abs(denom) > 0, src / denom, 0.0)
+        if progress_cb is not None:
+            progress_cb(s)
 
     w = np.asarray(weights, dtype=np.float64).reshape(nk)
     currents: dict[int, ComplexArray] = {}
@@ -281,6 +294,140 @@ def perk_harmonic_currents(
             for i in range(dim):
                 acc[s][i] += w[ik] * np.trace(vel[i] @ rho_s)
     return acc
+
+
+def time_domain_currents(band: BandData, weights, E_t, dt, max_order, *,
+                         gamma=1e-3, gamma_pop=None, k_chunk=None,
+                         progress_cb=None) -> dict:
+    """Order-by-order PERTURBATIVE response to an ARBITRARY field E(t).
+
+    This is the multi-frequency generalization of :func:`harmonic_currents`.  The
+    closed-form path assumes a single carrier ω and returns ρ^(s)(sω); here we
+    integrate the SAME length-gauge recursion in the time domain with the FULL
+    field E(t) (any number of lasers / frequencies), so every mixing product
+    (ω_i±ω_j±…) appears automatically in the FFT of the current — no enumeration.
+
+    Physics (identical operators to ``harmonic_currents``; H_0 diagonal in the
+    band basis makes the propagator a per-element frequency denominator):
+
+        S^(N)(t) = Σ_α E_α(t) [D_k ρ^(N-1)(t)]_α          (Wilson covariant grad)
+        ρ^(N)(ω) = FFT_t[S^(N)(t)] / (ω − ω_mn + iΓ_mn)    (Γ: T1 diag, T2 offdiag)
+        ρ^(N)(t) = IFFT_ω[ρ^(N)(ω)]
+
+    with ρ^(0) = diag(f).  Reduces to the closed form at every sω peak when E(t)
+    is monochromatic (validated to machine level — see the study script).
+
+    Parameters
+    ----------
+    band     : precomputed :class:`BandData` (eigh/velocity/occupation on the mesh).
+    weights  : (nk,) BZ quadrature weights.
+    E_t      : (Nt, dim) real electric field sampled on a uniform time grid.
+    dt       : time step (a.u.).
+    max_order: highest perturbative order.
+    gamma    : coherence dephasing 1/T2 (off-diagonal). gamma_pop: 1/T1 (diagonal).
+    k_chunk  : k-points processed at once in the frequency solve (memory knob).
+
+    Returns
+    -------
+    dict with ``freq`` (Nt, angular), ``J_omega`` {s: (Nt, dim) complex spectrum},
+    ``J_t`` {s: (Nt, dim) complex time-domain current}, one per order s=1..max_order.
+    """
+    E_t = np.asarray(E_t, dtype=np.complex128)
+    Nt, dim_in = E_t.shape
+    if gamma_pop is None:
+        gamma_pop = gamma
+    nb, nk, dim, diag = band.nb, band.nk, band.dim, band.diag
+    eps, valid, A, vel = band.eps, band.valid, band.A, band.vel
+    f, dfde = band.f, band.dfde
+    shape, U_mesh, Udag, dks = band.shape, band.U_mesh, band.Udag, band.dks
+    fmn = f[:, None, :] - f[:, :, None]
+
+    freq = 2.0 * np.pi * np.fft.fftfreq(Nt, d=dt)          # angular frequency grid
+    Gamma = np.full((nb, nb), gamma)
+    np.fill_diagonal(Gamma, gamma_pop)
+    iGamma = 1j * Gamma                                     # (nb, nb)
+    w_k = np.asarray(weights, dtype=np.float64).reshape(nk)
+    if k_chunk is None:
+        k_chunk = max(1, int(2_000_000 // (nb * nb * max(Nt, 1))))
+
+    # The propagator 1/(−ω − ε_mn + iΓ_mn) is ORDER-INDEPENDENT: build it ONCE
+    # (chunked to bound the temporary) so every order is a multiply, not a divide.
+    # Sign of ω follows numpy's ifft convention x(t)=Σ X(ω)e^{+iωt}: the physical
+    # response at output frequency Ω (e^{-iΩt}) sits in the −Ω bin, so (Ω − ε_mn + iΓ)
+    # becomes (−ω − ε_mn + iΓ), reproducing the closed form (sω − ε + iγ) at each sω.
+    inv_denom = np.empty((nk, nb, nb, Nt), dtype=np.complex128)
+    for k0 in range(0, nk, k_chunk):
+        k1 = min(k0 + k_chunk, nk)
+        inv_denom[k0:k1] = 1.0 / (-freq[None, None, None, :]
+                                  - eps[k0:k1, :, :, None]
+                                  + iGamma[None, :, :, None])
+
+    # v_i weighted by the BZ measure, TRANSPOSED (m<->n) so the trace Tr[v_i ρ] =
+    # Σ_mn v_i[m,n] ρ[n,m] becomes a plain index-aligned contraction that tensordot
+    # routes through BLAS (an m<->n-transposed einsum falls back to a slow loop).
+    vwT = [(vel[i] * w_k[:, None, None]).swapaxes(1, 2).copy() for i in range(dim)]
+
+    def _current(rho_omega, s):
+        # J^(s)_i(ω) = i^(s-1) Σ_k w_k Tr[v_i ρ^(s)(ω)] (physical phase -> J(t) real).
+        phase = 1j ** (s - 1)
+        Jw = np.empty((Nt, 3), dtype=np.complex128)
+        for i in range(dim):
+            Jw[:, i] = phase * np.tensordot(vwT[i], rho_omega, axes=([0, 1, 2], [0, 1, 2]))
+        return Jw, np.fft.ifft(Jw, axis=0)
+
+    # Wilson links are time- AND order-independent -> precompute ONCE per direction.
+    active_dirs = [b for b in range(dim) if np.any(np.abs(E_t[:, b]) > 1e-40)]
+    links = {}
+    for b in active_dirs:
+        Up = np.roll(U_mesh, -1, axis=b).reshape(nk, nb, nb)
+        Un = np.roll(U_mesh, +1, axis=b).reshape(nk, nb, nb)
+        wp = Udag @ Up
+        wm = Udag @ Un
+        links[b] = (wp, np.conj(np.swapaxes(wp, -1, -2)),
+                    wm, np.conj(np.swapaxes(wm, -1, -2)))
+
+    def _transport(Rx, wl, wr):
+        # wl @ Rx @ wr for Rx (nk,nb,nb,Nt), via BLAS batched matmul (much faster
+        # than a 3-operand einsum with an uncontracted time axis).
+        s1 = (wl @ Rx.reshape(nk, nb, nb * Nt)).reshape(nk, nb, nb, Nt)
+        s2 = np.matmul(np.swapaxes(s1, 2, 3), wr[:, None])   # (nk,nb,Nt,nb)
+        return np.swapaxes(s2, 2, 3)
+
+    def cov_grad_t(R, b):                                  # R: (nk,nb,nb,Nt)
+        wp, wpd, wm, wmd = links[b]
+        Rm = R.reshape(*shape, nb, nb, Nt)
+        Rp = np.roll(Rm, -1, axis=b).reshape(nk, nb, nb, Nt)
+        Rn = np.roll(Rm, +1, axis=b).reshape(nk, nb, nb, Nt)
+        return (_transport(Rp, wp, wpd) - _transport(Rn, wm, wmd)) / (2.0 * dks[b])
+
+    # ---- order 1: source operators are time-independent, scaled by E_α(t) ----
+    E_w = np.fft.fft(E_t, axis=0)                          # (Nt, dim)
+    num = np.zeros((nk, nb, nb, Nt), dtype=np.complex128)
+    for c in range(dim):
+        Sc = np.where(valid, A[c] * fmn, 0.0 + 0.0j)
+        Sc[:, diag, diag] += (-1j) * dfde * np.real(vel[c][:, diag, diag])
+        num += Sc[:, :, :, None] * E_w[None, None, None, :, c]
+    rho_omega = num * inv_denom
+    del num
+    J_omega, J_t = {}, {}
+    J_omega[1], J_t[1] = _current(rho_omega, 1)
+    if progress_cb is not None:
+        progress_cb(1)
+
+    # ---- orders ≥2: only the PREVIOUS order's ρ(t) is kept (bounded memory) ----
+    rho_t_prev = np.fft.ifft(rho_omega, axis=-1) if max_order >= 2 else None
+    for s in range(2, max_order + 1):
+        S_t = np.zeros((nk, nb, nb, Nt), dtype=np.complex128)
+        for b in active_dirs:
+            S_t += cov_grad_t(rho_t_prev, b) * E_t[None, None, None, :, b]
+        rho_omega = np.fft.fft(S_t, axis=-1) * inv_denom
+        del S_t
+        J_omega[s], J_t[s] = _current(rho_omega, s)
+        if s < max_order:
+            rho_t_prev = np.fft.ifft(rho_omega, axis=-1)
+        if progress_cb is not None:
+            progress_cb(s)
+    return {"freq": freq, "J_omega": J_omega, "J_t": J_t}
 
 
 def uniform_mp_grid(bounds, shape):
