@@ -112,6 +112,29 @@ def _bz_radial_mask_weights(
     return np.asarray(weights.reshape(-1), dtype=np.float64)
 
 
+def _mesh_parallel_settings(config: QXTIConfig) -> tuple[int | None, float]:
+    """(n_workers, reserve_gb) for the streaming mesh engine, from ``[cmd]``.
+
+    ``n_workers`` <= 0 -> None (engine uses all performance cores).  ``reserve_gb``
+    defaults to 1 GB (RAM always kept free) if the config predates the field.
+    """
+    ccfg = getattr(config, "cmd", None)
+    nw = int(getattr(ccfg, "n_workers", 0) or 0)
+    reserve = float(getattr(ccfg, "reserve_gb", 1.0))
+    return (None if nw <= 0 else nw), reserve
+
+
+def _model_h_batch(hamiltonian: Any):
+    """Return a vectorized ``kpts->(nk,nb,nb)`` builder if the model exposes
+    ``H_batch`` (big speedup on large grids); else None (per-k fallback)."""
+    module = getattr(hamiltonian, "_module", None)
+    fn = getattr(module, "H_batch", None)
+    if callable(fn):
+        params = dict(getattr(hamiltonian, "params", {}) or {})
+        return lambda kp: fn(kp, params)
+    return None
+
+
 def build_k_integration_weights(
     config: QXTIConfig,
     *,
@@ -553,7 +576,7 @@ def compute_hhg_spectrum(
         # Single VECTORIZED mesh recursion for ALL orders (1..max) -- replaces the old
         # per-k rho_order_s loop, the double-counting order-2 tensor path, AND the
         # separate interband-only sigma^(1) pass for order 1.
-        from qxti.analytics.mesh_response import precompute_band_data, harmonic_currents
+        from qxti.analytics.mesh_response import harmonic_currents_meshed, default_worker_count
         weights = build_k_integration_weights(config, hamiltonian=hamiltonian, kgrid=kgrid,
                                               extra_k_weight_mask=extra_k_weight_mask)
         k_points = kgrid.points()
@@ -561,27 +584,33 @@ def compute_hhg_spectrum(
         bounds = hamiltonian.reciprocal_box_bounds()
         E_field = np.asarray(list(E_cw) + [0.0] * (3 - dim), dtype=complex)
         from qxti.utils.progress import ProgressTimer, format_duration
+        # Memory-safe + multi-core: n_workers/reserve from [cmd]; use the model's
+        # vectorized H_batch when it exposes one (big speedup on large grids).
+        n_workers, reserve_gb = _mesh_parallel_settings(config)
+        h_batch = _model_h_batch(hamiltonian)
         if progress:
-            print(f"[theory-HHG] orders 1..{max_order}: vectorized mesh recursion "
-                  f"({nk} k-points). Progress with ETA below.", flush=True)
+            print(f"[theory-HHG] orders 1..{max_order}: memory-safe streaming mesh recursion "
+                  f"({nk} k-points, up to {n_workers or default_worker_count()} cores, "
+                  f">={reserve_gb:g} GB RAM kept free). Progress with ETA below.", flush=True)
         _t_band = time.perf_counter()
-        band = precompute_band_data(hamiltonian._matrix_at, k_points, shape, bounds,
-                                    mu=mu, T_au=temperature, dimension=dim,
-                                    distribution=distribution)
+        _btimer = ProgressTimer(total=1)
+
+        def _block_cb(done, total):
+            _btimer.total = max(1, total)
+            _btimer.completed = done
+            if progress and (done == 1 or done == total or done % max(1, total // 10) == 0):
+                print(f"[theory-HHG] mesh block {done}/{total} "
+                      f"-- elapsed {format_duration(_btimer.elapsed_seconds)}, "
+                      f"ETA {_btimer.eta_text()}.", flush=True)
+
+        J_all = harmonic_currents_meshed(
+            hamiltonian._matrix_at, k_points, shape, bounds, weights, E_field, omega0, max_order,
+            gamma=gamma, gamma_pop=gamma, mu=mu, T_au=temperature, dimension=dim,
+            distribution=distribution, n_workers=n_workers, reserve_gb=reserve_gb,
+            h_batch=h_batch, progress_cb=_block_cb)
         if progress:
-            print(f"[theory-HHG] band data ready (batched eigh over {nk} k-points): "
-                  f"elapsed {format_duration(time.perf_counter() - _t_band)}.", flush=True)
-        _otimer = ProgressTimer(total=max(1, max_order - 1))   # order callbacks 2..max_order
-
-        def _order_cb(s):
-            _otimer.advance()
-            if progress:
-                print(f"[theory-HHG] order {s}/{max_order} (rho^({s})({s}*omega)) done "
-                      f"-- elapsed {format_duration(_otimer.elapsed_seconds)}, "
-                      f"ETA {_otimer.eta_text()}.", flush=True)
-
-        J_all = harmonic_currents(band, weights, E_field, omega0, max_order,
-                                  gamma=gamma, gamma_pop=gamma, progress_cb=_order_cb)
+            print(f"[theory-HHG] mesh recursion done: elapsed "
+                  f"{format_duration(time.perf_counter() - _t_band)}.", flush=True)
         for s in range(1, max_order + 1):
             Js = -np.asarray(J_all[s][:dim], dtype=np.complex128)   # sum_k w Tr[-v rho^(s)]
             harmonic_peaks[s] = Js
@@ -659,7 +688,10 @@ def _mesh_susceptibility(hamiltonian, kgrid, omega_axis, weights, ccfg, orders_g
     components only (matches ``_susc_available_indices``); the SAME convention as the
     old orders>=3 branch:  sigma = conj( sum_k w_k Tr[(-v_i) rho^(s)] ).
     """
-    from qxti.analytics.mesh_response import precompute_band_data, harmonic_currents
+    from concurrent.futures import ThreadPoolExecutor
+    from qxti.analytics.mesh_response import (precompute_band_data, harmonic_currents,
+                                              default_worker_count, _LIVE_ARRAYS_PER_PLANE)
+    from qxti.utils import memory as _mem
     dim = int(hamiltonian.dimension)
     shape = tuple(int(kgrid.shape[a]) for a in range(3))
     kpts = np.asarray(kgrid.points(), dtype=np.float64)
@@ -672,36 +704,55 @@ def _mesh_susceptibility(hamiltonian, kgrid, omega_axis, weights, ccfg, orders_g
     max_s = max(orders_ge2)
     omega_axis = np.asarray(omega_axis, dtype=np.float64)
     nw = omega_axis.size
+    n_workers = int(getattr(ccfg, "n_workers", 0) or 0) or default_worker_count()
+    reserve_gb = float(getattr(ccfg, "reserve_gb", 1.0))
+
+    # RAM guard: the shared band data + one recursion per thread must fit.  eigh is
+    # done ONCE and reused across (freq x dir), so it never exceeds the full mesh.
+    nb = int(hamiltonian.basis_size)
+    band_bytes = kpts.shape[0] * nb * nb * 16.0 * _LIVE_ARRAYS_PER_PLANE
+    _mem.ensure_headroom(band_bytes, reserve_gb=reserve_gb, label="theory-susc band")
 
     if progress:
         print(f"[theory-susc] orders {list(orders_ge2)}: vectorized mesh recursion "
               f"({kpts.shape[0]} k-points, batched eigh once), {nw} frequencies x "
-              f"{dim} directions. Progress with ETA below.", flush=True)
+              f"{dim} directions on up to {n_workers} cores. Progress with ETA below.",
+              flush=True)
 
     from qxti.utils.progress import ProgressTimer, format_duration
-    timer = ProgressTimer(total=nw)
-    step = max(1, nw // 20)   # ~20 ETA updates over the sweep (don't spam huge nw)
-
     band = precompute_band_data(hamiltonian._matrix_at, kpts, shape, bounds,
                                 mu=mu, T_au=T_au, dimension=dim,
                                 distribution=distribution)
     sig = {s: np.full((nw,) + (dim,) * (s + 1), np.nan + 1j * np.nan, np.complex128)
            for s in orders_ge2}
-    for iw, omega in enumerate(omega_axis):
-        for j in range(dim):
-            E_field = np.zeros(3, dtype=np.complex128)
-            E_field[j] = 1.0
-            J = harmonic_currents(band, weights, E_field, float(omega), max_s,
-                                  gamma=gamma, gamma_pop=gamma)
-            for s in orders_ge2:
-                for i in range(dim):
-                    sig[s][(iw, i) + (j,) * s] = np.conj(-J[s][i])
+
+    def _one(iw_j):
+        iw, j = iw_j
+        E_field = np.zeros(3, dtype=np.complex128); E_field[j] = 1.0
+        J = harmonic_currents(band, weights, E_field, float(omega_axis[iw]), max_s,
+                              gamma=gamma, gamma_pop=gamma)
+        return iw, j, J
+
+    tasks = [(iw, j) for iw in range(nw) for j in range(dim)]
+    timer = ProgressTimer(total=len(tasks)); step = max(1, len(tasks) // 20)
+
+    def _store(iw, j, J):
+        for s in orders_ge2:
+            for i in range(dim):
+                sig[s][(iw, i) + (j,) * s] = np.conj(-J[s][i])
         timer.advance()
-        if progress and (iw % step == 0 or iw == nw - 1):
-            print(f"[theory-susc] frequency {timer.completed}/{nw} "
-                  f"(omega={float(omega):.5f}) done -- elapsed "
-                  f"{format_duration(timer.elapsed_seconds)}, ETA {timer.eta_text()}.",
+        if progress and (timer.completed % step == 0 or timer.completed == len(tasks)):
+            print(f"[theory-susc] {timer.completed}/{len(tasks)} (freq x dir) done -- "
+                  f"elapsed {format_duration(timer.elapsed_seconds)}, ETA {timer.eta_text()}.",
                   flush=True)
+
+    if n_workers <= 1:
+        for t in tasks:
+            _store(*_one(t))
+    else:
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            for iw, j, J in ex.map(_one, tasks):
+                _store(iw, j, J)
     return sig
 
 

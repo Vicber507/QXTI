@@ -247,8 +247,11 @@ class CMDConfig:
     solver_min_factor: float = 0.2
     solver_max_factor: float = 4.0
     save_frequency_domain: bool = False
-    # Number of parallel workers for the k-point loop (0 = use all logical CPUs).
+    # Number of parallel workers for the k-point loop (0 = use all performance cores).
     n_workers: int = 0
+    # RAM (GB) the streaming mesh engine always keeps free so the machine never
+    # swaps itself to death; the block size adapts to honor it (any OS).
+    reserve_gb: float = 1.0
 
 
 @dataclass(slots=True)
@@ -348,6 +351,10 @@ class LDOSConfig:
     #                   in this mode, so the relevant observable is LDOS(r, E)
     #                   rather than A(k, E). Configured by the finite_* keys.
     method: str = "eigenvalues"
+    # Parallel workers for the (embarrassingly parallel) surface k-loops
+    # (0 = all performance cores) and RAM to keep free.
+    n_workers: int = 0
+    reserve_gb: float = 1.0
     # --- Surface/edge mode (method = surface) ---
     # Direction made semi-infinite: "x"|"y"|"z" or "auto" (z in 3D, y in 2D).
     surface_normal: str = "auto"
@@ -782,6 +789,7 @@ class QXTIConfig:
             solver_max_factor=section.getfloat("solver_max_factor", fallback=4.0),
             save_frequency_domain=section.getboolean("save_frequency_domain", fallback=False),
             n_workers=section.getint("n_workers", fallback=0),
+            reserve_gb=section.getfloat("reserve_gb", fallback=1.0),
         )
 
     @staticmethod
@@ -916,6 +924,8 @@ class QXTIConfig:
             enabled=section.getboolean("enabled", fallback=False),
             output_dir=section.get("output_dir", fallback="outputs/ldos").strip() or "outputs/ldos",
             method=section.get("method", fallback="eigenvalues").strip().lower() or "eigenvalues",
+            n_workers=section.getint("n_workers", fallback=0),
+            reserve_gb=section.getfloat("reserve_gb", fallback=1.0),
             surface_normal=section.get("surface_normal", fallback="auto").strip().lower() or "auto",
             surface_side=section.get("surface_side", fallback="both").strip().lower() or "both",
             surface_max_iter=section.getint("surface_max_iter", fallback=80),
