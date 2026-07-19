@@ -823,7 +823,7 @@ def _surface_compare_layers(lcfg: Any, normal: int) -> int:
 
 
 def _principal_layer_blocks(
-    Hf, kpar: np.ndarray, normal: int, c_n: float, n_kn: int
+    Hf, kpar: np.ndarray, normal: int, c_n: float, n_kn: int, h_batch=None
 ) -> tuple[ComplexArray, ComplexArray]:
     """Fourier-transform H along the normal into principal-layer blocks.
 
@@ -833,15 +833,18 @@ def _principal_layer_blocks(
         H00 = <H(k_n)>_{k_n},   H01 = <H(k_n) e^{-i k_n c}>_{k_n}.
 
     ``kpar`` is a full 3-vector whose normal component is overwritten by the
-    sampling; only its in-plane components matter.
+    sampling; only its in-plane components matter.  ``h_batch`` (if given) builds
+    all ``n_kn`` matrices in one vectorized call -> large speedup (the per-k
+    Python loop over the model H dominates the surface cost).
     """
     kn = np.linspace(-np.pi / c_n, np.pi / c_n, int(n_kn), endpoint=False)
-    k = np.array(kpar, dtype=np.float64)
-    mats = []
-    for knj in kn:
-        k[normal] = knj
-        mats.append(np.asarray(Hf(float(k[0]), float(k[1]), float(k[2])), dtype=np.complex128))
-    Hs = np.array(mats)
+    kpts = np.repeat(np.array(kpar, dtype=np.float64)[None, :], kn.size, axis=0)
+    kpts[:, normal] = kn
+    if h_batch is not None:
+        Hs = np.asarray(h_batch(kpts), dtype=np.complex128)
+    else:
+        Hs = np.array([np.asarray(Hf(float(k[0]), float(k[1]), float(k[2])), dtype=np.complex128)
+                       for k in kpts])
     H00 = Hs.mean(axis=0)
     H01 = (Hs * np.exp(-1j * kn * c_n)[:, None, None]).mean(axis=0)
     H00 = 0.5 * (H00 + H00.conj().T)
@@ -898,10 +901,10 @@ def _sancho_surface_green(
 
 def _surface_spectral_vs_energy(
     Hf, kpar: np.ndarray, normal: int, c_n: float, energies: FloatArray, eta: float,
-    max_iter: int, tol: float, n_kn: int, side: str = "bottom",
+    max_iter: int, tol: float, n_kn: int, side: str = "bottom", h_batch=None,
 ) -> FloatArray:
     """A_surf(E) = -Im Tr G_s(k_par, E+i*eta)/pi for all energies at one k_par."""
-    H00, H01 = _principal_layer_blocks(Hf, kpar, normal, c_n, n_kn)
+    H00, H01 = _principal_layer_blocks(Hf, kpar, normal, c_n, n_kn, h_batch=h_batch)
     z = energies + 1j * eta
     g = _sancho_surface_green(z, H00, H01, max_iter, tol, side=side)
     return -np.imag(np.einsum("zii->z", g)) / np.pi
@@ -918,9 +921,10 @@ def _surface_observables_vs_energy(
     tol: float,
     n_kn: int,
     side: str = "bottom",
+    h_batch=None,
 ) -> tuple[FloatArray, FloatArray]:
     """Return total and orbital-resolved surface spectral weight vs energy."""
-    H00, H01 = _principal_layer_blocks(Hf, kpar, normal, c_n, n_kn)
+    H00, H01 = _principal_layer_blocks(Hf, kpar, normal, c_n, n_kn, h_batch=h_batch)
     z = energies + 1j * eta
     g = _sancho_surface_green(z, H00, H01, max_iter, tol, side=side)
     total = -np.imag(np.einsum("zii->z", g)) / np.pi
@@ -956,6 +960,15 @@ def compute_surface_spectrum(config: QXTIConfig, *, progress: bool = True) -> di
     side = str(getattr(lcfg, "surface_side", "bottom")).strip().lower() or "bottom"
     if side not in {"bottom", "top", "both"}:
         raise ValueError("ldos.surface_side must be one of: bottom, top, both.")
+    # Surface momenta are independent -> parallelize the Lopez-Sancho decimation
+    # across cores (each k does its own small linear algebra; embarrassingly par).
+    from concurrent.futures import ThreadPoolExecutor
+    from qxti.analytics.mesh_response import default_worker_count
+    from qxti.analytics.theory_response import _model_h_batch
+    n_workers = int(getattr(lcfg, "n_workers", 0) or 0) or default_worker_count()
+    # Vectorized H builder (if the model exposes H_batch): the per-k layer FT is
+    # the surface bottleneck -> building all n_kn layers at once is a big speedup.
+    h_batch = _model_h_batch(hamiltonian)
 
     num_e = max(int(lcfg.num_energies), 2)
     chunk = max(32, min(20000, int(5.0e6 / max(nb * num_e, 1))))
@@ -1012,22 +1025,30 @@ def compute_surface_spectrum(config: QXTIConfig, *, progress: bool = True) -> di
             spectral_bottom = np.zeros((num_k, num_e), dtype=np.float64)
             spectral_top = np.zeros((num_k, num_e), dtype=np.float64)
         timer = ProgressTimer(total=num_k)
-        for i in range(num_k):
+
+        def _path_row(i):
             if side == "both":
-                spectral_bottom[i] = _surface_spectral_vs_energy(
-                    Hf, path_k[i], normal, c_n, energies, eta, max_iter, tol, n_kn, side="bottom"
-                )
-                spectral_top[i] = _surface_spectral_vs_energy(
-                    Hf, path_k[i], normal, c_n, energies, eta, max_iter, tol, n_kn, side="top"
-                )
-                spectral[i] = spectral_bottom[i] + spectral_top[i]
-            else:
-                spectral[i] = _surface_spectral_vs_energy(
-                    Hf, path_k[i], normal, c_n, energies, eta, max_iter, tol, n_kn, side=side
-                )
-            timer.completed = i + 1
-            if progress and (i % max(1, num_k // 20) == 0 or i == num_k - 1):
-                print(f"[ldos-surface] path {i + 1}/{num_k}, ETA {timer.eta_text()}", flush=True)
+                b = _surface_spectral_vs_energy(Hf, path_k[i], normal, c_n, energies, eta,
+                                                max_iter, tol, n_kn, side="bottom", h_batch=h_batch)
+                t = _surface_spectral_vs_energy(Hf, path_k[i], normal, c_n, energies, eta,
+                                                max_iter, tol, n_kn, side="top", h_batch=h_batch)
+                return i, b, t
+            return i, _surface_spectral_vs_energy(Hf, path_k[i], normal, c_n, energies, eta,
+                                                  max_iter, tol, n_kn, side=side, h_batch=h_batch), None
+
+        def _emit(done):
+            timer.completed = done
+            if progress and (done % max(1, num_k // 20) == 0 or done == num_k):
+                print(f"[ldos-surface] path {done}/{num_k} ({n_workers} cores), "
+                      f"ETA {timer.eta_text()}", flush=True)
+
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            for n, (i, a, b) in enumerate(ex.map(_path_row, range(num_k)), 1):
+                if side == "both":
+                    spectral_bottom[i] = a; spectral_top[i] = b; spectral[i] = a + b
+                else:
+                    spectral[i] = a
+                _emit(n)
 
     # --- Constant-energy surface map A_surf(kx, ky; E0) ---
     plane = plane_bottom = plane_top = plane_kx = plane_ky = None
@@ -1053,20 +1074,30 @@ def compute_surface_spectrum(config: QXTIConfig, *, progress: bool = True) -> di
             plane_top = np.zeros((ky_vals.size, kx_vals.size), dtype=np.float64)
         if progress:
             print(f"[ldos-surface] constant-energy map E0={plane_energy:.4g} a.u. "
-                  f"({ky_vals.size}x{kx_vals.size}) ...", flush=True)
-        for iy, ky in enumerate(ky_vals):
+                  f"({ky_vals.size}x{kx_vals.size}, {n_workers} cores) ...", flush=True)
+
+        def _plane_row(iy):
+            ky = ky_vals[iy]
+            rb = np.zeros(kx_vals.size); rt = np.zeros(kx_vals.size); rtot = np.zeros(kx_vals.size)
             for ix, kx in enumerate(kx_vals):
                 kpar = np.array([kx, ky, float(lcfg.spectral_plane_kz)], dtype=np.float64)
-                H00, H01 = _principal_layer_blocks(Hf, kpar, normal, c_n, n_kn)
+                H00, H01 = _principal_layer_blocks(Hf, kpar, normal, c_n, n_kn, h_batch=h_batch)
                 if side == "both":
-                    g_bottom = _sancho_surface_green(z0, H00, H01, max_iter, tol, side="bottom")
-                    g_top = _sancho_surface_green(z0, H00, H01, max_iter, tol, side="top")
-                    plane_bottom[iy, ix] = float(-np.imag(np.trace(g_bottom[0])) / np.pi)
-                    plane_top[iy, ix] = float(-np.imag(np.trace(g_top[0])) / np.pi)
-                    plane[iy, ix] = plane_bottom[iy, ix] + plane_top[iy, ix]
+                    gb = _sancho_surface_green(z0, H00, H01, max_iter, tol, side="bottom")
+                    gt = _sancho_surface_green(z0, H00, H01, max_iter, tol, side="top")
+                    rb[ix] = -np.imag(np.trace(gb[0])) / np.pi
+                    rt[ix] = -np.imag(np.trace(gt[0])) / np.pi
+                    rtot[ix] = rb[ix] + rt[ix]
                 else:
                     g = _sancho_surface_green(z0, H00, H01, max_iter, tol, side=side)
-                    plane[iy, ix] = float(-np.imag(np.trace(g[0])) / np.pi)
+                    rtot[ix] = -np.imag(np.trace(g[0])) / np.pi
+            return iy, rb, rt, rtot
+
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            for iy, rb, rt, rtot in ex.map(_plane_row, range(ky_vals.size)):
+                plane[iy] = rtot
+                if side == "both":
+                    plane_bottom[iy] = rb; plane_top[iy] = rt
         plane_kx, plane_ky = kx_vals, ky_vals
 
     # --- Surface LDOS g_surf(E): integrate A_surf over the in-plane grid ---
@@ -1093,10 +1124,12 @@ def compute_surface_spectrum(config: QXTIConfig, *, progress: bool = True) -> di
                     kpar[inplane[1]] = v1
                 if side == "both":
                     total_bottom, orbital_bottom = _surface_observables_vs_energy(
-                        Hf, kpar, normal, c_n, energies, eta, max_iter, tol, n_kn, side="bottom"
+                        Hf, kpar, normal, c_n, energies, eta, max_iter, tol, n_kn, side="bottom",
+                        h_batch=h_batch
                     )
                     total_top, orbital_top = _surface_observables_vs_energy(
-                        Hf, kpar, normal, c_n, energies, eta, max_iter, tol, n_kn, side="top"
+                        Hf, kpar, normal, c_n, energies, eta, max_iter, tol, n_kn, side="top",
+                        h_batch=h_batch
                     )
                     if bool(lcfg.surface_ldos_enabled):
                         dos_bottom += total_bottom
@@ -1108,7 +1141,8 @@ def compute_surface_spectrum(config: QXTIConfig, *, progress: bool = True) -> di
                         surface_pdos += orbital_bottom + orbital_top
                 else:
                     total_side, orbital_side = _surface_observables_vs_energy(
-                        Hf, kpar, normal, c_n, energies, eta, max_iter, tol, n_kn, side=side
+                        Hf, kpar, normal, c_n, energies, eta, max_iter, tol, n_kn, side=side,
+                        h_batch=h_batch
                     )
                     if bool(lcfg.surface_ldos_enabled):
                         surface_dos += total_side

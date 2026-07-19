@@ -32,15 +32,33 @@ All quantities in atomic units (ℏ = e = 1).
 """
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
 import numpy as np
 from numpy.typing import NDArray
 
+from qxti.utils import memory as _mem
+
 ComplexArray = NDArray[np.complex128]
 FloatArray = NDArray[np.float64]
 
 _KB_AU = 3.1668114e-6  # Boltzmann constant in Hartree / K
+
+
+def default_worker_count() -> int:
+    """Best default core count for the mesh engine.
+
+    Reuses CMD's performance-core detection (on Apple Silicon / heterogeneous
+    CPUs the optimum is the number of PERFORMANCE cores; efficiency cores + GIL
+    contention make extra threads slower).  Lazy import avoids an import cycle.
+    """
+    try:
+        from qxti.response.cmd import _default_worker_count as _wc
+        return _wc()
+    except Exception:
+        return max(1, (os.cpu_count() or 2) // 2)
 
 
 def _fermi(E: FloatArray, mu: float, T_au: float) -> FloatArray:
@@ -211,6 +229,230 @@ def harmonic_currents(band: BandData, weights, E_field, omega, max_order, *,
     return currents
 
 
+# Per-plane peak live footprint of the streaming recursion, in units of
+# (nb*nb complex128) arrays (band build + r/rho/src/cov-grad temporaries). Kept
+# a touch conservative so block sizing errs small; the RAM guard checks the true
+# concurrent peak against live RAM before launching.
+_LIVE_ARRAYS_PER_PLANE = 14.0
+
+
+def _plan_stream(n0, bytes_per_plane, halo, n_workers_req, reserve_gb, cap):
+    """Decide (mode, n_workers, block_planes) for the memory-safe stream.
+
+    mode 'single' -> whole mesh in one pass (roll wraps periodically, no halo).
+    mode 'block'  -> contiguous interior blocks of ``block_planes`` (+halo each
+    side); up to ``n_workers`` processed CONCURRENTLY, so the block is sized for
+    ``n_workers × (block+2·halo) × bytes_per_plane ≤ budget``.
+
+    When a single pass would exceed the budget we prefer BLOCKING (slower but
+    safe) over failing; only a truly impossible case (1 plane won't fit) falls
+    through, where the caller's headroom check raises with a clear message.
+    """
+    budget = _mem.memory_budget_bytes(reserve_gb)
+    if cap >= n0 and (budget <= 0 or n0 * bytes_per_plane <= budget):
+        return "single", 1, n0
+    w_cap = max(1, int(n_workers_req))
+    for w in range(w_cap, 0, -1):
+        fit = int((budget / w) // bytes_per_plane) - 2 * halo
+        if cap:
+            fit = min(fit, int(cap))
+        if fit >= 1:
+            bs = max(1, min(fit, -(-n0 // w)))    # >= w blocks so workers stay busy
+            return "block", w, bs
+    return "block", 1, max(1, min(int(cap) if cap else 1, 1))
+
+
+def harmonic_currents_meshed(
+    H_func: Callable,
+    kpts: FloatArray,
+    shape: tuple[int, int, int],
+    bounds: tuple[tuple[float, float], ...],
+    weights: FloatArray,
+    E_field,
+    omega: float,
+    max_order: int,
+    *,
+    gamma: float = 1e-3,
+    gamma_pop: float | None = None,
+    mu: float = 0.0,
+    T_au: float = 0.0,
+    dimension: int = 3,
+    dk_vel: float = 1e-4,
+    distribution=None,
+    n_workers: int | None = None,
+    reserve_gb: float = 1.0,
+    max_block_planes: int | None = None,
+    h_batch: Callable | None = None,
+    progress_cb: Callable | None = None,
+) -> dict[int, ComplexArray]:
+    """Memory-safe + multi-core BZ-summed harmonic currents from ``H_func``.
+
+    Same result as ``precompute_band_data`` + ``harmonic_currents`` (bit-exact),
+    but streams the k-mesh in blocks of planes (halo = ``max_order-1`` -> the
+    covariant-gradient interior is exact) and runs blocks CONCURRENTLY on a
+    ``ThreadPoolExecutor``.  Block thickness is chosen from the RAM available at
+    run time so ``n_workers`` concurrent blocks always leave ``reserve_gb`` free
+    (Linux/macOS/Windows).  Falls back to a single full-mesh pass when it fits.
+
+    ``n_workers`` : max cores to use (None -> all logical CPUs; 1 -> serial).
+    ``reserve_gb``: RAM to keep free.  ``h_batch``: optional vectorized builder.
+
+    ``E_field`` may be a single complex 3-vector OR an ``(F, 3)`` stack of drive
+    amplitudes; with a stack, band data is built ONCE per block and reused across
+    all F fields (efficient tensor fits), and the return is a length-F list.
+    Returns ``{s: J^(s)}`` (single field) or ``[{s: J^(s)}, ...]`` (F fields).
+    """
+    n0, n1, n2 = int(shape[0]), int(shape[1]), int(shape[2])
+    dim = int(dimension)
+    nb = None
+    E_in = np.asarray(E_field, dtype=np.complex128)
+    single_field = (E_in.ndim == 1)
+    E_arr = E_in.reshape(1, -1) if single_field else E_in       # (F, 3)
+    nF = E_arr.shape[0]
+    if gamma_pop is None:
+        gamma_pop = gamma
+    dks = [(float(bounds[a][1]) - float(bounds[a][0])) / shape[a] for a in range(dim)]
+    halo = int(max_order) - 1
+    n_workers = default_worker_count() if n_workers is None else max(1, int(n_workers))
+
+    build = (lambda kp: np.asarray(h_batch(kp), dtype=np.complex128)) if h_batch is not None \
+        else (lambda kp: _build_H_mesh(H_func, kp))
+
+    kmesh = np.asarray(kpts, dtype=np.float64).reshape(n0, n1, n2, 3)
+    wmesh = np.asarray(weights, dtype=np.float64).reshape(n0, n1, n2)
+
+    nb = int(build(kmesh[:1, :1, :1].reshape(1, 3)).shape[1])
+    bytes_per_plane = n1 * n2 * nb * nb * 16.0 * _LIVE_ARRAYS_PER_PLANE
+    cap = int(max_block_planes) if max_block_planes else n0
+    mode, n_workers, bs = _plan_stream(n0, bytes_per_plane, halo, n_workers, reserve_gb, cap)
+    single = mode == "single"
+
+    def _band_and_current(plane_idx, interior):
+        """Band build once + recursion per field on one (block+halo).
+
+        Returns a length-F list of ``{s: Js(3,)}`` (F = number of drive fields).
+        """
+        P = plane_idx.size
+        kb = kmesh[plane_idx].reshape(P * n1 * n2, 3)
+        bshape = (P, n1, n2)
+        Hm = build(kb)
+        energies, U = np.linalg.eigh(Hm)
+        Udag = np.conj(np.swapaxes(U, -1, -2)); del Hm
+        vel = []
+        for a in range(dim):
+            sh = np.zeros(3); sh[a] = dk_vel
+            vel.append(Udag @ ((build(kb + sh) - build(kb - sh)) / (2 * dk_vel)) @ U)
+        f = _fermi(energies, mu, T_au) if distribution is None \
+            else np.asarray(distribution(energies, mu, T_au), dtype=np.float64)
+        dfde = _dfde(f, T_au)
+        eps = energies[:, :, None] - energies[:, None, :]
+        offdiag = ~np.eye(nb, dtype=bool)
+        valid = offdiag[None] & (np.abs(eps) > 1e-12)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            inv_eps = np.where(valid, 1.0 / eps, 0.0)
+        A = [1j * vel[a] * inv_eps for a in range(dim)]
+        diag = np.arange(nb)
+        fmn = f[:, None, :] - f[:, :, None]
+        U_mesh = U.reshape(*bshape, nb, nb)
+        w_full = wmesh[plane_idx].reshape(P * n1 * n2)
+        int_flat = np.repeat(np.isin(np.arange(P), np.arange(interior.start, interior.stop)),
+                             n1 * n2)
+
+        ow1_coh = complex(omega + 1j * gamma)
+        ow1_pop = complex(omega + 1j * gamma_pop)
+        Gamma = np.full((nb, nb), gamma); np.fill_diagonal(Gamma, gamma_pop)
+        iGamma = 1j * Gamma[None]
+        # E-independent order-1 building blocks r_c (coherent + intraband); reused
+        # across all F drive fields so the eigh/velocity build happens ONCE.
+        r_c = []
+        for c in range(dim):
+            with np.errstate(divide="ignore", invalid="ignore"):
+                r = np.where(valid, (A[c] * fmn) / (ow1_coh - eps), 0.0)
+            r[:, diag, diag] += (-1j) * dfde * np.real(vel[c][:, diag, diag]) / ow1_pop
+            r_c.append(r)
+        vint = [vel[i][int_flat] for i in range(dim)]
+        wint = w_full[int_flat]
+
+        def cov_grad(R, b):
+            Up = np.roll(U_mesh, -1, axis=b).reshape(P * n1 * n2, nb, nb)
+            Un = np.roll(U_mesh, +1, axis=b).reshape(P * n1 * n2, nb, nb)
+            wp = Udag @ Up; wm = Udag @ Un
+            Rm = R.reshape(*bshape, nb, nb)
+            Rp = np.roll(Rm, -1, axis=b).reshape(P * n1 * n2, nb, nb)
+            Rn = np.roll(Rm, +1, axis=b).reshape(P * n1 * n2, nb, nb)
+            return (wp @ Rp @ np.conj(np.swapaxes(wp, -1, -2))
+                    - wm @ Rn @ np.conj(np.swapaxes(wm, -1, -2))) / (2.0 * dks[b])
+
+        def _trace_J(rho_s):
+            Js = np.zeros(3, dtype=np.complex128)
+            ri = rho_s[int_flat]
+            for i in range(dim):
+                tr = np.einsum("kmn,knm->k", vint[i], ri, optimize=True)
+                Js[i] = np.sum(tr * wint)
+            return Js
+
+        results = []
+        for ef in range(nF):
+            E = E_arr[ef]
+            rho = np.zeros((P * n1 * n2, nb, nb), dtype=np.complex128)
+            for c in range(dim):
+                if abs(E[c]) >= 1e-40:
+                    rho += E[c] * r_c[c]
+            Js_by_order = {1: _trace_J(rho)}
+            for s in range(2, max_order + 1):
+                src = np.zeros((P * n1 * n2, nb, nb), dtype=np.complex128)
+                for b in range(dim):
+                    if abs(E[b]) >= 1e-40:
+                        src += E[b] * cov_grad(rho, b)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    denom = s * omega + iGamma - eps
+                    rho = np.where(np.abs(denom) > 0, src / denom, 0.0)
+                Js_by_order[s] = _trace_J(rho)
+            results.append(Js_by_order)
+        return results
+
+    # ---- build the block list (interior tiling) ------------------------------
+    jobs = []
+    if single:
+        jobs.append((np.arange(n0), slice(0, n0)))
+    else:
+        lo = 0
+        while lo < n0:
+            hi = min(lo + bs, n0)
+            plane_idx = np.arange(lo - halo, hi + halo) % n0
+            jobs.append((plane_idx, slice(halo, halo + (hi - lo))))
+            lo = hi
+
+    # ---- one concurrency-aware RAM check, then run ---------------------------
+    # Peak = (#blocks running at once) × (largest block+halo).  ThreadPoolExecutor
+    # caps concurrency at n_workers, so this bounds the true peak footprint.
+    max_block_planes_live = max((j[0].size for j in jobs), default=n0)
+    concurrent = 1 if (single or n_workers <= 1) else min(n_workers, len(jobs))
+    _mem.ensure_headroom(concurrent * max_block_planes_live * bytes_per_plane,
+                         reserve_gb=reserve_gb, label="mesh-stream (concurrent peak)")
+
+    totals = [{s: np.zeros(3, dtype=np.complex128) for s in range(1, max_order + 1)}
+              for _ in range(nF)]
+    done = [0]
+
+    def _accumulate(part):                        # part = list of F dicts
+        for ef in range(nF):
+            for s in part[ef]:
+                totals[ef][s] += part[ef][s]
+        done[0] += 1
+        if progress_cb is not None:
+            progress_cb(done[0], len(jobs))
+
+    if concurrent <= 1:
+        for job in jobs:
+            _accumulate(_band_and_current(*job))
+    else:
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            for part in ex.map(lambda j: _band_and_current(*j), jobs):
+                _accumulate(part)
+    return totals[0] if single_field else totals
+
+
 def mesh_harmonic_currents(
     H_func: Callable,
     kpts: FloatArray,
@@ -228,29 +470,20 @@ def mesh_harmonic_currents(
     dimension: int = 3,
     dk_vel: float = 1e-4,
     distribution=None,
+    n_workers: int | None = None,
+    reserve_gb: float = 1.0,
+    h_batch: Callable | None = None,
 ) -> dict[int, ComplexArray]:
     """BZ-summed harmonic currents J^(s)_i = Σ_k w_k Tr[v_i ρ^(s)(k, s·ω)].
 
-    Parameters
-    ----------
-    H_func      : H(kx,ky,kz) -> (nb,nb) hermitian, atomic units.
-    kpts        : (nk, 3) k-points, C-ordered to match ``shape``.
-    shape       : (nkx, nky, nkz) mesh shape (for the covariant gradient rolls).
-    bounds      : per-axis (lo, hi) of the reciprocal box (for grid spacing).
-    weights     : (nk,) BZ quadrature weights.
-    E_field     : complex 3-vector — amplitude of the e^{-iωt} drive.
-    max_order   : highest order s to compute.
-    gamma       : coherence dephasing 1/T2 (off-diagonal denominators).
-    gamma_pop   : population dephasing 1/T1 (diagonal); default = gamma.
-    Returns
-    -------
-    {s: J^(s)} for s = 1..max_order, each a complex 3-vector.
+    Thin wrapper over the memory-safe + multi-core streaming engine
+    :func:`harmonic_currents_meshed` (single full-mesh pass when it fits).
     """
-    band = precompute_band_data(H_func, kpts, shape, bounds, mu=mu, T_au=T_au,
-                                dimension=dimension, dk_vel=dk_vel,
-                                distribution=distribution)
-    return harmonic_currents(band, weights, E_field, omega, max_order,
-                             gamma=gamma, gamma_pop=gamma_pop)
+    return harmonic_currents_meshed(
+        H_func, kpts, shape, bounds, weights, E_field, omega, max_order,
+        gamma=gamma, gamma_pop=gamma_pop, mu=mu, T_au=T_au, dimension=dimension,
+        dk_vel=dk_vel, distribution=distribution, n_workers=n_workers,
+        reserve_gb=reserve_gb, h_batch=h_batch)
 
 
 def perk_harmonic_currents(

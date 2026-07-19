@@ -104,7 +104,7 @@ def test_ldos_runner_saves_dataset_and_satisfies_sum_rule(tmp_path: Path) -> Non
     assert np.all(dos >= 0.0)
     # Sum rule: integral of g(E) equals the number of bands within a few percent
     # (the small deficit is broadening leaking past the finite energy window).
-    trapezoid = getattr(np, "trapezoid", np.trapz)
+    trapezoid = np.trapezoid if hasattr(np, "trapezoid") else np.trapz  # NumPy 2.x renamed trapz
     integral = float(trapezoid(dos, energies))
     assert integral == pytest.approx(2.0, rel=0.05)
     # Cumulative N(E) is monotonically non-decreasing.
