@@ -67,11 +67,11 @@ can drive three independent calculations, selected by a flag to `main.py`. Every
 family writes to a standardized folder derived from the input name, and
 `graphics.py` plots whichever families have data on disk.
 
-| Flag    | Section(s)                        | Engine / runner                              | Output dir                | Produces |
-|---------|-----------------------------------|----------------------------------------------|---------------------------|----------|
-| `-cmd`  | `[cmd]`, `[laser]`, `[timegrid]`  | `QXTISimulation` (CMD time-domain or theory) | `outputs/<model>/cmd`     | HHG current spectrum, harmonics |
-| `-xtp`  | `[xtp]` (includes the sweep solver) | `SusceptibilityScanRunner`                 | `outputs/<model>/xtp`     | σ(ω), χ⁽ⁿ⁾(ω) tensors |
-| `-ldos` | `[ldos]`                          | `LDOSRunner` → `qxti.analytics.dos`          | `outputs/<model>/ldos`    | DOS/PDOS plus bulk, surface (one/both faces), or finite-plate LDOS observables |
+| Flag      | Section(s)                             | Engine / runner                                | Output dir               | Produces                                                                       |
+| --------- | -------------------------------------- | ---------------------------------------------- | ------------------------ | ------------------------------------------------------------------------------ |
+| `-cmd`  | `[cmd]`, `[laser]`, `[timegrid]` | `QXTISimulation` (CMD time-domain or theory) | `outputs/<model>/cmd`  | HHG current spectrum, harmonics                                                |
+| `-xtp`  | `[xtp]` (includes the sweep solver)  | `SusceptibilityScanRunner`                   | `outputs/<model>/xtp`  | σ(ω), χ⁽ⁿ⁾(ω) tensors                                                   |
+| `-ldos` | `[ldos]`                             | `LDOSRunner` → `qxti.analytics.dos`       | `outputs/<model>/ldos` | DOS/PDOS plus bulk, surface (one/both faces), or finite-plate LDOS observables |
 
 `-cmd` was previously spelled `-hhg`, which is kept as a deprecated alias. The
 susceptibility-sweep solver parameters (relaxation times, distribution, gauge,

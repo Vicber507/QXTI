@@ -94,13 +94,20 @@ def valence_occupation(
     if energies.ndim == 0:
         return 1.0
 
-    flat = energies.reshape(-1)
-    occupations = np.zeros_like(flat, dtype=float)
-    occupied_count = flat.size // 2
-    if occupied_count > 0:
-        occupied_indices = np.argsort(flat, kind="stable")[:occupied_count]
-        occupations[occupied_indices] = 1.0
-    return _scalar_or_array(occupations.reshape(energies.shape))
+    # Fill the lowest Nb//2 bands PER k-point (the last axis is the band index;
+    # any leading axes are k).  This matches antelope's UniformValence and the
+    # docstring.  IMPORTANT: must be per-k -- a GLOBAL argsort over the whole
+    # (nk, nb) array mis-assigns fillings whenever the valence and conduction
+    # manifolds overlap in energy across the BZ (e.g. tilted Weyl cones), because
+    # it would occupy a low-energy conduction state at one k over a high-energy
+    # valence state at another.  (For a gapped/untilted model the two coincide.)
+    nb = energies.shape[-1]
+    nocc = nb // 2
+    occupations = np.zeros_like(energies, dtype=float)
+    if nocc > 0:
+        order = np.argsort(energies, axis=-1, kind="stable")
+        np.put_along_axis(occupations, order[..., :nocc], 1.0, axis=-1)
+    return _scalar_or_array(occupations)
 
 
 def full_occupation(

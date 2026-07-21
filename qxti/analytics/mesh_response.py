@@ -283,6 +283,7 @@ def harmonic_currents_meshed(
     reserve_gb: float = 1.0,
     max_block_planes: int | None = None,
     h_batch: Callable | None = None,
+    return_intraband: bool = False,
     progress_cb: Callable | None = None,
 ) -> dict[int, ComplexArray]:
     """Memory-safe + multi-core BZ-summed harmonic currents from ``H_func``.
@@ -383,12 +384,24 @@ def harmonic_currents_meshed(
             return (wp @ Rp @ np.conj(np.swapaxes(wp, -1, -2))
                     - wm @ Rn @ np.conj(np.swapaxes(wm, -1, -2))) / (2.0 * dks[b])
 
+        vint_diag = [vint[i][:, diag, diag] for i in range(dim)] if return_intraband else None
+
         def _trace_J(rho_s):
+            """Total current J_i = Σ_k w_k Tr[v_i ρ] = Σ_k w Σ_mn v_mn ρ_nm."""
             Js = np.zeros(3, dtype=np.complex128)
             ri = rho_s[int_flat]
             for i in range(dim):
                 tr = np.einsum("kmn,knm->k", vint[i], ri, optimize=True)
                 Js[i] = np.sum(tr * wint)
+            return Js
+
+        def _trace_intra(rho_s):
+            """Intraband (Drude/Bloch) current: Σ_k w Σ_n v_nn ρ_nn (diagonal only).
+            Interband = total − intra (off-diagonal coherences)."""
+            Js = np.zeros(3, dtype=np.complex128)
+            ri_d = rho_s[int_flat][:, diag, diag]
+            for i in range(dim):
+                Js[i] = np.sum(np.einsum("kn,kn->k", vint_diag[i], ri_d, optimize=True) * wint)
             return Js
 
         results = []
@@ -399,6 +412,7 @@ def harmonic_currents_meshed(
                 if abs(E[c]) >= 1e-40:
                     rho += E[c] * r_c[c]
             Js_by_order = {1: _trace_J(rho)}
+            Ji_by_order = {1: _trace_intra(rho)} if return_intraband else None
             for s in range(2, max_order + 1):
                 src = np.zeros((P * n1 * n2, nb, nb), dtype=np.complex128)
                 for b in range(dim):
@@ -408,7 +422,9 @@ def harmonic_currents_meshed(
                     denom = s * omega + iGamma - eps
                     rho = np.where(np.abs(denom) > 0, src / denom, 0.0)
                 Js_by_order[s] = _trace_J(rho)
-            results.append(Js_by_order)
+                if return_intraband:
+                    Ji_by_order[s] = _trace_intra(rho)
+            results.append((Js_by_order, Ji_by_order))
         return results
 
     # ---- build the block list (interior tiling) ------------------------------
@@ -433,12 +449,17 @@ def harmonic_currents_meshed(
 
     totals = [{s: np.zeros(3, dtype=np.complex128) for s in range(1, max_order + 1)}
               for _ in range(nF)]
+    intras = [{s: np.zeros(3, dtype=np.complex128) for s in range(1, max_order + 1)}
+              for _ in range(nF)] if return_intraband else None
     done = [0]
 
-    def _accumulate(part):                        # part = list of F dicts
+    def _accumulate(part):                        # part = list of F (total, intra) tuples
         for ef in range(nF):
-            for s in part[ef]:
-                totals[ef][s] += part[ef][s]
+            tot_ef, intra_ef = part[ef]
+            for s in tot_ef:
+                totals[ef][s] += tot_ef[s]
+                if return_intraband:
+                    intras[ef][s] += intra_ef[s]
         done[0] += 1
         if progress_cb is not None:
             progress_cb(done[0], len(jobs))
@@ -450,7 +471,11 @@ def harmonic_currents_meshed(
         with ThreadPoolExecutor(max_workers=n_workers) as ex:
             for part in ex.map(lambda j: _band_and_current(*j), jobs):
                 _accumulate(part)
-    return totals[0] if single_field else totals
+    out_tot = totals[0] if single_field else totals
+    if return_intraband:
+        out_intra = intras[0] if single_field else intras
+        return out_tot, out_intra
+    return out_tot
 
 
 def mesh_harmonic_currents(
@@ -531,7 +556,7 @@ def perk_harmonic_currents(
 
 def time_domain_currents(band: BandData, weights, E_t, dt, max_order, *,
                          gamma=1e-3, gamma_pop=None, k_chunk=None,
-                         progress_cb=None) -> dict:
+                         return_intraband=False, progress_cb=None) -> dict:
     """Order-by-order PERTURBATIVE response to an ARBITRARY field E(t).
 
     This is the multi-frequency generalization of :func:`harmonic_currents`.  The
@@ -608,6 +633,18 @@ def time_domain_currents(band: BandData, weights, E_t, dt, max_order, *,
             Jw[:, i] = phase * np.tensordot(vwT[i], rho_omega, axes=([0, 1, 2], [0, 1, 2]))
         return Jw, np.fft.ifft(Jw, axis=0)
 
+    # diagonal (band-group) velocity weighted by the BZ measure, for the intraband
+    # current J_intra = Σ_k w_k Σ_n v_nn ρ_nn.  Interband = total − intra.
+    vdw = [(vel[i][:, diag, diag] * w_k[:, None]) for i in range(dim)] if return_intraband else None
+
+    def _current_intra(rho_omega, s):
+        phase = 1j ** (s - 1)
+        Jw = np.empty((Nt, 3), dtype=np.complex128)
+        rho_d = rho_omega[:, diag, diag, :]                 # (nk, nb, Nt)
+        for i in range(dim):
+            Jw[:, i] = phase * np.tensordot(vdw[i], rho_d, axes=([0, 1], [0, 1]))
+        return Jw, np.fft.ifft(Jw, axis=0)
+
     # Wilson links are time- AND order-independent -> precompute ONCE per direction.
     active_dirs = [b for b in range(dim) if np.any(np.abs(E_t[:, b]) > 1e-40)]
     links = {}
@@ -643,7 +680,10 @@ def time_domain_currents(band: BandData, weights, E_t, dt, max_order, *,
     rho_omega = num * inv_denom
     del num
     J_omega, J_t = {}, {}
+    J_omega_intra, J_t_intra = ({}, {}) if return_intraband else (None, None)
     J_omega[1], J_t[1] = _current(rho_omega, 1)
+    if return_intraband:
+        J_omega_intra[1], J_t_intra[1] = _current_intra(rho_omega, 1)
     if progress_cb is not None:
         progress_cb(1)
 
@@ -656,11 +696,17 @@ def time_domain_currents(band: BandData, weights, E_t, dt, max_order, *,
         rho_omega = np.fft.fft(S_t, axis=-1) * inv_denom
         del S_t
         J_omega[s], J_t[s] = _current(rho_omega, s)
+        if return_intraband:
+            J_omega_intra[s], J_t_intra[s] = _current_intra(rho_omega, s)
         if s < max_order:
             rho_t_prev = np.fft.ifft(rho_omega, axis=-1)
         if progress_cb is not None:
             progress_cb(s)
-    return {"freq": freq, "J_omega": J_omega, "J_t": J_t}
+    out = {"freq": freq, "J_omega": J_omega, "J_t": J_t}
+    if return_intraband:
+        out["J_omega_intra"] = J_omega_intra
+        out["J_t_intra"] = J_t_intra
+    return out
 
 
 def uniform_mp_grid(bounds, shape):

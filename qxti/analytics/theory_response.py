@@ -447,25 +447,33 @@ def _hhg_multilaser_result(config, hamiltonian, kgrid, dim, nk, max_order, gamma
                   flush=True)
 
     td = time_domain_currents(band, weights, E_t[:, :3], dt, max_order,
-                              gamma=gamma, gamma_pop=gamma, progress_cb=_order_cb)
+                              gamma=gamma, gamma_pop=gamma, return_intraband=True,
+                              progress_cb=_order_cb)
 
-    # Per-order physical current in time (real) and its spectrum.
+    # Per-order physical current in time (real) and its spectrum; plus the REAL
+    # intra/inter split (intraband = Σ_n v_nn ρ_nn diagonal, inter = total − intra).
     J_order: dict[int, np.ndarray] = {}
     current_dim = np.zeros((Nt, dim), dtype=np.float64)
+    intra_dim = np.zeros((Nt, dim), dtype=np.float64)
     for s in range(1, max_order + 1):
         Js_t = td["J_t"][s][:, :dim].real
         current_dim += Js_t
+        intra_dim += td["J_t_intra"][s][:, :dim].real
         J_order[s] = np.fft.fft(Js_t, axis=0)
 
     current_time = np.zeros((Nt, 3), dtype=np.float64)
     current_time[:, :dim] = current_dim
+    current_time_intra = np.zeros((Nt, 3), dtype=np.float64)
+    current_time_intra[:, :dim] = intra_dim
+    current_time_inter = current_time - current_time_intra
     field_time = np.zeros((Nt, 3), dtype=np.float64)
     field_time[:, :dim] = E_t[:, :dim].real
     current_spectrum = np.fft.fft(current_time, axis=0)
+    spectrum_intra = np.fft.fft(current_time_intra, axis=0)
+    spectrum_inter = current_spectrum - spectrum_intra
     current_magnitude = np.abs(current_spectrum)
     current_total_magnitude = np.sqrt(np.sum(current_magnitude ** 2, axis=1))
     zeros3 = np.zeros((Nt, 3), dtype=np.float64)
-    zeros3c = np.zeros((Nt, 3), dtype=np.complex128)
     dataset = {
         "omega_axis": freq, "current_spectrum": current_spectrum,
         "current_magnitude": current_magnitude,
@@ -474,10 +482,11 @@ def _hhg_multilaser_result(config, hamiltonian, kgrid, dim, nk, max_order, gamma
         "current_spectrum_total": current_spectrum, "polarization_time": zeros3,
         "equilibrium_current_time": zeros3, "equilibrium_polarization_time": zeros3,
         "time_axis": t_axis, "electric_field_time": field_time,
-        "current_time_intraband": zeros3, "current_time_interband": current_time,
-        "current_spectrum_intraband": zeros3c, "current_spectrum_interband": current_spectrum,
-        "current_total_magnitude_intraband": np.zeros(Nt),
-        "current_total_magnitude_interband": current_total_magnitude,
+        "current_decomposition_available": True,
+        "current_time_intraband": current_time_intra, "current_time_interband": current_time_inter,
+        "current_spectrum_intraband": spectrum_intra, "current_spectrum_interband": spectrum_inter,
+        "current_total_magnitude_intraband": np.sqrt(np.sum(np.abs(spectrum_intra) ** 2, axis=1)),
+        "current_total_magnitude_interband": np.sqrt(np.sum(np.abs(spectrum_inter) ** 2, axis=1)),
         "orders": np.asarray(tuple(range(1, max_order + 1))),
     }
     if progress:
@@ -572,6 +581,7 @@ def compute_hhg_spectrum(
     # --- Orders 1..max: harmonic peaks via analytic rho^(s)(k, s*omega0) ---
     harmonic_peaks: dict[int, np.ndarray] = {}
     J_harm_t = np.zeros((Nt, dim), dtype=np.float64)
+    J_harm_t_intra = np.zeros((Nt, dim), dtype=np.float64)   # diagonal (Drude/Bloch) part
     if max_order >= 1:
         # Single VECTORIZED mesh recursion for ALL orders (1..max) -- replaces the old
         # per-k rho_order_s loop, the double-counting order-2 tensor path, AND the
@@ -603,16 +613,20 @@ def compute_hhg_spectrum(
                       f"-- elapsed {format_duration(_btimer.elapsed_seconds)}, "
                       f"ETA {_btimer.eta_text()}.", flush=True)
 
-        J_all = harmonic_currents_meshed(
+        # return_intraband: the mesh also returns the diagonal (Drude/Bloch) part
+        # J_intra = Σ_k w Σ_n v_nn ρ_nn, so we can build the REAL intra/inter split
+        # (interband = total − intra), instead of faking it (was: all -> interband).
+        J_all, J_intra_all = harmonic_currents_meshed(
             hamiltonian._matrix_at, k_points, shape, bounds, weights, E_field, omega0, max_order,
             gamma=gamma, gamma_pop=gamma, mu=mu, T_au=temperature, dimension=dim,
             distribution=distribution, n_workers=n_workers, reserve_gb=reserve_gb,
-            h_batch=h_batch, progress_cb=_block_cb)
+            h_batch=h_batch, return_intraband=True, progress_cb=_block_cb)
         if progress:
             print(f"[theory-HHG] mesh recursion done: elapsed "
                   f"{format_duration(time.perf_counter() - _t_band)}.", flush=True)
         for s in range(1, max_order + 1):
-            Js = -np.asarray(J_all[s][:dim], dtype=np.complex128)   # sum_k w Tr[-v rho^(s)]
+            Js = -np.asarray(J_all[s][:dim], dtype=np.complex128)         # sum_k w Tr[-v rho^(s)]
+            Js_intra = -np.asarray(J_intra_all[s][:dim], dtype=np.complex128)  # diagonal (intraband)
             harmonic_peaks[s] = Js
             if s == 1:
                 J_order[1] = Js                                     # order 1 (inter + intraband)
@@ -620,6 +634,7 @@ def compute_hhg_spectrum(
             phase = np.exp(-1j * s * omega0 * t_axis)
             for a in range(dim):
                 J_harm_t[:, a] += 2.0 * np.real(Js[a] * (env_norm ** s) * phase)
+                J_harm_t_intra[:, a] += 2.0 * np.real(Js_intra[a] * (env_norm ** s) * phase)
         if progress:
             print("[theory-HHG] orders 1..max done.", flush=True)
 
@@ -631,6 +646,12 @@ def compute_hhg_spectrum(
     current_spectrum = np.fft.fft(current_time, axis=0)
     current_magnitude = np.abs(current_spectrum)
     current_total_magnitude = np.sqrt(np.sum(current_magnitude ** 2, axis=1))
+    # REAL intra/inter split (interband = total − intraband).
+    current_time_intra = np.zeros((Nt, 3), dtype=np.float64)
+    current_time_intra[:, :dim] = J_harm_t_intra
+    current_time_inter = current_time - current_time_intra
+    spectrum_intra = np.fft.fft(current_time_intra, axis=0)
+    spectrum_inter = current_spectrum - spectrum_intra
     zeros3 = np.zeros((Nt, 3), dtype=np.float64)
     zeros3c = np.zeros((Nt, 3), dtype=np.complex128)
     dataset = {
@@ -646,13 +667,14 @@ def compute_hhg_spectrum(
         "equilibrium_polarization_time": zeros3,
         "time_axis": t_axis,
         "electric_field_time": field_time,
-        # intra/inter split is not separated in theory mode: report all as interband.
-        "current_time_intraband": zeros3,
-        "current_time_interband": current_time,
-        "current_spectrum_intraband": zeros3c,
-        "current_spectrum_interband": current_spectrum,
-        "current_total_magnitude_intraband": np.zeros(Nt),
-        "current_total_magnitude_interband": current_total_magnitude,
+        # REAL intra/inter split: intraband = Σ_n v_nn ρ_nn (diagonal), inter = total − intra.
+        "current_decomposition_available": True,
+        "current_time_intraband": current_time_intra,
+        "current_time_interband": current_time_inter,
+        "current_spectrum_intraband": spectrum_intra,
+        "current_spectrum_interband": spectrum_inter,
+        "current_total_magnitude_intraband": np.sqrt(np.sum(np.abs(spectrum_intra) ** 2, axis=1)),
+        "current_total_magnitude_interband": np.sqrt(np.sum(np.abs(spectrum_inter) ** 2, axis=1)),
         "orders": np.asarray(tuple(range(1, max_order + 1))),
     }
 
