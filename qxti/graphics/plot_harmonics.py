@@ -10,8 +10,10 @@ from typing import Any
 import numpy as np
 
 
-os.environ.setdefault("MPLCONFIGDIR", "/private/tmp")
-os.environ.setdefault("XDG_CACHE_HOME", "/private/tmp")
+import tempfile as _tempfile
+_qxti_cache = os.path.join(_tempfile.gettempdir(), "qxti_cache")
+os.environ.setdefault("MPLCONFIGDIR", _qxti_cache)
+os.environ.setdefault("XDG_CACHE_HOME", _qxti_cache)
 
 
 try:

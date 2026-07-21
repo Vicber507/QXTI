@@ -57,6 +57,7 @@ Hamiltonianos *tight-binding* genéricos. Todo internamente en **unidades atómi
 - [[Playbook - Add a Config Option]]
 - [[Playbook - Add an Observable or Order]]
 - [[Playbook - Add an LDOS Method or Plot]]
+- [[Cluster and SLURM]] — correr en cluster (miles de núcleos), y cómo se eligen los cores.
 - [[Playbook - Invariants Not to Break]] ← **lee esto antes de cualquier cambio.**
 
 ## 📄 Docs largos previos (referencia de diseño, en `docs/`)

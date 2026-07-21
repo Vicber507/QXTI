@@ -1,0 +1,13 @@
+# QXTI job list — one run per line:  <config>  [mode]
+# mode is -cmd (default) | -xtp | -ldos.  Blank lines and #comments are ignored.
+# Used by:  ./cluster/submit.sh array cluster/joblist.txt
+#      or:  ./cluster/submit.sh chain cluster/joblist.txt
+#
+# Example: sweep several models/calculations in parallel (job array).
+inputs/inputParams.wsm.cfg            -cmd
+inputs/inputParams.wsm.cfg            -xtp
+inputs/inputParams.wsm_orenstein.cfg  -xtp
+inputs/inputParams.frank8.cfg         -cmd
+inputs/inputParams.frank_zhang_ldos.cfg -ldos
+inputs/inputParams.graphene.cfg       -cmd
+inputs/inputParams.haldane_topological.cfg -ldos

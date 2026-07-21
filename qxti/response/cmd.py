@@ -33,35 +33,18 @@ _DEFAULT_WORKERS_CACHE: int | None = None
 def _default_worker_count() -> int:
     """Best default thread count for the GIL-bound parallel k-loop.
 
-    On Apple Silicon (and other heterogeneous CPUs) the optimum is the number of
-    PERFORMANCE cores: efficiency cores plus GIL contention make extra threads
-    slower. Detect performance cores on macOS via ``sysctl``; otherwise fall back
-    to the physical-core count, then to half the logical CPUs.
+    Delegates to :func:`qxti.utils.parallel.resolve_worker_count`, the single
+    cross-platform source of truth: it uses the SLURM allocation on a cluster
+    (all of it, never a fraction), the CPU-affinity mask on Linux, and the
+    performance-core count on local Apple Silicon.  See
+    ``docs/vault/Concept - Memory and Parallelism`` and ``Cluster and SLURM``.
     """
     global _DEFAULT_WORKERS_CACHE
     if _DEFAULT_WORKERS_CACHE is not None:
         return _DEFAULT_WORKERS_CACHE
-    n = 0
-    try:  # macOS performance cores
-        import subprocess  # noqa: PLC0415
-        out = subprocess.run(
-            ["sysctl", "-n", "hw.perflevel0.physicalcpu"],
-            capture_output=True, text=True, timeout=1.0,
-        )
-        n = int(out.stdout.strip())
-    except Exception:
-        n = 0
-    if n <= 0:
-        try:  # physical cores (POSIX)
-            n = int(os.sysconf("SC_NPROCESSORS_ONLN"))
-            logical = os.cpu_count() or n
-            if logical >= 2 * n:  # hyperthreaded -> use physical
-                pass
-            else:
-                n = max(1, (logical + 1) // 2)
-        except (AttributeError, ValueError, OSError):
-            n = max(1, (os.cpu_count() or 2) // 2)
-    _DEFAULT_WORKERS_CACHE = max(1, n)
+    from qxti.utils.parallel import resolve_worker_count  # noqa: PLC0415
+
+    _DEFAULT_WORKERS_CACHE = resolve_worker_count()
     return _DEFAULT_WORKERS_CACHE
 
 
