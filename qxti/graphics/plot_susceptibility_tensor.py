@@ -12,8 +12,10 @@ import numpy as np
 from numpy.typing import NDArray
 
 
-os.environ.setdefault("MPLCONFIGDIR", "/private/tmp")
-os.environ.setdefault("XDG_CACHE_HOME", "/private/tmp")
+import tempfile as _tempfile
+_qxti_cache = os.path.join(_tempfile.gettempdir(), "qxti_cache")
+os.environ.setdefault("MPLCONFIGDIR", _qxti_cache)
+os.environ.setdefault("XDG_CACHE_HOME", _qxti_cache)
 
 
 DEFAULT_SUSCEPTIBILITY_PLOT_CONFIG = {

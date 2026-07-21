@@ -578,28 +578,28 @@ class SusceptibilityScanRunner:
     def _resolve_n_workers(self, *, nfreq: int, ndir: int, max_order: int) -> int:
         """Return a RAM-bounded process count for the frequency sweep.
 
-        Susceptibility workers now solve one frequency/direction at a time using
-        temporary rho scratch on disk.  This dramatically reduces RAM pressure
-        relative to the legacy all-orders-in-memory path, but the scratch/page-
-        cache footprint can still be large.  For stability the automatic mode is
-        intentionally conservative and defaults to serial execution unless the
-        user explicitly requests more workers.
+        Each process solves one frequency at a time (its k-loop pinned to a
+        single thread) using temporary rho scratch on disk.  Worker count now
+        follows the cross-platform resolver — so on a SLURM node it uses the
+        whole allocation — capped by (a) the number of frequencies and (b) a
+        rough RAM budget so N concurrent CMD solves never exhaust memory.  Set
+        ``[xtp] susceptibility_n_workers`` to force a value.
         """
         del ndir, max_order
-        requested = int(self.config.xtp.susceptibility_n_workers)
-        cpu = os.cpu_count() or 1
-        if requested <= 0:
-            n = 1
-            self._emit_progress(
-                f"Susceptibility sweep workers: {n} "
-                f"(cpu={cpu}, nfreq={nfreq}, auto-mode uses serial temporary-scratch execution for stability)."
-            )
-            return n
+        from qxti.utils.parallel import resolve_worker_count, available_cpus
 
-        n = max(1, min(requested, cpu, nfreq))
+        requested = int(self.config.xtp.susceptibility_n_workers)
+        cpu = available_cpus()
+        # ~3 GB per frequency worker (a full CMD solve + scratch page cache).
+        avail_gb = max(1.0, self._available_ram() / (1024.0 ** 3))
+        ram_cap = max(1, int(avail_gb // 3.0))
+        n = resolve_worker_count(requested if requested > 0 else None, cap=nfreq)
+        n = max(1, min(n, ram_cap))
+        mode = "user-requested" if requested > 0 else "auto"
         self._emit_progress(
-            f"Susceptibility sweep workers: {n} "
-            f"(cpu={cpu}, nfreq={nfreq}, user-requested parallelism)."
+            f"Susceptibility sweep workers: {n} ({mode}; usable CPUs={cpu}, "
+            f"nfreq={nfreq}, ram_cap={ram_cap} @~3GB/worker, "
+            f"avail={avail_gb:.1f}GB). Each process pins its k-loop to 1 thread."
         )
         return n
 

@@ -11,9 +11,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# Keep matplotlib/font caches in a writable place for local runs.
-os.environ.setdefault("MPLCONFIGDIR", "/private/tmp")
-os.environ.setdefault("XDG_CACHE_HOME", "/private/tmp")
+# Keep matplotlib/font caches in a writable place that exists on mac/win/linux
+# (honours $TMPDIR, which SLURM sets per job).
+import tempfile as _tempfile
+_qxti_cache = os.path.join(_tempfile.gettempdir(), "qxti_cache")
+os.environ.setdefault("MPLCONFIGDIR", _qxti_cache)
+os.environ.setdefault("XDG_CACHE_HOME", _qxti_cache)
 
 from qxti.core import QXTIConfig
 from qxti.data import (

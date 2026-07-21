@@ -50,13 +50,13 @@ _KB_AU = 3.1668114e-6  # Boltzmann constant in Hartree / K
 def default_worker_count() -> int:
     """Best default core count for the mesh engine.
 
-    Reuses CMD's performance-core detection (on Apple Silicon / heterogeneous
-    CPUs the optimum is the number of PERFORMANCE cores; efficiency cores + GIL
-    contention make extra threads slower).  Lazy import avoids an import cycle.
+    Single cross-platform source of truth (SLURM allocation on a cluster, CPU
+    affinity on Linux, performance cores on local macOS).  See
+    :func:`qxti.utils.parallel.resolve_worker_count`.
     """
     try:
-        from qxti.response.cmd import _default_worker_count as _wc
-        return _wc()
+        from qxti.utils.parallel import resolve_worker_count
+        return resolve_worker_count()
     except Exception:
         return max(1, (os.cpu_count() or 2) // 2)
 

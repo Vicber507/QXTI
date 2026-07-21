@@ -5,9 +5,12 @@ from dataclasses import replace
 import os
 from pathlib import Path
 
-# Keep matplotlib/font caches in a writable place for local runs.
-os.environ.setdefault("MPLCONFIGDIR", "/private/tmp")
-os.environ.setdefault("XDG_CACHE_HOME", "/private/tmp")
+# Cross-platform runtime setup, BEFORE importing NumPy (via qxti.core):
+#  - a writable matplotlib/font cache dir that exists on mac/win/linux;
+#  - pin BLAS/OpenMP to 1 thread so the k-loop ThreadPool owns the parallelism
+#    (no cores x BLAS oversubscription).  Override BLAS with QXTI_BLAS_THREADS.
+from qxti.utils.parallel import configure_runtime_env, parallel_plan
+configure_runtime_env()
 
 from qxti.core import QXTIConfig, QXTISimulation, SusceptibilityScanRunner, LDOSRunner
 
@@ -108,6 +111,8 @@ def main() -> int:
 
     mode = "cmd" if args.cmd else ("xtp" if args.xtp else ("ldos" if args.ldos else None))
     config_path = Path(args.config).expanduser()
+    print(f"[main] Parallelism: {parallel_plan()} "
+          f"(set [cmd]/[xtp]/[ldos] n_workers to override; 0 = auto).")
     outputs = run_from_config_path(config_path, mode=mode)
 
     if not outputs:

@@ -33,19 +33,42 @@ de ρ puede ir en `float16_complex` (4 bytes/elem, ver [[qxti.utils|io_utils]]).
 
 ## Paralelismo (por dónde)
 
+QXTI es **memoria compartida de un solo nodo** (multi-hilo), **no MPI** (a diferencia de
+antelope, que es `mpirun` multi-nodo). Un proceso QXTI usa **todos los cores de su nodo**.
+
 | Cálculo | Unidad paralela | Mecanismo |
 | --- | --- | --- |
-| mesh / theory (`-cmd`, `-xtp` o≥2) | bloques/planos-k, freq×dir | **ThreadPool** (NumPy suelta el GIL) |
+| mesh / theory (`-cmd`, `-xtp` o≥2) | **slabs** (bloques de planos-k) + halo, freq×dir | **ThreadPool** (NumPy suelta el GIL) |
 | CMD tiempo | chunks de k | ThreadPool |
-| `-xtp` simulation | **por frecuencia** | **ProcessPool** (cada worker: CMD+XTP en scratch) |
+| `-xtp` simulation | **por frecuencia** | **ProcessPool** (cada worker: CMD+XTP en scratch, k-loop a 1 hilo) |
 
-`n_workers = 0` ⇒ auto (`_default_worker_count`, **performance cores**; evita e-cores por el GIL).
-Speedup real ~2.5× con 6-8 cores (limitado por GIL/BLAS). Bit-exacto vs serie.
+## Conteo de cores — fuente única: `qxti/utils/parallel.py`
+
+`resolve_worker_count(requested, cap)` decide cuántos workers, con esta prioridad:
+1. `n_workers` del `.cfg` si **>0** (config gana), 2. `QXTI_NUM_WORKERS`, 3. **SLURM**
+(`SLURM_CPUS_PER_TASK` — completo, **nunca a la mitad**), 4. **todos los cores usables** (el
+máximo local: `os.sched_getaffinity` en Linux —respeta cgroups/taskset—, `os.cpu_count()` en
+mac/win). Es decir `n_workers=0` ⇒ **todos** los cores de la PC.
+**Opt-in** (no default): `QXTI_MAC_PERF_CORES=1` limita a los performance cores en Apple Silicon
+(a veces más rápido: e-cores + GIL).
+
+Los 3 sitios (`cmd._default_worker_count`, `mesh_response.default_worker_count`,
+`susceptibility._resolve_n_workers`) delegan aquí → mismo comportamiento en laptop, workstation y
+cluster. `main.py` imprime el plan al arrancar (`[main] Parallelism: N workers (source: …)`).
 
 ⛔ **Invariantes**
-- El resultado **no** depende de `n_workers` (paralelismo bit-exacto). Si cambia con los workers,
-  hay un bug de acumulación/halo.
-- No sobre-suscribir: el worker de proceso (`-xtp`) fuerza `n_workers=1` internamente.
+- El resultado **no** depende de `n_workers` (paralelismo bit-exacto: los slabs llevan halo).
+  Si cambia con los workers, hay bug de acumulación/halo.
+- No sobre-suscribir: el worker de proceso (`-xtp`) fuerza `n_workers=1` internamente, y las
+  librerías BLAS se **pinchan a 1 hilo** (`configure_thread_env`, `OMP/MKL/OPENBLAS_NUM_THREADS=1`)
+  para que el pool de k sea el único que paraleliza. Override con `QXTI_BLAS_THREADS`.
+- En cluster una asignación de N cores significa N (se usa entera). Ver [[Cluster and SLURM]].
+
+## Cross-platform (mac/win/linux)
+
+- RAM guard nativo por SO (`memory.py`). Cache de matplotlib vía `tempfile.gettempdir()` (respeta
+  `$TMPDIR` de SLURM) — antes era `/private/tmp` (solo-macOS, rompía en Linux/Windows).
+- Windows: `-xtp` usa ProcessPool con `spawn`; `main.py` tiene el guard `if __name__=="__main__"`.
 
 ---
 
