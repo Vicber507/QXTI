@@ -32,21 +32,25 @@ graph LR
     SIM --> KG[build KGrid + degeneracy guard]
     SIM --> LS[build LaserSystem]
     HAM & KG & LS --> BR{response_method}
-    BR -->|theory| TH["theory_response.compute_hhg_spectrum<br/>(mesh cerrado, rápido)"]
-    BR -->|simulation| CMD["CMD.solve_time_domain<br/>(propaga ρ en el tiempo)"]
-    BR -->|both| TH & CMD
+    BR -->|pfddm| TH["theory_response.compute_hhg_spectrum<br/>(mesh cerrado, rápido)"]
+    BR -->|ptddm| CMD["CMD.solve_time_domain<br/>(propaga ρ⁽ˢ⁾ perturbativo)"]
+    BR -->|tddm| FULL["tddm.compute_hhg_spectrum_tddm<br/>(full no-perturbativo, gauge velocidad)"]
+    BR -->|both/all| TH & CMD & FULL
     CMD --> STC["StreamingCurrentAccumulator<br/>(J intra/inter al vuelo)"]
     TH --> DS[dataset .npz]
+    FULL --> DS
     STC --> XTP[XTP → J(ω), χ⁽ˢ⁾]
     XTP --> DS
     DS --> GFX[graphics: espectros, RCP/LCP, intra/inter]
 ```
 
-- **theory** (por defecto en modelos pesados): [[qxti.analytics|theory_response]] → `harmonic_currents_meshed`
-  con `return_intraband=True` → split intra/inter **real** en el dataset.
-- **simulation**: [[qxti.response|CMD]] propaga ρ⁽ˢ⁾(k,t); si `basis=band` usa
-  [[qxti.data|StreamingCurrentAccumulator]] para acumular J(t) sin materializar ρ (ahorro de RAM).
-- Multi-láser → `time_domain_currents` (rama tiempo, todos los productos de mezcla automáticos).
+- **pfddm** (=theory, por defecto en modelos pesados): [[qxti.analytics|theory_response]] →
+  `harmonic_currents_meshed` con `return_intraband=True` → split intra/inter **real**.
+- **ptddm** (=simulation): [[qxti.response|CMD]] propaga ρ⁽ˢ⁾(k,t); si `basis=band` usa
+  [[qxti.data|StreamingCurrentAccumulator]] (J(t) sin materializar ρ).
+- **tddm** (nuevo, no-perturbativo): [[qxti.analytics|tddm.py]] gauge velocidad, para campo fuerte.
+- **all** → los 3 + `engine_comparison.npz`. Ver [[Concept - Response Engines]].
+- Multi-láser → `time_domain_currents` (rama tiempo, pfddm pulsado).
 
 Claves: [[Concept - Inter-Intra Decomposition]] · [[Concept - Memory and Parallelism]].
 
@@ -56,17 +60,19 @@ Claves: [[Concept - Inter-Intra Decomposition]] · [[Concept - Memory and Parall
 graph LR
     CFG[QXTIConfig] --> RUN[SusceptibilityScanRunner.run]
     RUN --> BR{susceptibility_method}
-    BR -->|theory| THS["theory_response.compute_susceptibility_spectrum<br/>(Kubo o(1) + mesh o≥2)"]
-    BR -->|simulation| WK["por frecuencia: probes x/y/z<br/>ProcessPool → CMD+XTP"]
+    BR -->|pfddm| THS["compute_susceptibility_spectrum<br/>(Kubo o(1) + mesh o≥2)"]
+    BR -->|ptddm| WK["por frecuencia: probes x/y/z<br/>ProcessPool → CMD+XTP"]
+    BR -->|tddm| TS["compute_susceptibility_spectrum_tddm<br/>(escalado en amplitud → χ⁽ˢ⁾)"]
     THS --> DS[xtp_susceptibility.npz]
     WK --> DS
+    TS --> DS
     DS --> GFX[graphics: χ/σ cartesiano + helicidad]
 ```
 
-- **theory**: orden 1 vía Kubo (streaming, ver [[qxti.analytics|rho_analytic.sigma1_kubo]]),
+- **pfddm**: orden 1 vía Kubo (streaming, ver [[qxti.analytics|rho_analytic.sigma1_kubo]]),
   órdenes ≥2 vía `_mesh_susceptibility` (ThreadPool sobre freq×dir).
-- **simulation**: paraleliza **por frecuencia** con `ProcessPoolExecutor`; cada worker corre
-  `CMD` en un dir de scratch temporal y arma `XTP`. Ver [[qxti.core|susceptibility_scan]].
+- **ptddm**: paraleliza **por frecuencia** con `ProcessPoolExecutor`; cada worker corre `CMD`+`XTP`.
+- **tddm**: M amplitudes E0 por frecuencia + ajuste polinomial → χ⁽ˢ⁾. Ver [[qxti.core|susceptibility_scan]].
 - Tensor completo (componentes fuera de diagonal) → [[qxti.response|SusceptibilityTensorCalculator]] (LSQ).
 
 ## Rama `-ldos` (densidad de estados)

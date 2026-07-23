@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
+import sys
+import threading
 import time
 from typing import Callable
 
@@ -67,6 +69,79 @@ class ProgressTimer:
         if self.completed < minimum:
             return "unknown"
         return format_duration(self.eta_seconds())
+
+
+class AtomicCounter:
+    """A lock-guarded integer shared by cooperating threads (or a serial loop).
+
+    ``add`` returns the new value so callers can render progress without a second
+    read.  Reads via :attr:`value` are lock-free (a plain int load is atomic under
+    the GIL and only used for display)."""
+
+    __slots__ = ("_value", "_lock")
+
+    def __init__(self, value: int = 0) -> None:
+        self._value = int(value)
+        self._lock = threading.Lock()
+
+    def add(self, n: int) -> int:
+        with self._lock:
+            self._value += int(n)
+            return self._value
+
+    @property
+    def value(self) -> int:
+        return self._value
+
+
+class LiveProgress:
+    """A single, self-refreshing progress line with a live ETA.
+
+    ``update(done)`` is cheap to call very often — it only re-renders every
+    ``interval`` seconds.  On a TTY the line is rewritten in place (``\\r``) so it
+    stays put and updates smoothly; when stdout is redirected to a file it prints a
+    fresh (throttled) line so logs stay readable.  ``done``/``total`` are arbitrary
+    work units (k-points, time steps, blocks, frequencies…), so the percentage is
+    exact regardless of how the work is chunked.
+
+    IMPORTANT: call :meth:`close` before emitting any other line (a summary,
+    another engine message…), otherwise the next print clobbers the in-place line.
+    ``close`` is idempotent, so wrapping a loop with ``update`` then ``close`` is
+    the whole contract — the SAME line style is reused by every engine.
+    """
+
+    def __init__(self, label: str, total: int, *, interval: float = 2.0,
+                 file_interval: float = 15.0):
+        self.label = str(label)
+        self.total = max(1, int(total))
+        self.interval = float(interval)
+        self._file_interval = float(file_interval)
+        self._timer = ProgressTimer(total=self.total)
+        self._last = float("-inf")
+        self._tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+        self._dirty = False
+
+    def update(self, done: int, *, message: str = "", force: bool = False) -> None:
+        now = time.perf_counter()
+        interval = self.interval if self._tty else max(self.interval, self._file_interval)
+        if not force and (now - self._last) < interval:
+            return
+        self._last = now
+        self._timer.completed = min(self.total, max(0, int(done)))
+        pct = 100.0 * self._timer.completed / self.total
+        extra = f"  {message}" if message else ""
+        line = (f"[{self.label}] {pct:5.1f}%{extra}  elapsed "
+                f"{format_duration(self._timer.elapsed_seconds)}, ETA {self._timer.eta_text()}")
+        if self._tty:
+            print("\r" + line + "        ", end="", flush=True)
+            self._dirty = True
+        else:
+            print(line + ".", flush=True)
+
+    def close(self) -> None:
+        if self._tty and self._dirty:
+            print("", flush=True)
+            self._dirty = False
 
 
 @dataclass(slots=True)

@@ -243,8 +243,8 @@ def compute_linear_response_spectrum(
     # bounded by the chunk size, so even millions of k-points run fast and
     # without OOM. The BZ-summed sigma is gauge-invariant, so the raw eigenvector
     # gauge gives the same result as the smoothed one.
-    from qxti.utils.progress import ProgressTimer
-    timer = ProgressTimer(total=nk)
+    from qxti.utils.progress import LiveProgress
+    live = LiveProgress("theory", nk) if progress else None
     offdiag_mask = ~np.eye(nb, dtype=bool)
     Hf = hamiltonian._matrix_at
     dk = 1e-4
@@ -288,16 +288,12 @@ def compute_linear_response_spectrum(
                 num = (np.transpose(Ja, (0, 2, 1)) * Ab) * fmn * w_c[:, None, None]
                 sigma[:, a, b] += np.einsum("cnm,cwnm->w", num, inv_denom, optimize=True)
 
-        timer.completed = stop
-        if progress:
-            print(
-                f"[theory] k-points {stop}/{nk} ({100 * stop // nk}%), "
-                f"elapsed {timer.elapsed_seconds:.1f}s, ETA {timer.eta_text()}",
-                flush=True,
-            )
+        if live is not None:
+            live.update(stop)
 
-    if progress:
-        print(f"[theory] done: {nk}/{nk} k-points in {timer.elapsed_seconds:.1f}s")
+    if live is not None:
+        live.update(nk, force=True)
+        live.close()
 
     # chi = sigma / (-i omega); guard omega=0
     safe_omega = np.where(np.abs(omega_axis) > 1e-30, omega_axis, np.nan)
@@ -418,7 +414,7 @@ def _hhg_multilaser_result(config, hamiltonian, kgrid, dim, nk, max_order, gamma
     Reduces to the closed form for a single laser (validated in the study).
     """
     from qxti.analytics.mesh_response import precompute_band_data, time_domain_currents
-    from qxti.utils.progress import ProgressTimer, format_duration
+    from qxti.utils.progress import format_duration
 
     weights = build_k_integration_weights(config, hamiltonian=hamiltonian, kgrid=kgrid,
                                           extra_k_weight_mask=extra_k_weight_mask)
@@ -431,24 +427,27 @@ def _hhg_multilaser_result(config, hamiltonian, kgrid, dim, nk, max_order, gamma
               f"({Nt} time steps, window [{t_axis[0]:.1f}, {t_axis[-1]:.1f}] a.u.). "
               "Progress with ETA below.", flush=True)
     _t_band = time.perf_counter()
+    # Pad the mesh so the covariant gradient reads real out-of-box neighbours at the
+    # box edge (no periodic wrap); time_domain_currents uses the 2-point stencil.
     band = precompute_band_data(hamiltonian._matrix_at, k_points, shape, bounds,
                                 mu=mu, T_au=temperature, dimension=dim,
-                                distribution=distribution)
+                                distribution=distribution, halo=max(0, max_order - 1))
     if progress:
         print(f"[theory-HHG] band data ready (batched eigh): "
               f"elapsed {format_duration(time.perf_counter() - _t_band)}.", flush=True)
-    _otimer = ProgressTimer(total=max_order)
+    from qxti.utils.progress import LiveProgress
+    _olive = LiveProgress("theory-HHG", max_order) if progress else None
 
     def _order_cb(s):
-        _otimer.advance()
-        if progress:
-            print(f"[theory-HHG] order {s}/{max_order} (time-domain) done -- elapsed "
-                  f"{format_duration(_otimer.elapsed_seconds)}, ETA {_otimer.eta_text()}.",
-                  flush=True)
+        if _olive is not None:
+            _olive.update(s, message=f"order {s}/{max_order} (time-domain)")
 
     td = time_domain_currents(band, weights, E_t[:, :3], dt, max_order,
                               gamma=gamma, gamma_pop=gamma, return_intraband=True,
                               progress_cb=_order_cb)
+    if _olive is not None:
+        _olive.update(max_order, force=True)
+        _olive.close()
 
     # Per-order physical current in time (real) and its spectrum; plus the REAL
     # intra/inter split (intraband = Σ_n v_nn ρ_nn diagonal, inter = total − intra).
@@ -593,25 +592,26 @@ def compute_hhg_spectrum(
         shape = tuple(int(kgrid.shape[a]) for a in range(3))
         bounds = hamiltonian.reciprocal_box_bounds()
         E_field = np.asarray(list(E_cw) + [0.0] * (3 - dim), dtype=complex)
-        from qxti.utils.progress import ProgressTimer, format_duration
+        from qxti.utils.progress import LiveProgress, format_duration
         # Memory-safe + multi-core: n_workers/reserve from [cmd]; use the model's
         # vectorized H_batch when it exposes one (big speedup on large grids).
         n_workers, reserve_gb = _mesh_parallel_settings(config)
+        grad_stencil = int(getattr(ccfg, "gradient_stencil", 2) or 2)
         h_batch = _model_h_batch(hamiltonian)
         if progress:
             print(f"[theory-HHG] orders 1..{max_order}: memory-safe streaming mesh recursion "
                   f"({nk} k-points, up to {n_workers or default_worker_count()} cores, "
-                  f">={reserve_gb:g} GB RAM kept free). Progress with ETA below.", flush=True)
+                  f">={reserve_gb:g} GB RAM kept free). Live progress with ETA below.", flush=True)
         _t_band = time.perf_counter()
-        _btimer = ProgressTimer(total=1)
+        _blive: dict[str, LiveProgress] = {}   # created lazily: total (#blocks) is known only in the callback
 
         def _block_cb(done, total):
-            _btimer.total = max(1, total)
-            _btimer.completed = done
-            if progress and (done == 1 or done == total or done % max(1, total // 10) == 0):
-                print(f"[theory-HHG] mesh block {done}/{total} "
-                      f"-- elapsed {format_duration(_btimer.elapsed_seconds)}, "
-                      f"ETA {_btimer.eta_text()}.", flush=True)
+            if not progress:
+                return
+            live = _blive.get("p")
+            if live is None:
+                live = _blive["p"] = LiveProgress("theory-HHG", max(1, total))
+            live.update(done, message="mesh recursion")
 
         # return_intraband: the mesh also returns the diagonal (Drude/Bloch) part
         # J_intra = Σ_k w Σ_n v_nn ρ_nn, so we can build the REAL intra/inter split
@@ -620,8 +620,13 @@ def compute_hhg_spectrum(
             hamiltonian._matrix_at, k_points, shape, bounds, weights, E_field, omega0, max_order,
             gamma=gamma, gamma_pop=gamma, mu=mu, T_au=temperature, dimension=dim,
             distribution=distribution, n_workers=n_workers, reserve_gb=reserve_gb,
-            h_batch=h_batch, return_intraband=True, progress_cb=_block_cb)
+            h_batch=h_batch, return_intraband=True, progress_cb=_block_cb,
+            grad_stencil=grad_stencil)
         if progress:
+            _live = _blive.get("p")
+            if _live is not None:
+                _live.update(_live.total, force=True)
+                _live.close()
             print(f"[theory-HHG] mesh recursion done: elapsed "
                   f"{format_duration(time.perf_counter() - _t_band)}.", flush=True)
         for s in range(1, max_order + 1):
@@ -728,6 +733,7 @@ def _mesh_susceptibility(hamiltonian, kgrid, omega_axis, weights, ccfg, orders_g
     nw = omega_axis.size
     n_workers = int(getattr(ccfg, "n_workers", 0) or 0) or default_worker_count()
     reserve_gb = float(getattr(ccfg, "reserve_gb", 1.0))
+    grad_stencil = int(getattr(ccfg, "gradient_stencil", 2) or 2)
 
     # RAM guard: the shared band data + one recursion per thread must fit.  eigh is
     # done ONCE and reused across (freq x dir), so it never exceeds the full mesh.
@@ -738,13 +744,16 @@ def _mesh_susceptibility(hamiltonian, kgrid, omega_axis, weights, ccfg, orders_g
     if progress:
         print(f"[theory-susc] orders {list(orders_ge2)}: vectorized mesh recursion "
               f"({kpts.shape[0]} k-points, batched eigh once), {nw} frequencies x "
-              f"{dim} directions on up to {n_workers} cores. Progress with ETA below.",
+              f"{dim} directions on up to {n_workers} cores. Live progress with ETA below.",
               flush=True)
 
-    from qxti.utils.progress import ProgressTimer, format_duration
+    from qxti.utils.progress import LiveProgress
+    # Pad the mesh so the covariant gradient reads real out-of-box neighbours at the
+    # BZ box edge (no periodic wrap); halo = (max_order-1)*(stencil reach).
     band = precompute_band_data(hamiltonian._matrix_at, kpts, shape, bounds,
                                 mu=mu, T_au=T_au, dimension=dim,
-                                distribution=distribution)
+                                distribution=distribution,
+                                halo=(max_s - 1) * (grad_stencil // 2))
     sig = {s: np.full((nw,) + (dim,) * (s + 1), np.nan + 1j * np.nan, np.complex128)
            for s in orders_ge2}
 
@@ -752,21 +761,20 @@ def _mesh_susceptibility(hamiltonian, kgrid, omega_axis, weights, ccfg, orders_g
         iw, j = iw_j
         E_field = np.zeros(3, dtype=np.complex128); E_field[j] = 1.0
         J = harmonic_currents(band, weights, E_field, float(omega_axis[iw]), max_s,
-                              gamma=gamma, gamma_pop=gamma)
+                              gamma=gamma, gamma_pop=gamma, grad_stencil=grad_stencil)
         return iw, j, J
 
     tasks = [(iw, j) for iw in range(nw) for j in range(dim)]
-    timer = ProgressTimer(total=len(tasks)); step = max(1, len(tasks) // 20)
+    live = LiveProgress("theory-susc", len(tasks)) if progress else None
+    _done = [0]                                   # single-threaded: _store runs on the main thread
 
     def _store(iw, j, J):
         for s in orders_ge2:
             for i in range(dim):
                 sig[s][(iw, i) + (j,) * s] = np.conj(-J[s][i])
-        timer.advance()
-        if progress and (timer.completed % step == 0 or timer.completed == len(tasks)):
-            print(f"[theory-susc] {timer.completed}/{len(tasks)} (freq x dir) done -- "
-                  f"elapsed {format_duration(timer.elapsed_seconds)}, ETA {timer.eta_text()}.",
-                  flush=True)
+        _done[0] += 1
+        if live is not None:
+            live.update(_done[0], message="freq x dir")
 
     if n_workers <= 1:
         for t in tasks:
@@ -775,6 +783,9 @@ def _mesh_susceptibility(hamiltonian, kgrid, omega_axis, weights, ccfg, orders_g
         with ThreadPoolExecutor(max_workers=n_workers) as ex:
             for iw, j, J in ex.map(_one, tasks):
                 _store(iw, j, J)
+    if live is not None:
+        live.update(len(tasks), force=True)
+        live.close()
     return sig
 
 

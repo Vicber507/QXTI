@@ -35,6 +35,11 @@ from qxti.graphics.plot_susceptibility_tensor import (
 )
 
 
+# Default harmonic-axis cap for the full non-perturbative tddm engine, whose
+# spectrum is broadband (not limited by [cmd] max_order). Shows up to harmonic 10
+# (the +0.5 keeps the H10 peak fully inside the axis).
+TDDM_DEFAULT_MAX_HARMONIC_ORDER = 10.5
+
 DEFAULT_HAMILTONIAN_PLOTS = (
     "band_structure_2d",
     "band_surface_3d",
@@ -317,9 +322,18 @@ def plot_harmonic_graphics_from_saved_data(
     output_dir = Path(config.cmd.output_dir)
     data_dir = output_dir / "data"
     resolved_plot_config = resolve_harmonic_plot_config(plot_config)
-    # Show every harmonic that was actually computed: bump the display cap to the
-    # configured [cmd] max_order (the 3.5 default hides orders 4+ from a 7-order run).
+    # Show every harmonic that was actually computed by bumping the display cap.
+    #   * pfddm / ptddm (perturbative): the harmonic order IS the highest computed
+    #     order, so cap at [cmd] max_order (+0.5). The 3.5 default would otherwise
+    #     hide orders 4+ from a 7-order run.
+    #   * tddm (full non-perturbative): the solve produces a BROADBAND spectrum (all
+    #     harmonics up to Nyquist); max_order there only sizes the dataset schema,
+    #     NOT the harmonic content. Capping at max_order would hide the real H4+
+    #     peaks, so default the tddm display to harmonic 10 (raise, never lower).
+    _method = str(getattr(config.cmd, "response_method", "ptddm"))
     _max_h = float(config.cmd.max_order) + 0.5
+    if _method in ("tddm", "all"):
+        _max_h = max(_max_h, TDDM_DEFAULT_MAX_HARMONIC_ORDER)
     for _sec in resolved_plot_config.values():
         if isinstance(_sec, dict) and _sec.get("max_harmonic_order") is not None:
             _sec["max_harmonic_order"] = max(float(_sec["max_harmonic_order"]), _max_h)
