@@ -16,11 +16,17 @@ updated: 2026-07-21
 
 | Archivo | Rol | Símbolos clave |
 | --- | --- | --- |
-| [mesh_response.py](../../qxti/analytics/mesh_response.py) | Recursión **mesh-vectorizada** (producción) | `harmonic_currents_meshed`, `time_domain_currents`, `precompute_band_data`, `perk_harmonic_currents` |
-| [theory_response.py](../../qxti/analytics/theory_response.py) | Cablea mesh a producción (HHG + σ/χ) | `compute_hhg_spectrum`, `compute_susceptibility_spectrum`, `compute_linear_response_spectrum` |
+| [mesh_response.py](../../qxti/analytics/mesh_response.py) | Recursión **mesh-vectorizada** (`pfddm`) | `harmonic_currents_meshed`, `time_domain_currents`, `precompute_band_data`, `perk_harmonic_currents` |
+| [theory_response.py](../../qxti/analytics/theory_response.py) | Cablea mesh a producción (HHG + σ/χ) = `pfddm` | `compute_hhg_spectrum`, `compute_susceptibility_spectrum`, `compute_linear_response_spectrum` |
+| [tddm.py](../../qxti/analytics/tddm.py) | **`tddm`** full NO-perturbativo (gauge velocidad) | `compute_hhg_spectrum_tddm`, `compute_susceptibility_spectrum_tddm`, `_tddm_current_time`, `_vector_potential_from_field` |
 | [rho_analytic.py](../../qxti/analytics/rho_analytic.py) | **Referencia per-k** (Hipólito 2018) | `rho_order_s`, `sigma1_kubo`, `sigma_analytic`, `compare_rho_vs_qxti` |
 | [dos.py](../../qxti/analytics/dos.py) | 4 motores de DOS/LDOS | `compute_dos_spectrum` |
 | [hipolito2018.py](../../qxti/analytics/hipolito2018.py) | σ⁽¹⁾ analítica rápida (validación) | `analytical_sigma1_fast`, `load_model` |
+
+> El eje de motores (`pfddm`/`ptddm`/`tddm`) y la comparación están en [[Concept - Response Engines]].
+> `tddm` (gauge velocidad, streamable sin halo, exp-Euler en base instantánea) es el motor para
+> **fuera del régimen perturbativo**; en `-cmd` da el espectro directo, en `-xtp` extrae χ⁽ˢ⁾ por
+> **escalado en amplitud**.
 
 Guía detallada: [[MESH_RESPONSE]] (en `docs/`).
 

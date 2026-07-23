@@ -19,7 +19,7 @@ from qxti.utils.io_utils import (
     save_array_npy,
     write_complex_to_float16_memmap,
 )
-from qxti.utils.progress import ProgressTimer, format_bytes, format_duration
+from qxti.utils.progress import LiveProgress, ProgressTimer, format_bytes, format_duration
 
 from .distributions import T1T2Relaxation, bose_einstein, fermi_dirac, full_occupation, maxwell_boltzmann, valence_occupation
 
@@ -223,6 +223,9 @@ class CMD:
         self._damping_cache: ComplexArray = self._damping_matrix()
         # Console progress (set False to silence, e.g. inside parallel workers).
         self.progress_enabled: bool = True
+        # Live, self-refreshing ETA line for the k-loop (created per solve); the
+        # SAME LiveProgress style used by the tddm/pfddm engines. None => silent.
+        self._live: LiveProgress | None = None
         # Use the gauge-invariant covariant k-gradient (parallel transport /
         # Wilson links) instead of computing grad_k rho and the Berry-connection
         # commutator separately. The separate form is not individually
@@ -364,6 +367,8 @@ class CMD:
         saved_paths: dict[int, Path] = {}
         can_stream_saved_band_orders = self.basis == "band"
         progress_timer = ProgressTimer(total=total_order_solves)
+        self._live = (LiveProgress("CMD", total_order_solves)
+                      if (self.progress_enabled and total_order_solves > 0) else None)
         callbacks = order_observe_callbacks or {}
         last_order_observed = callbacks.get(self.max_order) is not None
 
@@ -562,6 +567,10 @@ class CMD:
                     )
                 previous_order_band = current_order_band
 
+        if self._live is not None:
+            self._live.update(total_order_solves, force=True)
+            self._live.close()
+            self._live = None
         self._time_domain_cache = None
         self._frequency_domain_cache = None
         return saved_paths
@@ -598,6 +607,8 @@ class CMD:
         completed_solves = 0
         field_series = self._field_series(target_times)
         progress_timer = ProgressTimer(total=total_order_solves)
+        self._live = (LiveProgress("CMD", total_order_solves)
+                      if (self.progress_enabled and total_order_solves > 0) else None)
 
         self._emit_progress(
             f"CMD starting: {self.max_order} driven orders, {len(k_points)} k-points, "
@@ -622,6 +633,10 @@ class CMD:
                 f"CMD order {order}/{self.max_order} completed."
             )
 
+        if self._live is not None:
+            self._live.update(total_order_solves, force=True)
+            self._live.close()
+            self._live = None
         return orders_band
 
     def _equilibrium_tensor_band(
@@ -942,28 +957,21 @@ class CMD:
                 if observe_callback is not None:
                     observe_callback(ik, np.asarray(solved_series, dtype=np.complex128))
 
-                # Heartbeat: emit a progress line at most once per interval.
-                # Also write a checkpoint file so a crash can be resumed.
+                # Heartbeat: refresh the live ETA line (throttles itself to a few
+                # seconds) and write a resume checkpoint at most once per interval.
                 now = time.perf_counter()
                 with _par_lock:
                     _par_counter[0] += 1
                     done = _par_counter[0]
                     if progress_timer is not None:
                         progress_timer.advance()
+                    if self._live is not None:
+                        self._live.update(
+                            progress_timer.completed if progress_timer else (completed_solves + done),
+                            message=(f"order {order}/{self.max_order}, "
+                                     f"{100 * (done + resume_from_k) // nk}%"))
                     if now - _par_last_emit[0] >= _PAR_HEARTBEAT_S:
                         _par_last_emit[0] = now
-                        elapsed = (
-                            format_duration(progress_timer.elapsed_seconds)
-                            if progress_timer else "unknown"
-                        )
-                        eta = progress_timer.eta_text() if progress_timer else "unknown"
-                        self._emit_progress(
-                            f"CMD progress: order {order}/{self.max_order}, "
-                            f"{done + resume_from_k}/{nk} k-points "
-                            f"({100 * (done + resume_from_k) // nk}%), "
-                            f"global {completed_solves + done}/{total_order_solves}, "
-                            f"elapsed {elapsed}, ETA {eta}."
-                        )
                         if checkpoint_path is not None:
                             try:
                                 Path(checkpoint_path).write_text(
@@ -1017,19 +1025,12 @@ class CMD:
                 except OSError:
                     pass
         else:
-            # Sequential k-loop with throttled milestone reporting.
+            # Sequential k-loop: _solve_k_range already refreshes the live ETA line
+            # via its heartbeat; here we only persist the resume checkpoint.
             for ik in range(remaining_k_start, nk):
                 _solve_k_range(ik, ik + 1)
                 completed_solves += 1
                 if (ik + 1) % milestone_interval == 0 or ik + 1 == nk:
-                    elapsed = format_duration(progress_timer.elapsed_seconds) if progress_timer else "unknown"
-                    eta = progress_timer.eta_text() if progress_timer else "unknown"
-                    self._emit_progress(
-                        f"CMD progress: order {order}/{self.max_order}, "
-                        f"k-point {ik + 1}/{nk} ({100 * (ik + 1) // nk}%), "
-                        f"global {completed_solves}/{total_order_solves}, "
-                        f"elapsed {elapsed}, ETA {eta}."
-                    )
                     if checkpoint_path is not None:
                         try:
                             Path(checkpoint_path).write_text(
@@ -1797,4 +1798,9 @@ class CMD:
         # workers, where the per-k-point progress would spam the console and
         # the meaningful progress is the per-frequency global counter).
         if getattr(self, "progress_enabled", True):
+            # Finalize any in-place live ETA line first so this message lands on a
+            # clean row instead of clobbering it.
+            live = getattr(self, "_live", None)
+            if live is not None:
+                live.close()
             print(f"[CMD] {message}")

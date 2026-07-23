@@ -42,10 +42,14 @@ Los campos completos de cada dataclass están en el propio `config.py`. Los más
 
 `.run()` ⇒ construye Hamiltoniano → datasets de bandas (si `hamiltonian_plots`) → `generate_cmd_outputs()`.
 
-`generate_cmd_outputs()` despacha por `cmd.response_method`:
-- `theory` → `_generate_hhg_theory()` → **lazy** `from qxti.analytics.theory_response import compute_hhg_spectrum`
-- `simulation` → pipeline `CMD` en el tiempo (+ streaming) 
-- `both` → ambos, reporta *speedup*
+`generate_cmd_outputs()` despacha por `cmd.response_method` (canónico vía `config._canonical_method`;
+alias theory→pfddm, simulation→ptddm):
+- `pfddm` → `_generate_hhg_theory()` → **lazy** `compute_hhg_spectrum` (mesh)
+- `ptddm` → pipeline `CMD` en el tiempo (+ streaming)
+- `tddm` → `_generate_hhg_tddm()` → **lazy** `compute_hhg_spectrum_tddm` (full no-perturbativo)
+- `both` → pfddm+ptddm; `all` → los 3 + `_report_engine_comparison` (`engine_comparison.npz`)
+
+Ver [[Concept - Response Engines]]. Config nueva: `[cmd] tddm_amplitude_ladder` (χ⁽ˢ⁾ de tddm en `-xtp`).
 
 *Builders* reutilizables (también los usa `theory_response`): `build_hamiltonian`, `build_kgrid`
 (con **degeneracy guard**, ver [[Concept - BZ Grid and Degeneracy Guard]]), `build_timegrid`,

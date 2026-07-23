@@ -561,33 +561,43 @@ class QXTISimulation:
         if not cmd_cfg.enabled:
             return {}
 
-        method = str(getattr(cmd_cfg, "response_method", "simulation")).lower()
-        if method not in {"simulation", "theory", "both"}:
+        # Canonical response engines (config normalizes theory->pfddm, simulation->ptddm):
+        #   pfddm = perturbative frequency-domain DM (mesh, fast)
+        #   ptddm = perturbative time-domain DM      (CMD, exact reference)
+        #   tddm  = full NON-perturbative time-domain DM (velocity gauge)
+        #   both  = pfddm + ptddm ;  all = pfddm + ptddm + tddm (+ comparison)
+        method = str(getattr(cmd_cfg, "response_method", "ptddm")).lower()
+        valid = {"pfddm", "ptddm", "tddm", "both", "all"}
+        if method not in valid:
             raise ValueError(
-                f"[cmd] response_method must be 'simulation', 'theory', or 'both' (got '{method}')."
+                f"[cmd] response_method must be one of {sorted(valid)} "
+                f"(aliases: theory->pfddm, simulation->ptddm; got '{method}')."
             )
 
+        if method == "pfddm":
+            return self._generate_hhg_theory(hamiltonian)[0]
+        if method == "ptddm":
+            return self._generate_cmd_simulation(hamiltonian)
+        if method == "tddm":
+            return self._generate_hhg_tddm(hamiltonian)[0]
+
+        # multi-engine: run each and (for 'all') compare
         outputs: dict[str, Path] = {}
-        theory_runtime = sim_runtime = None
-        if method in {"theory", "both"}:
-            theory_out, theory_runtime = self._generate_hhg_theory(hamiltonian)
-            outputs.update(theory_out)
-        if method == "theory":
-            return outputs
-        if method == "both":
-            t0 = time.perf_counter()
-            outputs.update(self._generate_cmd_simulation(hamiltonian))
-            sim_runtime = time.perf_counter() - t0
-            speedup = (sim_runtime / theory_runtime) if theory_runtime else float("inf")
-            self._emit_progress(
-                "=== HHG: comparacion de tiempos (mismos parametros) ===\n"
-                f"  Simulacion (CMD time-domain): {format_duration(sim_runtime)}\n"
-                f"  Teoria (perturbativa):        {format_duration(theory_runtime)}\n"
-                f"  Speedup:                      {speedup:.1f}x mas rapida la teoria"
-            )
-            return outputs
-
-        return self._generate_cmd_simulation(hamiltonian)
+        runtimes: dict[str, float] = {}
+        engines = ["pfddm", "ptddm"] + (["tddm"] if method == "all" else [])
+        for eng in engines:
+            if eng == "pfddm":
+                out, rt = self._generate_hhg_theory(hamiltonian)
+                outputs.update(out); runtimes["pfddm"] = rt
+            elif eng == "ptddm":
+                t0 = time.perf_counter()
+                outputs.update(self._generate_cmd_simulation(hamiltonian))
+                runtimes["ptddm"] = time.perf_counter() - t0
+            else:  # tddm
+                out, rt = self._generate_hhg_tddm(hamiltonian)
+                outputs.update(out); runtimes["tddm"] = rt
+        self._report_engine_comparison(runtimes, outputs)
+        return outputs
 
     def _generate_hhg_theory(self, hamiltonian: Hamiltonian) -> tuple[dict[str, Path], float]:
         """Compute the perturbative (theory) HHG spectrum and save it."""
@@ -604,24 +614,125 @@ class QXTISimulation:
         data_dir.mkdir(parents=True, exist_ok=True)
 
         # Save a graphics-compatible current_spectrum dataset so the standard
-        # harmonic graphics work transparently on the theory result. In 'both'
-        # mode the simulation owns current_spectrum.npz, so theory writes a
-        # clearly-named companion file instead.
-        method = str(getattr(cmd_cfg, "response_method", "simulation")).lower()
-        dataset_name = "current_spectrum_theory.npz" if method == "both" else "current_spectrum.npz"
+        # harmonic graphics work transparently. In multi-engine mode (both/all)
+        # ptddm owns current_spectrum.npz, so pfddm writes a named companion.
+        method = str(getattr(cmd_cfg, "response_method", "ptddm")).lower()
+        multi = method in {"both", "all"}
+        dataset_name = "current_spectrum_pfddm.npz" if multi else "current_spectrum.npz"
         dataset_path = data_dir / dataset_name
         np.savez(dataset_path, **result["dataset"])
 
-        outputs = {"xtp_current_spectrum_theory_data": dataset_path}
-        graphics_name = "current_spectrum_theory.npz" if method == "both" else "current_spectrum.npz"
+        outputs = {"xtp_current_spectrum_pfddm_data": dataset_path}
         self._emit_progress(
-            f"HHG theory current spectrum saved as '{dataset_path.name}' "
-            f"(computed in {format_duration(result['runtime_seconds'])}). "
-            f"Plot it with: python qxti/graphics/graphics.py <config> --family harmonics"
-            + ("  (uses current_spectrum.npz)" if method != "both" else
-               f"  (theory dataset: {graphics_name})")
+            f"HHG pfddm (perturbative frequency-domain) current spectrum saved as "
+            f"'{dataset_path.name}' (computed in {format_duration(result['runtime_seconds'])}). "
+            f"Plot: python qxti/graphics/graphics.py <config> --family harmonics"
+            + ("" if multi else "  (uses current_spectrum.npz)")
         )
         return outputs, float(result["runtime_seconds"])
+
+    def _generate_hhg_tddm(self, hamiltonian: Hamiltonian) -> tuple[dict[str, Path], float]:
+        """Compute the FULL non-perturbative (tddm) HHG spectrum and save it."""
+        from qxti.analytics.tddm import compute_hhg_spectrum_tddm
+
+        cmd_cfg = self.config.cmd
+        self._emit_progress(
+            f"HHG tddm engine: FULL non-perturbative time-domain solve (velocity gauge) "
+            f"up to the field's own harmonics (max_order={cmd_cfg.max_order} sets the schema). "
+            "Valid outside the perturbative regime. Progress with ETA below."
+        )
+        result = compute_hhg_spectrum_tddm(self.config, progress=True)
+        out_dir = Path(cmd_cfg.output_dir)
+        data_dir = out_dir / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+
+        method = str(getattr(cmd_cfg, "response_method", "ptddm")).lower()
+        multi = method in {"both", "all"}
+        dataset_name = "current_spectrum_tddm.npz" if multi else "current_spectrum.npz"
+        dataset_path = data_dir / dataset_name
+        np.savez(dataset_path, **result["dataset"])
+
+        outputs = {"xtp_current_spectrum_tddm_data": dataset_path}
+        self._emit_progress(
+            f"HHG tddm (full non-perturbative) current spectrum saved as "
+            f"'{dataset_path.name}' (computed in {format_duration(result['runtime_seconds'])}). "
+            f"Plot: python qxti/graphics/graphics.py <config> --family harmonics"
+            + ("" if multi else "  (uses current_spectrum.npz)")
+        )
+        return outputs, float(result["runtime_seconds"])
+
+    def _report_engine_comparison(self, runtimes: dict[str, float],
+                                  outputs: dict[str, Path]) -> None:
+        """Report timing across the engines run (both/all) and save a comparison
+        dataset (harmonic-peak overlay + per-harmonic relative error)."""
+        names = {"pfddm": "pfddm (pert. freq-domain, mesh)",
+                 "ptddm": "ptddm (pert. time-domain, CMD)",
+                 "tddm": "tddm (full non-perturbative)"}
+        lines = ["=== HHG engine comparison (same parameters) ==="]
+        for eng in ("pfddm", "ptddm", "tddm"):
+            if eng in runtimes:
+                lines.append(f"  {names[eng]:<38}: {format_duration(runtimes[eng])}")
+        # relative timings vs the fast pfddm engine
+        if "pfddm" in runtimes and runtimes["pfddm"] > 0:
+            for eng in ("ptddm", "tddm"):
+                if eng in runtimes:
+                    lines.append(f"  {eng}/pfddm slowdown: {runtimes[eng] / runtimes['pfddm']:.1f}x")
+        self._emit_progress("\n".join(lines))
+        try:
+            self._save_engine_comparison_dataset(outputs)
+        except Exception as exc:  # comparison is a convenience, never fatal
+            self._emit_progress(f"[compare] engine-comparison dataset skipped: {exc}")
+
+    def _save_engine_comparison_dataset(self, outputs: dict[str, Path]) -> None:
+        """Overlay the per-engine harmonic spectra and per-harmonic relative error."""
+        data_dir = Path(self.config.cmd.output_dir) / "data"
+        files = {
+            "pfddm": data_dir / "current_spectrum_pfddm.npz",
+            "ptddm": data_dir / "current_spectrum.npz",
+            "tddm": data_dir / "current_spectrum_tddm.npz",
+        }
+        loaded = {}
+        for eng, path in files.items():
+            if path.exists():
+                with np.load(path) as d:
+                    loaded[eng] = (np.asarray(d["omega_axis"]),
+                                   np.asarray(d["current_total_magnitude"]))
+        if len(loaded) < 2:
+            return
+        omega0 = float(self.config.laser.omega)
+        max_order = int(self.config.cmd.max_order)
+        ref = "ptddm" if "ptddm" in loaded else "pfddm"
+        omega_ref, mag_ref = loaded[ref]
+        comp = {"omega0": omega0, "reference_engine": ref,
+                "engines": np.asarray(list(loaded.keys()))}
+        for eng, (omega, mag) in loaded.items():
+            comp[f"omega_axis_{eng}"] = omega
+            comp[f"current_total_magnitude_{eng}"] = mag
+        # per-harmonic peak table + relative error vs the reference
+        harmonics = list(range(1, max_order + 1))
+        peaks = {eng: [] for eng in loaded}
+        relerr = []
+        for s in harmonics:
+            for eng, (omega, mag) in loaded.items():
+                peaks[eng].append(float(mag[int(np.argmin(np.abs(omega - s * omega0)))]))
+            pr = peaks[ref][-1]
+            row = {eng: peaks[eng][-1] for eng in loaded}
+            relerr.append([abs(row[eng] - pr) / pr if pr > 0 else np.nan for eng in loaded])
+        comp["harmonics"] = np.asarray(harmonics)
+        for eng in loaded:
+            comp[f"harmonic_peaks_{eng}"] = np.asarray(peaks[eng])
+        comp["relative_error_columns"] = np.asarray(list(loaded.keys()))
+        comp["relative_error_vs_reference"] = np.asarray(relerr)
+        out_path = data_dir / "engine_comparison.npz"
+        np.savez(out_path, **comp)
+        outputs["engine_comparison_data"] = out_path
+        # a compact console table
+        header = "  H  " + "  ".join(f"{eng:>12}" for eng in loaded)
+        rows = [header]
+        for i, s in enumerate(harmonics):
+            rows.append(f"  {s:<3}" + "  ".join(f"{peaks[eng][i]:>12.4e}" for eng in loaded))
+        self._emit_progress("HHG harmonic-peak comparison (|J| total):\n" + "\n".join(rows)
+                            + f"\n(reference={ref}; full table + relative error in {out_path.name})")
 
     def _generate_cmd_simulation(self, hamiltonian: Hamiltonian) -> dict[str, Path]:
         cmd_cfg = self.config.cmd

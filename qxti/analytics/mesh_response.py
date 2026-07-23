@@ -85,19 +85,70 @@ def _build_H_mesh(H_func: Callable, kpts: FloatArray) -> ComplexArray:
     return out
 
 
+def _pad_band_mesh(kpts, shape, bounds, halo, dim):
+    """Extend the k-mesh by ``halo`` REAL out-of-box layers on each active axis.
+
+    The covariant-gradient stencil reads neighbours via ``np.roll``, which wraps
+    PERIODICALLY at the box edges — correct only if the reciprocal box is a lattice
+    cell (``H(k+box)=H(k)``).  For axis-aligned rectangular boxes on non-orthogonal
+    (e.g. hexagonal) lattices the wraparound links inequivalent k-points, injecting a
+    boundary gradient error that DIVERGES ∝N.  Padding with REAL out-of-box k (same
+    spacing, Cartesian extrapolation, no wrap) makes the stencil read true neighbours
+    at the boundary.  For a genuinely periodic box the padded points ARE the periodic
+    images (``H`` periodic), so this reduces to the wrapped result — correct either way.
+
+    Returns ``(kpts_pad, shape_pad, bounds_pad, interior_mask)`` with the interior
+    (original grid) flagged so the BZ sum still runs over exactly one cell.
+    """
+    n = [int(shape[a]) for a in range(3)]
+    km = np.asarray(kpts, dtype=np.float64).reshape(n[0], n[1], n[2], 3)
+    axvals = [km[:, 0, 0, 0].copy(), km[0, :, 0, 1].copy(), km[0, 0, :, 2].copy()]
+    padded, bounds_pad, interior = [], [], []
+    for a in range(3):
+        v = axvals[a]
+        if a < dim and n[a] > 1:
+            dk = (v[-1] - v[0]) / (n[a] - 1)
+            below = v[0] - dk * np.arange(halo, 0, -1)
+            above = v[-1] + dk * np.arange(1, halo + 1)
+            vp = np.concatenate([below, v, above])
+            interior.append((halo, halo + n[a]))
+            bounds_pad.append((float(vp[0] - 0.5 * dk), float(vp[-1] + 0.5 * dk)))
+        else:
+            vp = v
+            interior.append((0, n[a]))
+            bd = bounds[a] if a < len(bounds) else (0.0, 0.0)
+            bounds_pad.append((float(bd[0]), float(bd[1])))
+        padded.append(vp)
+    KX, KY, KZ = np.meshgrid(padded[0], padded[1], padded[2], indexing="ij")
+    kpts_pad = np.stack([KX.ravel(), KY.ravel(), KZ.ravel()], axis=1)
+    shape_pad = tuple(len(p) for p in padded)
+    mask = np.zeros(shape_pad, dtype=bool)
+    (a0, b0), (a1, b1), (a2, b2) = interior
+    mask[a0:b0, a1:b1, a2:b2] = True
+    return kpts_pad, shape_pad, tuple(bounds_pad), mask.ravel()
+
+
 class BandData:
     """Frequency/field-independent band data on the k-mesh, computed ONCE.
 
     Reused across a whole (ω, drive-direction) sweep by ``harmonic_currents`` so
     the expensive batched ``eigh`` and velocity build happen only a single time.
+
+    ``halo`` > 0 pads the mesh with real out-of-box layers (see ``_pad_band_mesh``)
+    so the covariant gradient does not wrap at the BZ box edge; ``self.interior``
+    then flags the original grid cells for the BZ sum.
     """
 
     __slots__ = ("energies", "U", "Udag", "U_mesh", "vel", "A", "f", "dfde",
-                 "eps", "valid", "inv_eps", "dks", "shape", "nb", "nk", "dim", "diag")
+                 "eps", "valid", "inv_eps", "dks", "shape", "nb", "nk", "dim", "diag",
+                 "interior")
 
     def __init__(self, H_func, kpts, shape, bounds, *, mu=0.0, T_au=0.0,
-                 dimension=3, dk_vel=1e-4, distribution=None, h_batch=None):
+                 dimension=3, dk_vel=1e-4, distribution=None, h_batch=None, halo=0):
         dim = int(dimension)
+        interior = None
+        if halo and int(halo) > 0:
+            kpts, shape, bounds, interior = _pad_band_mesh(kpts, shape, bounds, int(halo), dim)
         nk = kpts.shape[0]
         # ``h_batch(kpts)->(nk,nb,nb)`` (vectorized) avoids the per-k Python loop in
         # ``_build_H_mesh`` — essential at large grids (150^3 = millions of points).
@@ -141,11 +192,12 @@ class BandData:
         self.shape = tuple(int(s) for s in shape)
         self.nb = nb; self.nk = nk; self.dim = dim
         self.diag = np.arange(nb)
+        self.interior = interior   # bool mask (nk,) of original-grid cells, or None
 
 
 def precompute_band_data(H_func, kpts, shape, bounds, *, mu=0.0, T_au=0.0,
                          dimension=3, dk_vel=1e-4, distribution=None,
-                         h_batch=None) -> BandData:
+                         h_batch=None, halo=0) -> BandData:
     """Diagonalize H and build velocities/Berry connection on the mesh ONCE.
 
     ``distribution(E, mu, T) -> f`` sets the band occupation (default: energy
@@ -153,14 +205,39 @@ def precompute_band_data(H_func, kpts, shape, bounds, *, mu=0.0, T_au=0.0,
     SAME filling as order 1 and as the configured engine (e.g. valence_occupation).
     ``h_batch(kpts)->(nk,nb,nb)`` is an optional VECTORIZED Hamiltonian builder
     (skips the per-k Python loop; needed for large grids).
+    ``halo`` > 0 pads the mesh with real out-of-box layers so the covariant gradient
+    does not wrap at the BZ box edge; pass ``(max_order-1)*(grad_stencil//2)``.
     """
     return BandData(H_func, kpts, shape, bounds, mu=mu, T_au=T_au,
                     dimension=dimension, dk_vel=dk_vel, distribution=distribution,
-                    h_batch=h_batch)
+                    h_batch=h_batch, halo=halo)
+
+
+def _wilson_cov_grad(R, b, U_mesh, Udag, mesh_shape, nflat, nb, dk, grad_stencil):
+    """Wilson-link covariant k-gradient D_k ρ = ∂_k ρ − i[A_k, ρ] along axis ``b``.
+
+    Each neighbour ρ(k+m·Δk) is parallel-transported into k's eigengauge via the
+    Wilson link W = U(k)† U(k+m·Δk) before the finite difference.
+    ``grad_stencil=2`` -> 2-point central difference, truncation error O(Δk²).
+    ``grad_stencil=4`` -> 5-point 4th-order stencil, error O(Δk⁴); reaches the ±2
+    neighbours (upstream halo must be 2·(max_order−1) so the interior stays exact).
+    """
+    Rm = R.reshape(*mesh_shape, nb, nb)
+
+    def transported(shift):
+        W = Udag @ np.roll(U_mesh, -shift, axis=b).reshape(nflat, nb, nb)
+        Rs = np.roll(Rm, -shift, axis=b).reshape(nflat, nb, nb)
+        return W @ Rs @ np.conj(np.swapaxes(W, -1, -2))
+
+    if grad_stencil >= 4:
+        return (-transported(2) + 8.0 * transported(1)
+                - 8.0 * transported(-1) + transported(-2)) / (12.0 * dk)
+    return (transported(1) - transported(-1)) / (2.0 * dk)
 
 
 def harmonic_currents(band: BandData, weights, E_field, omega, max_order, *,
-                      gamma=1e-3, gamma_pop=None, progress_cb=None) -> dict[int, ComplexArray]:
+                      gamma=1e-3, gamma_pop=None, progress_cb=None,
+                      grad_stencil=2) -> dict[int, ComplexArray]:
     """BZ-summed J^(s)_i = Σ_k w_k Tr[v_i ρ^(s)] from precomputed band data.
 
     ρ^(s) is the length-gauge A1 recursion with the one-shot Wilson covariant
@@ -196,15 +273,8 @@ def harmonic_currents(band: BandData, weights, E_field, omega, max_order, *,
     shape, U_mesh, Udag, dks = band.shape, band.U_mesh, band.Udag, band.dks
 
     def cov_grad(R, b):
-        Up = np.roll(U_mesh, -1, axis=b).reshape(nk, nb, nb)
-        Un = np.roll(U_mesh, +1, axis=b).reshape(nk, nb, nb)
-        wp = Udag @ Up
-        wm = Udag @ Un
-        Rm = R.reshape(*shape, nb, nb)
-        Rp = np.roll(Rm, -1, axis=b).reshape(nk, nb, nb)
-        Rn = np.roll(Rm, +1, axis=b).reshape(nk, nb, nb)
-        return (wp @ Rp @ np.conj(np.swapaxes(wp, -1, -2))
-                - wm @ Rn @ np.conj(np.swapaxes(wm, -1, -2))) / (2.0 * dks[b])
+        return _wilson_cov_grad(R, b, U_mesh, Udag, shape, nk, nb,
+                                dks[b], grad_stencil)
 
     for s in range(2, max_order + 1):
         src = np.zeros((nk, nb, nb), dtype=np.complex128)
@@ -218,12 +288,17 @@ def harmonic_currents(band: BandData, weights, E_field, omega, max_order, *,
         if progress_cb is not None:
             progress_cb(s)
 
-    w = np.asarray(weights, dtype=np.float64).reshape(nk)
+    # BZ sum runs over the ORIGINAL grid only; padded (halo) cells exist solely to
+    # feed the covariant gradient real neighbours at the box edge.
+    interior = band.interior
+    w = np.asarray(weights, dtype=np.float64).reshape(-1)
     currents: dict[int, ComplexArray] = {}
     for s in range(1, max_order + 1):
         Js = np.zeros(3, dtype=np.complex128)
         for i in range(dim):
             tr = np.einsum("kmn,knm->k", vel[i], rhos[s], optimize=True)
+            if interior is not None:
+                tr = tr[interior]
             Js[i] = np.sum(tr * w)
         currents[s] = Js
     return currents
@@ -285,6 +360,7 @@ def harmonic_currents_meshed(
     h_batch: Callable | None = None,
     return_intraband: bool = False,
     progress_cb: Callable | None = None,
+    grad_stencil: int = 2,
 ) -> dict[int, ComplexArray]:
     """Memory-safe + multi-core BZ-summed harmonic currents from ``H_func``.
 
@@ -313,7 +389,9 @@ def harmonic_currents_meshed(
     if gamma_pop is None:
         gamma_pop = gamma
     dks = [(float(bounds[a][1]) - float(bounds[a][0])) / shape[a] for a in range(dim)]
-    halo = int(max_order) - 1
+    # 2-point stencil reaches ±1 per gradient application -> halo max_order-1.
+    # 5-point (grad_stencil=4) reaches ±2 -> halo doubles so the interior stays exact.
+    halo = (int(max_order) - 1) * (int(grad_stencil) // 2)
     n_workers = default_worker_count() if n_workers is None else max(1, int(n_workers))
 
     build = (lambda kp: np.asarray(h_batch(kp), dtype=np.complex128)) if h_batch is not None \
@@ -323,19 +401,31 @@ def harmonic_currents_meshed(
     wmesh = np.asarray(weights, dtype=np.float64).reshape(n0, n1, n2)
 
     nb = int(build(kmesh[:1, :1, :1].reshape(1, 3)).shape[1])
-    bytes_per_plane = n1 * n2 * nb * nb * 16.0 * _LIVE_ARRAYS_PER_PLANE
+    # Each block is padded with a real out-of-box halo on every active axis so the
+    # covariant gradient never wraps at the box edge; size the plane by the PADDED
+    # transverse extent (axes 1,2) so the RAM guard stays honest.
+    n1p = n1 + (2 * halo if dim >= 2 else 0)
+    n2p = n2 + (2 * halo if dim >= 3 else 0)
+    bytes_per_plane = n1p * n2p * nb * nb * 16.0 * _LIVE_ARRAYS_PER_PLANE
     cap = int(max_block_planes) if max_block_planes else n0
     mode, n_workers, bs = _plan_stream(n0, bytes_per_plane, halo, n_workers, reserve_gb, cap)
     single = mode == "single"
 
-    def _band_and_current(plane_idx, interior):
-        """Band build once + recursion per field on one (block+halo).
+    def _band_and_current(p_lo, p_hi):
+        """Band build once + recursion per field on ONE block, padded with a real
+        out-of-box halo on every active axis so the covariant gradient never wraps
+        at the BZ box edge (spurious for non-orthogonal / hexagonal reciprocal cells).
 
         Returns a length-F list of ``{s: Js(3,)}`` (F = number of drive fields).
         """
-        P = plane_idx.size
-        kb = kmesh[plane_idx].reshape(P * n1 * n2, 3)
-        bshape = (P, n1, n2)
+        P = p_hi - p_lo
+        kb_int = kmesh[p_lo:p_hi].reshape(P * n1 * n2, 3)
+        w_int = wmesh[p_lo:p_hi].reshape(P * n1 * n2)
+        if halo > 0:
+            kb, bshape, _, sel = _pad_band_mesh(kb_int, (P, n1, n2), bounds, halo, dim)
+        else:                                    # max_order == 1: no gradient, no halo
+            kb, bshape, sel = kb_int, (P, n1, n2), None
+        npad = kb.shape[0]
         Hm = build(kb)
         energies, U = np.linalg.eigh(Hm)
         Udag = np.conj(np.swapaxes(U, -1, -2)); del Hm
@@ -355,9 +445,6 @@ def harmonic_currents_meshed(
         diag = np.arange(nb)
         fmn = f[:, None, :] - f[:, :, None]
         U_mesh = U.reshape(*bshape, nb, nb)
-        w_full = wmesh[plane_idx].reshape(P * n1 * n2)
-        int_flat = np.repeat(np.isin(np.arange(P), np.arange(interior.start, interior.stop)),
-                             n1 * n2)
 
         ow1_coh = complex(omega + 1j * gamma)
         ow1_pop = complex(omega + 1j * gamma_pop)
@@ -371,25 +458,20 @@ def harmonic_currents_meshed(
                 r = np.where(valid, (A[c] * fmn) / (ow1_coh - eps), 0.0)
             r[:, diag, diag] += (-1j) * dfde * np.real(vel[c][:, diag, diag]) / ow1_pop
             r_c.append(r)
-        vint = [vel[i][int_flat] for i in range(dim)]
-        wint = w_full[int_flat]
+        # BZ sum runs over the INTERIOR (original grid) cells only; the padded halo
+        # cells exist solely to feed the covariant gradient real neighbours.
+        vint = [vel[i] if sel is None else vel[i][sel] for i in range(dim)]
+        wint = w_int
+        vint_diag = [vint[i][:, diag, diag] for i in range(dim)] if return_intraband else None
 
         def cov_grad(R, b):
-            Up = np.roll(U_mesh, -1, axis=b).reshape(P * n1 * n2, nb, nb)
-            Un = np.roll(U_mesh, +1, axis=b).reshape(P * n1 * n2, nb, nb)
-            wp = Udag @ Up; wm = Udag @ Un
-            Rm = R.reshape(*bshape, nb, nb)
-            Rp = np.roll(Rm, -1, axis=b).reshape(P * n1 * n2, nb, nb)
-            Rn = np.roll(Rm, +1, axis=b).reshape(P * n1 * n2, nb, nb)
-            return (wp @ Rp @ np.conj(np.swapaxes(wp, -1, -2))
-                    - wm @ Rn @ np.conj(np.swapaxes(wm, -1, -2))) / (2.0 * dks[b])
-
-        vint_diag = [vint[i][:, diag, diag] for i in range(dim)] if return_intraband else None
+            return _wilson_cov_grad(R, b, U_mesh, Udag, bshape, npad,
+                                    nb, dks[b], grad_stencil)
 
         def _trace_J(rho_s):
             """Total current J_i = Σ_k w_k Tr[v_i ρ] = Σ_k w Σ_mn v_mn ρ_nm."""
             Js = np.zeros(3, dtype=np.complex128)
-            ri = rho_s[int_flat]
+            ri = rho_s if sel is None else rho_s[sel]
             for i in range(dim):
                 tr = np.einsum("kmn,knm->k", vint[i], ri, optimize=True)
                 Js[i] = np.sum(tr * wint)
@@ -399,7 +481,7 @@ def harmonic_currents_meshed(
             """Intraband (Drude/Bloch) current: Σ_k w Σ_n v_nn ρ_nn (diagonal only).
             Interband = total − intra (off-diagonal coherences)."""
             Js = np.zeros(3, dtype=np.complex128)
-            ri_d = rho_s[int_flat][:, diag, diag]
+            ri_d = (rho_s if sel is None else rho_s[sel])[:, diag, diag]
             for i in range(dim):
                 Js[i] = np.sum(np.einsum("kn,kn->k", vint_diag[i], ri_d, optimize=True) * wint)
             return Js
@@ -407,14 +489,14 @@ def harmonic_currents_meshed(
         results = []
         for ef in range(nF):
             E = E_arr[ef]
-            rho = np.zeros((P * n1 * n2, nb, nb), dtype=np.complex128)
+            rho = np.zeros((npad, nb, nb), dtype=np.complex128)
             for c in range(dim):
                 if abs(E[c]) >= 1e-40:
                     rho += E[c] * r_c[c]
             Js_by_order = {1: _trace_J(rho)}
             Ji_by_order = {1: _trace_intra(rho)} if return_intraband else None
             for s in range(2, max_order + 1):
-                src = np.zeros((P * n1 * n2, nb, nb), dtype=np.complex128)
+                src = np.zeros((npad, nb, nb), dtype=np.complex128)
                 for b in range(dim):
                     if abs(E[b]) >= 1e-40:
                         src += E[b] * cov_grad(rho, b)
@@ -427,22 +509,23 @@ def harmonic_currents_meshed(
             results.append((Js_by_order, Ji_by_order))
         return results
 
-    # ---- build the block list (interior tiling) ------------------------------
+    # ---- build the block list (interior plane ranges) ------------------------
+    # Each block is the interior [lo,hi); ``_band_and_current`` pads it with the
+    # real out-of-box halo internally (no periodic wrap at the box edge).
     jobs = []
     if single:
-        jobs.append((np.arange(n0), slice(0, n0)))
+        jobs.append((0, n0))
     else:
         lo = 0
         while lo < n0:
             hi = min(lo + bs, n0)
-            plane_idx = np.arange(lo - halo, hi + halo) % n0
-            jobs.append((plane_idx, slice(halo, halo + (hi - lo))))
+            jobs.append((lo, hi))
             lo = hi
 
     # ---- one concurrency-aware RAM check, then run ---------------------------
-    # Peak = (#blocks running at once) × (largest block+halo).  ThreadPoolExecutor
+    # Peak = (#blocks running at once) × (largest padded block).  ThreadPoolExecutor
     # caps concurrency at n_workers, so this bounds the true peak footprint.
-    max_block_planes_live = max((j[0].size for j in jobs), default=n0)
+    max_block_planes_live = max((hi - lo for (lo, hi) in jobs), default=n0) + 2 * halo
     concurrent = 1 if (single or n_workers <= 1) else min(n_workers, len(jobs))
     _mem.ensure_headroom(concurrent * max_block_planes_live * bytes_per_plane,
                          reserve_gb=reserve_gb, label="mesh-stream (concurrent peak)")
@@ -498,6 +581,7 @@ def mesh_harmonic_currents(
     n_workers: int | None = None,
     reserve_gb: float = 1.0,
     h_batch: Callable | None = None,
+    grad_stencil: int = 2,
 ) -> dict[int, ComplexArray]:
     """BZ-summed harmonic currents J^(s)_i = Σ_k w_k Tr[v_i ρ^(s)(k, s·ω)].
 
@@ -508,7 +592,7 @@ def mesh_harmonic_currents(
         H_func, kpts, shape, bounds, weights, E_field, omega, max_order,
         gamma=gamma, gamma_pop=gamma_pop, mu=mu, T_au=T_au, dimension=dimension,
         dk_vel=dk_vel, distribution=distribution, n_workers=n_workers,
-        reserve_gb=reserve_gb, h_batch=h_batch)
+        reserve_gb=reserve_gb, h_batch=h_batch, grad_stencil=grad_stencil)
 
 
 def perk_harmonic_currents(
@@ -604,7 +688,11 @@ def time_domain_currents(band: BandData, weights, E_t, dt, max_order, *,
     Gamma = np.full((nb, nb), gamma)
     np.fill_diagonal(Gamma, gamma_pop)
     iGamma = 1j * Gamma                                     # (nb, nb)
-    w_k = np.asarray(weights, dtype=np.float64).reshape(nk)
+    # BZ sum runs over the INTERIOR (original grid); padded halo cells (band built
+    # with halo>0) only feed the covariant gradient real neighbours at the box edge.
+    interior = band.interior
+    w_k = np.asarray(weights, dtype=np.float64).reshape(-1)
+    vel_int = vel if interior is None else [vel[i][interior] for i in range(dim)]
     if k_chunk is None:
         k_chunk = max(1, int(2_000_000 // (nb * nb * max(Nt, 1))))
 
@@ -623,24 +711,25 @@ def time_domain_currents(band: BandData, weights, E_t, dt, max_order, *,
     # v_i weighted by the BZ measure, TRANSPOSED (m<->n) so the trace Tr[v_i ρ] =
     # Σ_mn v_i[m,n] ρ[n,m] becomes a plain index-aligned contraction that tensordot
     # routes through BLAS (an m<->n-transposed einsum falls back to a slow loop).
-    vwT = [(vel[i] * w_k[:, None, None]).swapaxes(1, 2).copy() for i in range(dim)]
+    vwT = [(vel_int[i] * w_k[:, None, None]).swapaxes(1, 2).copy() for i in range(dim)]
 
     def _current(rho_omega, s):
         # J^(s)_i(ω) = i^(s-1) Σ_k w_k Tr[v_i ρ^(s)(ω)] (physical phase -> J(t) real).
         phase = 1j ** (s - 1)
+        ro = rho_omega if interior is None else rho_omega[interior]
         Jw = np.empty((Nt, 3), dtype=np.complex128)
         for i in range(dim):
-            Jw[:, i] = phase * np.tensordot(vwT[i], rho_omega, axes=([0, 1, 2], [0, 1, 2]))
+            Jw[:, i] = phase * np.tensordot(vwT[i], ro, axes=([0, 1, 2], [0, 1, 2]))
         return Jw, np.fft.ifft(Jw, axis=0)
 
     # diagonal (band-group) velocity weighted by the BZ measure, for the intraband
     # current J_intra = Σ_k w_k Σ_n v_nn ρ_nn.  Interband = total − intra.
-    vdw = [(vel[i][:, diag, diag] * w_k[:, None]) for i in range(dim)] if return_intraband else None
+    vdw = [(vel_int[i][:, diag, diag] * w_k[:, None]) for i in range(dim)] if return_intraband else None
 
     def _current_intra(rho_omega, s):
         phase = 1j ** (s - 1)
         Jw = np.empty((Nt, 3), dtype=np.complex128)
-        rho_d = rho_omega[:, diag, diag, :]                 # (nk, nb, Nt)
+        rho_d = (rho_omega if interior is None else rho_omega[interior])[:, diag, diag, :]
         for i in range(dim):
             Jw[:, i] = phase * np.tensordot(vdw[i], rho_d, axes=([0, 1], [0, 1]))
         return Jw, np.fft.ifft(Jw, axis=0)

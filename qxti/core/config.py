@@ -210,16 +210,34 @@ class LaserConfig:
         return self.phiz
 
 
+# Canonical response-engine names (with backward-compatible aliases).  The eje:
+#   pfddm = perturbative frequency-domain DM  (old "theory";     the mesh engine)
+#   ptddm = perturbative time-domain DM       (old "simulation"; the CMD engine)
+#   tddm  = full NON-perturbative time-domain DM (new; velocity gauge)
+#   both  = the two perturbative engines (pfddm + ptddm)
+#   all   = run all three and emit the comparison
+_ENGINE_ALIASES = {
+    "theory": "pfddm", "pfddm": "pfddm",
+    "simulation": "ptddm", "ptddm": "ptddm",
+    "tddm": "tddm", "both": "both", "all": "all",
+}
+_CANONICAL_ENGINES = ("pfddm", "ptddm", "tddm", "both", "all")
+
+
+def _canonical_method(value: str | None, *, default: str = "ptddm") -> str:
+    """Map an engine name (including deprecated aliases) to its canonical form."""
+    s = (str(value).strip().lower() if value is not None else "") or default
+    return _ENGINE_ALIASES.get(s, s)
+
+
 @dataclass(slots=True)
 class CMDConfig:
     enabled: bool = False
     output_dir: str = "outputs/cmd"
     max_order: int = 1
-    # HHG/CMD engine selector:
-    #   "simulation" = time-domain density-matrix solve + FFT (exact, slow)
-    #   "theory"     = perturbative analytical current spectrum (fast)
-    #   "both"       = run both and report timing + comparison
-    response_method: str = "simulation"
+    # Response engine (canonical: pfddm | ptddm | tddm | both | all; old names
+    # theory/simulation are accepted as aliases). See _ENGINE_ALIASES above.
+    response_method: str = "ptddm"
     rho_storage_dtype: str = "complex128"
     scratch_rho_storage_dtype: str = "auto"
     keep_rho_orders: bool = True
@@ -252,6 +270,14 @@ class CMDConfig:
     # RAM (GB) the streaming mesh engine always keeps free so the machine never
     # swaps itself to death; the block size adapts to honor it (any OS).
     reserve_gb: float = 1.0
+    # tddm (-xtp): field-amplitude ladder for the χ⁽ˢ⁾ polynomial extraction
+    # (empty -> auto geometric ladder covering max_order+1 amplitudes).
+    tddm_amplitude_ladder: tuple[float, ...] = ()
+    # Order of the covariant k-gradient finite-difference stencil in the pfddm/ptddm
+    # mesh recursion. 2 = 2-point central (error O(Δk²), default); 4 = 5-point 4th
+    # order (error O(Δk⁴), ~1.5x/point but far less grid error, so a coarser mesh
+    # reaches the same accuracy). Halo widens to 2·(max_order−1) when 4.
+    gradient_stencil: int = 2
 
 
 @dataclass(slots=True)
@@ -284,7 +310,7 @@ class XTPConfig:
     #   "simulation" = time-domain CMD pulse + FFT (numerically exact, slow)
     #   "theory"     = analytical frequency-domain Kubo/Hipolito formula (fast)
     #   "both"       = run both and save both for comparison (+ timing report)
-    susceptibility_method: str = "simulation"
+    susceptibility_method: str = "ptddm"
     # Parallel processes for the laser-frequency sweep (0 = auto, RAM-bounded).
     susceptibility_n_workers: int = 0
     susceptibility_plot_enabled: bool = False
@@ -760,7 +786,7 @@ class QXTIConfig:
             enabled=section.getboolean("enabled", fallback=False),
             output_dir=section.get("output_dir", fallback="outputs/cmd").strip() or "outputs/cmd",
             max_order=section.getint("max_order", fallback=1),
-            response_method=section.get("response_method", fallback="simulation").strip().lower() or "simulation",
+            response_method=_canonical_method(section.get("response_method", fallback="ptddm")),
             rho_storage_dtype=section.get("rho_storage_dtype", fallback="complex128").strip().lower() or "complex128",
             scratch_rho_storage_dtype=section.get("scratch_rho_storage_dtype", fallback="auto").strip().lower() or "auto",
             keep_rho_orders=section.getboolean("keep_rho_orders", fallback=True),
@@ -790,6 +816,8 @@ class QXTIConfig:
             save_frequency_domain=section.getboolean("save_frequency_domain", fallback=False),
             n_workers=section.getint("n_workers", fallback=0),
             reserve_gb=section.getfloat("reserve_gb", fallback=1.0),
+            tddm_amplitude_ladder=tuple(_parse_float_list(section.get("tddm_amplitude_ladder", fallback=""))),
+            gradient_stencil=section.getint("gradient_stencil", fallback=2),
         )
 
     @staticmethod
@@ -843,7 +871,7 @@ class QXTIConfig:
                 _parse_float_list(section.get("susceptibility_omega_values", fallback=""), default=[])
             ),
             susceptibility_eps=section.getfloat("susceptibility_eps", fallback=1.0e-14),
-            susceptibility_method=section.get("susceptibility_method", fallback="simulation").strip().lower() or "simulation",
+            susceptibility_method=_canonical_method(section.get("susceptibility_method", fallback="ptddm")),
             susceptibility_n_workers=section.getint("susceptibility_n_workers", fallback=0),
             susceptibility_plot_enabled=section.getboolean("susceptibility_plot_enabled", fallback=False),
             susceptibility_plot_output_dir=section.get("susceptibility_plot_output_dir", fallback="").strip(),

@@ -50,6 +50,10 @@ python main.py inputs/inputParams.frank8.cfg -ldos  # DOS / arcos de Fermi
 python qxti/graphics/graphics.py inputs/inputParams.wsm.cfg   # plotea lo que haya
 ```
 
+**Motor de respuesta** (`[cmd] response_method` / `[xtp] susceptibility_method`):
+`pfddm` (=theory) | `ptddm` (=simulation) | `tddm` (full no-perturbativo) | `both` | `all`.
+Ver [[Concept - Response Engines]]. Para campo fuerte usa `tddm`; para comparar los 3, `all`.
+
 ## Convergencia / validez perturbativa
 
 Cada modelo tiene su malla-k, dt, E0, ω máximos para seguir siendo perturbativo. `tools/

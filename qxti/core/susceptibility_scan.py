@@ -16,7 +16,7 @@ from qxti.core.simulation import QXTISimulation
 from qxti.data import save_dataset_npz
 from qxti.response import SusceptibilityTensorCalculator, XTP
 from qxti.response.cmd import CMD
-from qxti.utils.progress import ProgressTimer, format_bytes, format_duration
+from qxti.utils.progress import LiveProgress, ProgressTimer, format_bytes, format_duration
 
 
 ComplexArray = NDArray[np.complex128]
@@ -226,29 +226,39 @@ class SusceptibilityScanRunner:
         return cls(config=QXTIConfig.from_file(config_path).with_standard_output_dirs())
 
     def run(self) -> dict[str, Path]:
-        """Dispatch on ``[xtp] susceptibility_method``: simulation, theory, or both."""
-        method = str(getattr(self.config.xtp, "susceptibility_method", "simulation")).lower()
-        if method not in {"simulation", "theory", "both"}:
+        """Dispatch on ``[xtp] susceptibility_method``: pfddm | ptddm | tddm | both | all.
+
+        (aliases: theory->pfddm, simulation->ptddm; both = pfddm+ptddm; all adds tddm.)
+        """
+        method = str(getattr(self.config.xtp, "susceptibility_method", "ptddm")).lower()
+        valid = {"pfddm", "ptddm", "tddm", "both", "all"}
+        if method not in valid:
             raise ValueError(
-                f"susceptibility_method must be 'simulation', 'theory', or 'both' (got '{method}')."
+                f"susceptibility_method must be one of {sorted(valid)} "
+                f"(aliases: theory->pfddm, simulation->ptddm; got '{method}')."
             )
 
+        if method == "pfddm":
+            return self._run_theory()[0]
+        if method == "ptddm":
+            return self._run_simulation()
+        if method == "tddm":
+            return self._run_tddm()[0]
+
+        # multi-engine (both = pfddm+ptddm ; all = + tddm)
         outputs: dict[str, Path] = {}
-        sim_runtime = theory_runtime = None
-
-        if method in {"theory", "both"}:
-            theory_out, theory_runtime = self._run_theory()
-            outputs.update(theory_out)
-
-        if method in {"simulation", "both"}:
-            t0 = time.perf_counter()
-            sim_out = self._run_simulation()
-            sim_runtime = time.perf_counter() - t0
-            outputs.update(sim_out)
-
-        if method == "both":
-            self._report_timing(sim_runtime, theory_runtime, outputs)
-
+        runtimes: dict[str, float] = {}
+        engines = ["pfddm", "ptddm"] + (["tddm"] if method == "all" else [])
+        for eng in engines:
+            if eng == "pfddm":
+                out, rt = self._run_theory(); outputs.update(out); runtimes["pfddm"] = rt
+            elif eng == "ptddm":
+                t0 = time.perf_counter()
+                outputs.update(self._run_simulation())
+                runtimes["ptddm"] = time.perf_counter() - t0
+            else:
+                out, rt = self._run_tddm(); outputs.update(out); runtimes["tddm"] = rt
+        self._report_timing(runtimes.get("ptddm"), runtimes.get("pfddm"), outputs)
         return outputs
 
     def _run_theory(self) -> tuple[dict[str, Path], float]:
@@ -265,25 +275,50 @@ class SusceptibilityScanRunner:
         )
         result = compute_susceptibility_spectrum(self.config, omega_axis, orders, progress=True)
 
-        # In 'both' mode the simulation owns xtp_susceptibility.npz, so theory
-        # writes a companion file; otherwise it writes the standard name so the
+        # In multi-engine mode (both/all) ptddm owns xtp_susceptibility.npz, so
+        # pfddm writes a named companion; otherwise the standard name so the
         # susceptibility graphics find it transparently.
-        method = str(getattr(self.config.xtp, "susceptibility_method", "simulation")).lower()
+        method = str(getattr(self.config.xtp, "susceptibility_method", "ptddm")).lower()
+        multi = method in {"both", "all"}
         out_dir = Path(self.config.xtp.susceptibility_output_dir) / "data"
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_name = "xtp_susceptibility_theory.npz" if method == "both" else "xtp_susceptibility.npz"
+        out_name = "xtp_susceptibility_pfddm.npz" if multi else "xtp_susceptibility.npz"
         out_path = out_dir / out_name
         from qxti.data import save_dataset_npz
         save_dataset_npz(out_path, result["dataset"])
-        plot_hint = (
-            f"python qxti/graphics/graphics.py <config> --family susceptibility"
-            + (f"  (theory dataset: {out_name})" if method == "both" else "")
-        )
         self._emit_progress(
-            f"Theory susceptibility tensors saved as '{out_path.name}' "
-            f"(computed in {format_duration(result['runtime_seconds'])}). Plot with: {plot_hint}"
+            f"pfddm susceptibility tensors saved as '{out_path.name}' "
+            f"(computed in {format_duration(result['runtime_seconds'])}). Plot with: "
+            f"python qxti/graphics/graphics.py <config> --family susceptibility"
         )
-        return {"xtp_susceptibility_theory_data": out_path}, float(result["runtime_seconds"])
+        return {"xtp_susceptibility_pfddm_data": out_path}, float(result["runtime_seconds"])
+
+    def _run_tddm(self) -> tuple[dict[str, Path], float]:
+        """χ⁽ˢ⁾ tensors from the FULL non-perturbative solve, via amplitude scaling."""
+        from qxti.analytics.tddm import compute_susceptibility_spectrum_tddm
+
+        omega_axis = np.asarray(self._resolve_laser_omega_axis(), dtype=np.float64)
+        orders = self._resolve_orders()
+        self._emit_progress(
+            f"tddm engine (-xtp): χ⁽ˢ⁾ by field-amplitude scaling for orders {orders} on "
+            f"{omega_axis.size} frequencies. Each amplitude is a full non-perturbative solve "
+            "(the most expensive engine). Progress below."
+        )
+        result = compute_susceptibility_spectrum_tddm(self.config, omega_axis, orders, progress=True)
+        method = str(getattr(self.config.xtp, "susceptibility_method", "ptddm")).lower()
+        multi = method in {"both", "all"}
+        out_dir = Path(self.config.xtp.susceptibility_output_dir) / "data"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_name = "xtp_susceptibility_tddm.npz" if multi else "xtp_susceptibility.npz"
+        out_path = out_dir / out_name
+        from qxti.data import save_dataset_npz
+        save_dataset_npz(out_path, result["dataset"])
+        self._emit_progress(
+            f"tddm susceptibility tensors saved as '{out_path.name}' "
+            f"(computed in {format_duration(result['runtime_seconds'])}). Plot with: "
+            f"python qxti/graphics/graphics.py <config> --family susceptibility"
+        )
+        return {"xtp_susceptibility_tddm_data": out_path}, float(result["runtime_seconds"])
 
     def _report_timing(self, sim_runtime: float, theory_runtime: float, outputs: dict[str, Path]) -> None:
         speedup = (sim_runtime / theory_runtime) if theory_runtime and theory_runtime > 0 else float("inf")
@@ -330,7 +365,6 @@ class SusceptibilityScanRunner:
             dimension=hamiltonian.dimension,
         )
 
-        frequency_timer = ProgressTimer(total=len(laser_omega_axis))
         max_order = max(requested_orders)
         n_workers = self._resolve_n_workers(
             nfreq=len(laser_omega_axis),
@@ -356,14 +390,13 @@ class SusceptibilityScanRunner:
         ]
 
         nfreq_total = len(laser_omega_axis)
+        sweep_live = LiveProgress("xtp", nfreq_total)   # single refreshing ETA line
+        _sweep_done = [0]                               # main-thread counter (map results are ordered)
 
         def _emit_frequency_progress(index: int) -> None:
-            frequency_timer.advance()
+            _sweep_done[0] += 1
             omega_ev = float(laser_omega_axis[index]) * _AU_TO_EV
-            self._emit_progress(
-                f"Susceptibility sweep: frequency {frequency_timer.completed}/{nfreq_total} done "
-                f"(omega_laser={omega_ev:.4f} eV), {self._runtime_suffix(frequency_timer)}."
-            )
+            sweep_live.update(_sweep_done[0], message=f"{nfreq_total} freqs, omega={omega_ev:.4f} eV")
 
         if n_workers <= 1:
             self._emit_progress(
@@ -385,6 +418,9 @@ class SusceptibilityScanRunner:
                 for index, values in executor.map(_susceptibility_frequency_worker, payloads):
                     self._write_frequency_result(dataset, index, values)
                     _emit_frequency_progress(index)
+
+        sweep_live.update(nfreq_total, force=True)
+        sweep_live.close()
 
         output_dir = Path(xtp_cfg.susceptibility_output_dir) / "data"
         output_dir.mkdir(parents=True, exist_ok=True)
