@@ -67,3 +67,37 @@ def H(kx, ky, kz, params=None):
         ],
         dtype=np.complex128,
     )
+
+
+def H_batch(kpts, params=None):
+    """Vectorized version of H over many k: kpts (nk,3) -> (nk,4,4).
+
+    Exact replica of H (each ``H[i,j] = expr`` -> ``H[:,i,j] = expr`` with
+    kx,ky,kz as arrays).  Avoids the per-k Python loop for large grids.
+    """
+    p = dict(DEFAULT_PARAMS)
+    if params:
+        p.update({k: v for k, v in params.items() if k in DEFAULT_PARAMS})
+    t, my, mz, delta = float(p["t"]), float(p["my"]), float(p["mz"]), float(p["delta"])
+    a0 = _a0(p)
+    kpts = np.asarray(kpts, dtype=np.float64)
+    kx, ky, kz = kpts[:, 0], kpts[:, 1], kpts[:, 2]
+    nk = kx.shape[0]
+    Bx = t * (np.cos(kx * a0) + my * (1 - np.cos(ky * a0)) + mz * (1 - np.cos(kz * a0)))
+    By1 = t * np.sin(ky * a0)
+    By2 = delta * t * np.cos(ky * a0)
+    Bz = t * np.sin(kz * a0)
+    H = np.zeros((nk, 4, 4), dtype=np.complex128)
+    H[:, 0, 1] = Bx - 1j * By1
+    H[:, 0, 2] = Bz
+    H[:, 0, 3] = -1j * By2
+    H[:, 1, 0] = Bx + 1j * By1
+    H[:, 1, 2] = 1j * By2
+    H[:, 1, 3] = -Bz
+    H[:, 2, 0] = Bz
+    H[:, 2, 1] = -1j * By2
+    H[:, 2, 3] = Bx - 1j * By1
+    H[:, 3, 0] = 1j * By2
+    H[:, 3, 1] = Bz
+    H[:, 3, 2] = Bx + 1j * By1
+    return H

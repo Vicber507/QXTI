@@ -243,3 +243,108 @@ def H(kx: float, ky: float, kz: float, params: dict[str, object] | None) -> np.n
     if stacking == "BA":
         return _hamiltonian_ba(f, gamma0, gamma1, gamma3, gamma4, delta_prime, u)
     return _hamiltonian_aa(f, gamma0, gamma1, u)
+
+
+def H_batch(kpts, params=None):
+    """Version VECTORIZADA de H sobre muchos k: kpts (nk,3) -> (nk,4,4).
+
+    Replica EXACTA de H (cada ``H[i,j] = expr`` -> ``H[:,i,j] = expr`` con
+    kx,ky como arrays). El stacking es un parametro escalar por llamada, asi
+    que la rama AB/BA/AA se elige una sola vez; el factor de estructura ``f``
+    y todos los elementos de matriz se construyen vectorizados sobre k.
+    """
+    resolved = _resolved_params(params)
+    _validate_graphene_bilayer_params(resolved)
+
+    a0 = float(resolved["a0"])
+    gamma0 = float(resolved["gamma0"])
+    gamma1 = float(resolved["gamma1"])
+    gamma3 = float(resolved["gamma3"])
+    gamma4 = float(resolved["gamma4"])
+    delta_prime = float(resolved["delta_prime"])
+    u = float(resolved["u"])
+    stacking = _normalize_stacking(resolved.get("stacking", "AB"))
+
+    kpts = np.asarray(kpts, dtype=np.float64)
+    kx, ky = kpts[:, 0], kpts[:, 1]
+    nk = kx.shape[0]
+
+    # Factor de estructura vectorizado (equivalente a _structure_factor).
+    deltas = _nn_vectors(a0)
+    phases = kx[:, None] * deltas[:, 0][None, :] + ky[:, None] * deltas[:, 1][None, :]
+    f = np.exp(1.0j * phases).sum(axis=1).astype(np.complex128)
+    f_conj = np.conjugate(f)
+
+    H = np.zeros((nk, 4, 4), dtype=np.complex128)
+
+    if stacking == "AB":
+        # Sitios no-dimer: A1, B2 ; sitios dimer: B1, A2
+        e_a1 = 0.5 * u
+        e_b1 = 0.5 * u + delta_prime
+        e_a2 = -0.5 * u + delta_prime
+        e_b2 = -0.5 * u
+
+        H[:, 0, 0] = e_a1
+        H[:, 0, 1] = gamma0 * f
+        H[:, 0, 2] = gamma4 * f_conj
+        H[:, 0, 3] = gamma3 * f
+        H[:, 1, 0] = gamma0 * f_conj
+        H[:, 1, 1] = e_b1
+        H[:, 1, 2] = gamma1
+        H[:, 1, 3] = gamma4 * f_conj
+        H[:, 2, 0] = gamma4 * f
+        H[:, 2, 1] = gamma1
+        H[:, 2, 2] = e_a2
+        H[:, 2, 3] = gamma0 * f
+        H[:, 3, 0] = gamma3 * f_conj
+        H[:, 3, 1] = gamma4 * f
+        H[:, 3, 2] = gamma0 * f_conj
+        H[:, 3, 3] = e_b2
+        return H
+
+    if stacking == "BA":
+        # Sitios no-dimer: B1, A2 ; sitios dimer: A1, B2
+        e_a1 = 0.5 * u + delta_prime
+        e_b1 = 0.5 * u
+        e_a2 = -0.5 * u
+        e_b2 = -0.5 * u + delta_prime
+
+        H[:, 0, 0] = e_a1
+        H[:, 0, 1] = gamma0 * f
+        H[:, 0, 2] = gamma4 * f
+        H[:, 0, 3] = gamma1
+        H[:, 1, 0] = gamma0 * f_conj
+        H[:, 1, 1] = e_b1
+        H[:, 1, 2] = gamma3 * f_conj
+        H[:, 1, 3] = gamma4 * f
+        H[:, 2, 0] = gamma4 * f_conj
+        H[:, 2, 1] = gamma3 * f
+        H[:, 2, 2] = e_a2
+        H[:, 2, 3] = gamma0 * f
+        H[:, 3, 0] = gamma1
+        H[:, 3, 1] = gamma4 * f_conj
+        H[:, 3, 2] = gamma0 * f_conj
+        H[:, 3, 3] = e_b2
+        return H
+
+    # stacking == "AA"
+    e_layer1 = 0.5 * u
+    e_layer2 = -0.5 * u
+
+    H[:, 0, 0] = e_layer1
+    H[:, 0, 1] = gamma0 * f
+    H[:, 0, 2] = gamma1
+    H[:, 0, 3] = 0.0
+    H[:, 1, 0] = gamma0 * f_conj
+    H[:, 1, 1] = e_layer1
+    H[:, 1, 2] = 0.0
+    H[:, 1, 3] = gamma1
+    H[:, 2, 0] = gamma1
+    H[:, 2, 1] = 0.0
+    H[:, 2, 2] = e_layer2
+    H[:, 2, 3] = gamma0 * f
+    H[:, 3, 0] = 0.0
+    H[:, 3, 1] = gamma1
+    H[:, 3, 2] = gamma0 * f_conj
+    H[:, 3, 3] = e_layer2
+    return H

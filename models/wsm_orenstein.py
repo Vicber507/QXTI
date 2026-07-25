@@ -165,6 +165,44 @@ def H(kx: float, ky: float, kz: float, params: dict[str, object] | None = None) 
     return np.asarray(matrix, dtype=complex)
 
 
+def H_batch(kpts, params: dict[str, object] | None = None) -> np.ndarray:
+    """Vectorized version of ``H`` over many k-points: kpts (nk,3) -> (nk,4,4).
+
+    Exact replica of ``H`` (each scalar coefficient ``coeff(kx,ky,kz)`` becomes an
+    array of shape (nk,) multiplying the corresponding constant 4x4 building
+    block). Avoids the per-k Python loop over ``H`` for large grids. QXTI uses
+    this as ``h_batch``; a test compares it against ``H`` at machine precision.
+    """
+    p = _resolved_params(params)
+    _validate_params(p)
+    t = float(p["t"])
+    my = float(p["my"])
+    mz = float(p["mz"])
+    delta = float(p["Delta"])
+    a = float(p["a"])
+
+    kpts = np.asarray(kpts, dtype=np.float64)
+    kx, ky, kz = kpts[:, 0], kpts[:, 1], kpts[:, 2]
+    nk = kx.shape[0]
+
+    kxa, kya, kza = a * kx, a * ky, a * kz
+    f_x = np.cos(kxa) + my * (1.0 - np.cos(kya)) + mz * (1.0 - np.cos(kza))
+
+    # coefficients: (nk, 1, 1) broadcast against constant (4, 4) blocks.
+    c_sigx_i = (t * f_x)[:, None, None]
+    c_sigy_i = (t * np.sin(kya))[:, None, None]
+    c_sigy_sx = (t * delta * np.cos(kya))[:, None, None]
+    c_sigz_sx = (t * np.sin(kza))[:, None, None]
+
+    H = (
+        c_sigx_i * _SIGX_I
+        + c_sigy_i * _SIGY_I
+        + c_sigy_sx * _SIGY_SX
+        + c_sigz_sx * _SIGZ_SX
+    )
+    return np.asarray(H, dtype=np.complex128)
+
+
 def dH_dk(kx: float, ky: float, kz: float, direction: str,
           params: dict[str, object] | None = None) -> np.ndarray:
     """ANALYTIC velocity operator dH/dk along 'x'|'y'|'z' (exact, no finite diff).

@@ -186,6 +186,48 @@ def H(kx: float, ky: float, kz: float, params: dict[str, object] | None = None) 
     )
 
 
+def H_batch(kpts, params=None):
+    """Version VECTORIZADA de H sobre muchos k: kpts (nk,3) -> (nk,2,2).
+
+    Replica EXACTA de H (cada ``H[i,j] = expr`` -> ``H[:,i,j] = expr`` con
+    kx,ky,kz como arrays).  Evita el loop Python punto a punto: imprescindible
+    para grids grandes.  QXTI la usa como ``h_batch``.  Un test compara
+    H_batch vs H a precision de maquina.
+    """
+    resolved = _resolved_params(params)
+    _validate_params(resolved)
+    gamma = float(resolved["gamma"])
+    tx = float(resolved["tx"])
+    ty = float(resolved["ty"])
+    tz = float(resolved["tz"])
+    M0 = float(resolved["M0"])
+    a0 = float(resolved["a0"])
+    a1 = float(resolved["a1"])
+    a2 = float(resolved["a2"])
+    kw = _kw_internal(resolved)
+
+    kpts = np.asarray(kpts, dtype=np.float64)
+    kx, ky, kz = kpts[:, 0], kpts[:, 1], kpts[:, 2]
+    nk = kx.shape[0]
+
+    cos_k0 = np.cos(a0 * kw)
+    cos_shift_x = np.cos(a0 * kx) - cos_k0
+    cos_shift_2x = np.cos(2.0 * a0 * kx) - cos_k0
+    cos_shift_z = np.cos(a2 * kz) - cos_k0
+
+    b0 = gamma * cos_shift_2x * cos_shift_z
+    b1 = -(M0 * (1.0 - np.cos(a2 * kz) - np.cos(a1 * ky)) + 2.0 * tx * cos_shift_x)
+    b2 = -2.0 * ty * np.sin(a1 * ky)
+    b3 = -2.0 * tz * np.cos(a2 * kz)
+
+    H = np.zeros((nk, 2, 2), dtype=np.complex128)
+    H[:, 0, 0] = b0 + b3
+    H[:, 0, 1] = b1 - 1j * b2
+    H[:, 1, 0] = b1 + 1j * b2
+    H[:, 1, 1] = b0 - b3
+    return H
+
+
 def band_energies(kx: float, ky: float, kz: float, params: dict[str, object] | None = None) -> np.ndarray:
     """Devuelve las dos energias de banda ordenadas como [E_menos, E_mas]."""
     resolved = _resolved_params(params)
