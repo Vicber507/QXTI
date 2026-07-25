@@ -306,3 +306,16 @@ def H(kx, ky, kz, params=None):
     """QXTI Hamiltonian: k in atomic units (1/Bohr), returns 8x8 in Hartree."""
     kv = np.array([kx, ky, kz], dtype=float) * _AU_PER_ANGSTROM   # 1/Bohr -> 1/Angstrom
     return _model().Hk(kv) * _EV_TO_HARTREE                        # eV -> Hartree
+
+
+def H_batch(kpts, params=None):
+    """Vectorized QXTI Hamiltonian over many k-points: kpts (nk,3) -> (nk,8,8).
+
+    Exact vectorized replica of ``H`` (same k-scaling 1/Bohr -> 1/Angstrom and
+    the same eV -> Hartree factor), evaluated for all k at once via the model's
+    ``Hk_batch`` (the batched twin of ``Hk`` with identical phase convention).
+    Like ``H``, ``params`` is accepted for signature compatibility but the cached
+    default model is used.  QXTI uses this as ``h_batch`` to avoid the per-k loop.
+    """
+    ks = np.atleast_2d(np.asarray(kpts, dtype=float)) * _AU_PER_ANGSTROM
+    return _model().Hk_batch(ks) * _EV_TO_HARTREE

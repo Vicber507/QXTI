@@ -166,3 +166,41 @@ def H(kx: float, ky: float, kz: float, params: dict[str, object] | None) -> np.n
         - t * fim * sigma_y
         +     M   * sigma_z
     )
+
+
+def H_batch(kpts, params=None):
+    """Version VECTORIZADA de H sobre muchos k: kpts (nk,3) -> (nk,2,2).
+
+    Replica EXACTA de H (cada ``H[i,j] = expr`` -> ``H[:,i,j] = expr`` con
+    kx,ky como arrays).  Evita el loop Python punto a punto: imprescindible
+    para grids grandes.  QXTI la usa como ``h_batch``.
+
+    Con f(k) = fre + i*fim:
+
+        H(k) = t*fre*sigma_x - t*fim*sigma_y + M*sigma_z
+
+             = |   M              t*(fre + i*fim) |
+               | t*(fre - i*fim)       -M         |
+    """
+    resolved = _resolved_params(params)
+    _validate_graphene_params(resolved)
+
+    a0 = float(resolved["a0"])
+    t  = float(resolved["t"])
+    M  = float(resolved["M"])
+
+    kpts = np.asarray(kpts, dtype=np.float64)
+    kx, ky = kpts[:, 0], kpts[:, 1]  # kz ignorado (sistema 2D)
+    nk = kx.shape[0]
+
+    deltas = _nn_vectors(a0)                     # (3, 2)
+    phases = kx[:, None] * deltas[:, 0] + ky[:, None] * deltas[:, 1]  # (nk, 3)
+    fre = np.cos(phases).sum(axis=1)             # (nk,)
+    fim = np.sin(phases).sum(axis=1)             # (nk,)
+
+    H = np.zeros((nk, 2, 2), dtype=np.complex128)
+    H[:, 0, 0] = M
+    H[:, 1, 1] = -M
+    H[:, 0, 1] = t * fre + 1j * t * fim
+    H[:, 1, 0] = t * fre - 1j * t * fim
+    return H

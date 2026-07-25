@@ -203,6 +203,71 @@ def H(kx: float, ky: float, kz: float, params: dict[str, object] | None = None) 
     return Hm
 
 
+def H_batch(kpts, params=None):
+    """Vectorised version of :func:`H` over many k-points.
+
+    ``kpts`` is an ``(nk, 3)`` array of momenta; returns an
+    ``(nk, BASIS_SIZE, BASIS_SIZE)`` complex128 stack. The interlayer
+    tunnelling blocks and the moiré geometry are k-independent, so only the
+    diagonal Dirac blocks vary with k — these are filled as ``(nk,)`` arrays.
+    Bit-exact replica of :func:`H` (kz is ignored, 2D).
+    """
+    p = default_params()
+    if params:
+        p.update({k: v for k, v in params.items() if k in p})
+    a = float(p["a"])
+    hbar_vF = float(p["hbar_vF"])
+    g1, g2, q1, theta, _ = _geometry(p["theta_deg"], a)
+    T1, T2, T3 = _interlayer_T(float(p["w_aa"]), float(p["w_ab"]))
+
+    kpts = np.asarray(kpts, dtype=np.float64)
+    kx, ky = kpts[:, 0], kpts[:, 1]
+    nk = kx.shape[0]
+    nb = BASIS_SIZE
+    Hm = np.zeros((nk, nb, nb), dtype=complex)
+
+    # Rotation matrices for the bottom (−θ/2) and top (+θ/2) Dirac blocks.
+    cb, sb = np.cos(-theta / 2.0), np.sin(-theta / 2.0)
+    ct, st = np.cos(+theta / 2.0), np.sin(+theta / 2.0)
+
+    # Diagonal: per moiré point, a bottom (−θ/2) and top (+θ/2) Dirac block.
+    # _dirac(px, py, phi) = hbar_vF * ((c*px - s*py) * _SX + (s*px + c*py) * _SY).
+    for idx, (i, j) in enumerate(_POINTS):
+        base = 4 * idx
+        Gm = i * g1 + j * g2
+        pbx = kx + Gm[0]               # bottom layer momentum
+        pby = ky + Gm[1]
+        ptx = kx + Gm[0] + q1[0]       # top layer momentum (shifted by q1)
+        pty = ky + Gm[1] + q1[1]
+
+        rbx = cb * pbx - sb * pby
+        rby = sb * pbx + cb * pby
+        rtx = ct * ptx - st * pty
+        rty = st * ptx + ct * pty
+
+        # bottom Dirac block (rows/cols base..base+2)
+        Hm[:, base + 0, base + 1] = hbar_vF * (rbx - 1j * rby)  # sx - i sy off-diag
+        Hm[:, base + 1, base + 0] = hbar_vF * (rbx + 1j * rby)
+        # top Dirac block (rows/cols base+2..base+4)
+        Hm[:, base + 2, base + 3] = hbar_vF * (rtx - 1j * rty)
+        Hm[:, base + 3, base + 2] = hbar_vF * (rtx + 1j * rty)
+
+    # Off-diagonal (k-independent): bottom(i,j) -> top(i,j) [T1], top(i+1,j)
+    # [T2], top(i,j+1) [T3]. Hermitian partner added automatically.
+    couplings = (((0, 0), T1), ((1, 0), T2), ((0, 1), T3))
+    for idx, (i, j) in enumerate(_POINTS):
+        b = 4 * idx                    # bottom block rows [b, b+2)
+        for (di, dj), T in couplings:
+            nbr = _INDEX.get((i + di, j + dj))
+            if nbr is None:
+                continue               # truncated neighbour: dropped (see #2)
+            t = 4 * nbr + 2            # top block of the neighbour
+            Hm[:, b:b + 2, t:t + 2] += T
+            Hm[:, t:t + 2, b:b + 2] += T.conj().T
+
+    return Hm
+
+
 def _moire_reciprocal(theta_deg: float = None, a: float = None):
     """Moiré reciprocal lattice vectors g1, g2 (for BZ bounds / k-paths)."""
     g1, g2, _, _, _ = _geometry(

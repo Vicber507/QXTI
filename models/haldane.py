@@ -211,3 +211,47 @@ def H(kx: float, ky: float, kz: float,
         + B2 * sigma_y
         + B3 * sigma_z
     )
+
+
+def H_batch(kpts, params=None):
+    """Version VECTORIZADA de H sobre muchos k: kpts (nk,3) -> (nk,2,2).
+
+    Replica EXACTA de `H` (mismos parametros resueltos y mismos vectores NN/NNN)
+    pero construyendo todos los k a la vez. Evita el loop Python punto-a-punto:
+    imprescindible para grids grandes. QXTI la usa como ``h_batch``.
+
+    El Hamiltoniano se escribe como:
+
+        H = B0*sigma_0 + B1*sigma_x + B2*sigma_y + B3*sigma_z
+
+          = | B0 + B3       B1 - i*B2 |
+            | B1 + i*B2     B0 - B3   |
+    """
+    p = _resolved_params(params)
+    t1   = float(p["t1"])
+    t2   = float(p["t2"])
+    M0   = float(p["M0"])
+    phi0 = float(p["phi0"])
+    a0   = float(p["a0"])
+
+    vec_a = _nn_vectors(a0)   # shape (3, 2)
+    vec_b = _nnn_vectors(a0)  # shape (3, 2)
+
+    kpts = np.asarray(kpts, dtype=np.float64)
+    k = kpts[:, :2]           # (nk, 2); kz ignorado (sistema 2D)
+    nk = k.shape[0]
+
+    angles_a = k @ vec_a.T    # (nk, 3)
+    angles_b = k @ vec_b.T    # (nk, 3)
+
+    B0 = 2.0 * t2 * np.cos(phi0)  * np.cos(angles_b).sum(axis=1)
+    B1 = t1                        * np.cos(angles_a).sum(axis=1)
+    B2 = t1                        * np.sin(angles_a).sum(axis=1)
+    B3 = M0 - 2.0 * t2 * np.sin(phi0) * np.sin(angles_b).sum(axis=1)
+
+    H = np.zeros((nk, 2, 2), dtype=np.complex128)
+    H[:, 0, 0] = B0 + B3
+    H[:, 0, 1] = B1 - 1j * B2
+    H[:, 1, 0] = B1 + 1j * B2
+    H[:, 1, 1] = B0 - B3
+    return H

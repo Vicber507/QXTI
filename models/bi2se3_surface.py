@@ -142,3 +142,48 @@ def H(kx: float, ky: float, kz: float, params: dict[str, object] | None) -> np.n
 
     h0 = eps + 2.0 * t0 * h0
     return h0 * sigma_0 + h1 * sigma_x + h2 * sigma_y + h3 * sigma_z
+
+
+def H_batch(kpts, params=None):
+    """Version VECTORIZADA de H sobre muchos k: kpts (nk,3) -> (nk,2,2).
+
+    Replica EXACTA de H (cada ``H[i,j] = expr`` -> ``H[:,i,j] = expr`` con
+    kx,ky como arrays).  Evita el loop Python por k: imprescindible para grids
+    grandes.  QXTI la usa como ``h_batch``; un test la compara contra H a
+    precision de maquina.
+    """
+    resolved = _resolved_params(params)
+    _validate_surface_params(resolved)
+
+    a0 = float(resolved["a0"])
+    surface_avec, surface_bvec = _surface_vectors(a0)
+    eps, t0, lamb_a, lamb_b, lamb_z = _effective_coefficients(resolved)
+
+    kpts = np.asarray(kpts, dtype=np.float64)
+    kx, ky = kpts[:, 0], kpts[:, 1]
+    nk = kx.shape[0]
+
+    h0 = np.zeros(nk, dtype=np.float64)
+    h1 = np.zeros(nk, dtype=np.float64)
+    h2 = np.zeros(nk, dtype=np.float64)
+    h3 = np.zeros(nk, dtype=np.float64)
+
+    for i in range(3):
+        pa = kx * surface_avec[i, 0] + ky * surface_avec[i, 1]
+        pb = kx * surface_bvec[i, 0] + ky * surface_bvec[i, 1]
+
+        h0 += np.cos(pa)
+        h1 += -2.0 * lamb_a * np.sin(Omega[i]) * np.sin(pa)
+        h1 += 2.0 * lamb_b * np.cos(Omega[i]) * np.sin(pb)
+        h2 += -2.0 * lamb_a * np.cos(Omega[i]) * np.sin(pa)
+        h2 += -2.0 * lamb_b * np.sin(Omega[i]) * np.sin(pb)
+        h3 += 2.0 * lamb_z * np.sin(pa)
+
+    h0 = eps + 2.0 * t0 * h0
+
+    H = np.zeros((nk, 2, 2), dtype=np.complex128)
+    H += h0[:, None, None] * sigma_0
+    H += h1[:, None, None] * sigma_x
+    H += h2[:, None, None] * sigma_y
+    H += h3[:, None, None] * sigma_z
+    return H
