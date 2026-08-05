@@ -155,6 +155,24 @@ class KGridConfig:
     kz_values: list[float] = field(default_factory=list)
     shifted: bool = False
     auto_degeneracy_guard: bool = True
+    # Berry-connection-aware guard: the plain degeneracy guard only reacts to an
+    # EXACT band touching (gap ~ 0).  Below-gap intraband/anomalous response is
+    # driven by the Berry connection A_mn = v_mn / (eps_m - eps_n) ~ 1/gap, which
+    # is already huge in a NEIGHBOURHOOD of a Weyl/Dirac node -- so a grid can
+    # clear the exact-degeneracy floor yet still land on a near-node point where
+    # |A| spikes (e.g. frank8's generic nodes), giving an erratic, grid-dependent
+    # response.  When on, the guard also scans max_k |v_mn|/gap and, if it finds
+    # an anomalous spike, nudges the point count to the grid that MINIMISES the
+    # worst Berry spike (not just the one that clears gap ~ 0).  Requires
+    # auto_degeneracy_guard = true.  NOTE: this makes the coarse-grid response
+    # more robust/reproducible, but it does not by itself converge a response
+    # whose weight is genuinely concentrated at the nodes -- that needs adaptive
+    # near-node refinement or the velocity-gauge (tddm) solver.
+    berry_singularity_guard: bool = True
+    # A grid is flagged as hitting a Berry near-singularity when its worst
+    # |v_mn|/gap exceeds this ratio times a robust typical value (the 90th
+    # percentile over the scan).  Scale-free; larger = less eager to nudge.
+    berry_guard_ratio: float = 12.0
 
 
 @dataclass(slots=True)
@@ -694,6 +712,8 @@ class QXTIConfig:
             kz_values=_parse_float_list(section.get("kz_values", fallback=""), default=[]),
             shifted=section.getboolean("shifted", fallback=section.getboolean("monkhorst_pack", fallback=False)),
             auto_degeneracy_guard=section.getboolean("auto_degeneracy_guard", fallback=True),
+            berry_singularity_guard=section.getboolean("berry_singularity_guard", fallback=True),
+            berry_guard_ratio=section.getfloat("berry_guard_ratio", fallback=12.0),
         )
 
     @staticmethod

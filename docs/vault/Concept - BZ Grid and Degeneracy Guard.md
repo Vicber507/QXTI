@@ -28,6 +28,22 @@ aparecen **armónicos espurios**. Solución automática:
   (offset Monkhorst-Pack 0.5).
 - `[kgrid] shifted = true` desplaza a puntos medios (nunca borde/centro).
 
+### Guard consciente de la conexión de Berry
+
+El guard de gap solo reacciona al **cero exacto** (gap < 1e-6·bandwidth). Pero la respuesta
+intrabanda/anómala por debajo del gap la dirige la **conexión de Berry** `A_mn = v_mn/(ε_m−ε_n) ~ 1/gap`,
+que ya es enorme en **todo un vecindario** del nodo — así una malla puede *superar* el piso de
+degeneración exacta y aun así caer en un punto **casi-nodo** donde `|A|` se dispara (los near-misses
+genéricos de frank8). `[kgrid] berry_singularity_guard = true` (default) escanea también
+`max_k |v_mn|/gap` (velocidad por diferencias finitas + `eigh`), y si el peor pico supera
+`berry_guard_ratio`× el valor típico (percentil 90, criterio scale-free) **empuja N a la malla que
+minimiza ese peor pico** (`_grid_berry_diagnostics`). Preserva la simetría k→−k.
+
+⚠️ **Alcance honesto:** esto hace la respuesta en malla gruesa **más robusta/reproducible** (evita los
+peores spikes), pero **no** converge por sí solo una respuesta cuyo peso está genuinamente concentrado
+en los nodos (frank8 HHG). Para eso: **refino adaptativo cerca del nodo** (octree) o el solver en
+**gauge de velocidad `tddm`** (que nunca forma `1/gap`). Ver memoria `frank8-belowgap-nodes`.
+
 ⛔ **Invariante:** preservar la **simetría k→−k** (offset exacto 0.5). Un offset irracional esquiva
 todo punto racional **pero** rompe esa simetría (y con ella la cancelación de respuestas prohibidas).
 Ver [[qxti.grids]].
