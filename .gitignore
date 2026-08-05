@@ -30,6 +30,10 @@ env/
 *.log
 outputs/
 
+# Private/unpublished materials (do NOT upload): the bi2se3 Floquet effective
+# model lives under outputs/ (already ignored); its cfg is ignored here too.
+inputs/inputParams.bi2se3_floquet.cfg
+
 # Claude memory and plans
 .claude/
 

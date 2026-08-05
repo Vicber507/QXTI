@@ -104,6 +104,8 @@ class QXTISimulation:
         bounds = hamiltonian.reciprocal_box_bounds()
         npts = (nkx, nky, nkz)
         guard_on = bool(getattr(kcfg, "auto_degeneracy_guard", True))
+        berry_guard = guard_on and bool(getattr(kcfg, "berry_singularity_guard", True))
+        berry_ratio = float(getattr(kcfg, "berry_guard_ratio", 12.0))
 
         axes, effective_shifted = self._resolve_safe_axes(
             hamiltonian,
@@ -112,6 +114,8 @@ class QXTISimulation:
             dimension=dimension,
             want_shifted=shifted,
             guard_on=guard_on,
+            berry_guard=berry_guard,
+            berry_ratio=berry_ratio,
         )
 
         kgrid = KGrid(
@@ -139,6 +143,8 @@ class QXTISimulation:
         dimension: int,
         want_shifted: bool,
         guard_on: bool,
+        berry_guard: bool = False,
+        berry_ratio: float = 12.0,
     ) -> tuple[list[NDArray[np.float64]], bool]:
         """Return k-axes that avoid band degeneracies for *any* point count.
 
@@ -193,17 +199,32 @@ class QXTISimulation:
 
         min_gap, bandwidth, worst = self._grid_gap_diagnostics(hamiltonian, base_axes)
         gap_floor = max(1.0e-9, 1.0e-6 * bandwidth)
-        if min_gap >= gap_floor:
+        gap_hit = min_gap < gap_floor
+
+        # Berry-connection guard: a grid can clear the exact-degeneracy floor yet
+        # still land on a near-node point where |A_mn| = |v_mn|/gap spikes (the
+        # below-gap intraband/anomalous driver).  Flag such a spike relative to a
+        # robust typical value (90th percentile) so it is scale-free.
+        berry_hit = False
+        berry_max = berry_p90 = 0.0
+        berry_worst = None
+        if berry_guard:
+            berry_max, berry_p90, berry_worst = self._grid_berry_diagnostics(hamiltonian, base_axes)
+            berry_hit = berry_p90 > 0.0 and berry_max > berry_ratio * berry_p90
+
+        if not gap_hit and not berry_hit:
             # Already safe: leave the grid (and its exact symmetry) untouched.
             return base_axes, want_shifted
 
-        # Degeneracy hit.  Keep the symmetric Monkhorst-Pack grid (offset 1/2)
-        # and search the nearest point count that clears it.  Try the smallest
-        # nudges first (delta = 0 also covers the case where the *only* problem
-        # was an edge-inclusive grid hitting the BZ boundary / a Dirac point,
-        # which switching to Monkhorst-Pack already fixes).
+        # Hit.  Keep the symmetric Monkhorst-Pack grid (offset 1/2) and search the
+        # nearest point count that best clears the singularity.  When the trigger
+        # is a Berry spike we RANK candidates by the worst Berry element (lower is
+        # better); for a pure exact-degeneracy hit we rank by the gap (as before).
+        # Try the smallest nudges first.
         deltas = [0, -1, 1, -2, 2, -3, 3, -4, 4]
-        best_axes, best_counts, best_gap, best_delta = None, base_counts, min_gap, None
+        best_axes, best_counts, best_delta = None, base_counts, None
+        best_gap, best_berry = min_gap, berry_max
+        best_score = np.inf
         for delta in deltas:
             counts = tuple(
                 (npts[axis] + delta) if axis in active else npts[axis] for axis in range(3)
@@ -212,21 +233,47 @@ class QXTISimulation:
                 continue
             candidate = _build(0.5, counts)  # symmetric Monkhorst-Pack
             gap, _, _ = self._grid_gap_diagnostics(hamiltonian, candidate)
-            if best_axes is None or gap > best_gap:
-                best_axes, best_counts, best_gap, best_delta = candidate, counts, gap, delta
-            if gap >= gap_floor:
-                best_axes, best_counts, best_gap, best_delta = candidate, counts, gap, delta
+            if berry_hit:
+                bmax, bp90, _ = self._grid_berry_diagnostics(hamiltonian, candidate)
+                score = bmax                       # minimise the worst Berry spike
+                cleared = gap >= gap_floor and (bp90 <= 0.0 or bmax <= berry_ratio * bp90)
+            else:
+                bmax, bp90 = np.inf, 0.0
+                score = -gap                       # maximise the gap
+                cleared = gap >= gap_floor
+            if best_axes is None or score < best_score:
+                best_axes, best_counts, best_delta = candidate, counts, delta
+                best_gap, best_berry, best_score = gap, bmax, score
+            if cleared:
+                best_axes, best_counts, best_delta = candidate, counts, delta
+                best_gap, best_berry = gap, bmax
                 break
 
         active_counts = tuple(best_counts[a] for a in active)
-        self._emit_progress(
-            "[KGrid] auto degeneracy guard: the requested grid sat on a band "
-            f"degeneracy (min gap {min_gap:.2e} a.u. at k={worst}). Rebuilt as a "
-            f"symmetric Monkhorst-Pack grid with point count(s) {active_counts} "
-            f"(min gap now {best_gap:.2e} a.u.); the k->-k symmetry that cancels "
-            "forbidden components to machine zero is preserved. Set "
-            "'auto_degeneracy_guard = false' in [kgrid] to disable."
-        )
+        if berry_hit and not gap_hit:
+            self._emit_progress(
+                "[KGrid] Berry-connection guard: the requested grid cleared the "
+                f"exact-degeneracy floor but landed on a near-node point where the "
+                f"Berry connection |v_mn|/gap spikes ({berry_max:.2e}, "
+                f"{berry_max / max(berry_p90, 1e-300):.0f}x the typical value, at "
+                f"k={berry_worst}). Rebuilt as a symmetric Monkhorst-Pack grid with "
+                f"point count(s) {active_counts} (worst |A| now {best_berry:.2e}); "
+                "the k->-k symmetry is preserved. NOTE: this makes the coarse-grid "
+                "response more robust but does not by itself converge a node-"
+                "concentrated response -- for that use adaptive near-node refinement "
+                "or the velocity-gauge (tddm) solver. Set 'berry_singularity_guard = "
+                "false' in [kgrid] to disable."
+            )
+        else:
+            extra = (f", worst |v_mn|/gap now {best_berry:.2e}" if berry_guard else "")
+            self._emit_progress(
+                "[KGrid] auto degeneracy guard: the requested grid sat on a band "
+                f"degeneracy (min gap {min_gap:.2e} a.u. at k={worst}). Rebuilt as a "
+                f"symmetric Monkhorst-Pack grid with point count(s) {active_counts} "
+                f"(min gap now {best_gap:.2e} a.u.{extra}); the k->-k symmetry that "
+                "cancels forbidden components to machine zero is preserved. Set "
+                "'auto_degeneracy_guard = false' in [kgrid] to disable."
+            )
         return best_axes, True
 
     def _grid_gap_diagnostics(
@@ -292,6 +339,86 @@ class QXTISimulation:
                     timer.advance()
         bandwidth = max(e_hi - e_lo, 1.0e-30)
         return min_gap, bandwidth, worst
+
+    def _grid_berry_diagnostics(
+        self,
+        hamiltonian: Hamiltonian,
+        axes: list[NDArray[np.float64]],
+        *,
+        cap: int = 60_000,
+    ) -> tuple[float, float, tuple[float, float, float] | None]:
+        """Worst Berry-connection element over the (sub-sampled) grid.
+
+        Returns ``(berry_max, berry_p90, worst_k)`` where
+        ``berry_max = max_k max_{m != n, a in active} |v^a_mn(k)| / |eps_m - eps_n|``
+        is the largest Berry-connection matrix element (the below-gap intraband /
+        anomalous driver, ~ 1/gap near a Weyl/Dirac node), ``berry_p90`` is a
+        robust typical value (90th percentile of the per-point maxima, used to
+        detect a *spike* in a scale-free way), and ``worst_k`` locates the spike.
+
+        The band velocities ``v^a = U^dag (dH/dk_a) U`` are obtained by central
+        finite differences of ``H`` along the active axes, vectorized through the
+        model's ``H_batch`` when available (else a per-k fallback).
+        """
+        nb = int(hamiltonian.basis_size)
+        if nb < 2:
+            return 0.0, 0.0, None
+
+        dim = int(hamiltonian.dimension)
+        ax = [np.asarray(a, dtype=float) for a in axes]
+        active = [a for a in range(3) if a < dim and ax[a].size > 1]
+        if not active:
+            return 0.0, 0.0, None
+
+        total = int(ax[0].size * ax[1].size * ax[2].size)
+        stride = 1
+        if total > cap:
+            stride = int(np.ceil((total / cap) ** (1.0 / 3.0)))
+            ax = [a[::stride] if a.size > 1 else a for a in ax]
+        K = np.stack(np.meshgrid(ax[0], ax[1], ax[2], indexing="ij"), -1).reshape(-1, 3)
+
+        from qxti.analytics.theory_response import _model_h_batch
+
+        h_batch = _model_h_batch(hamiltonian)
+
+        def H_of(pts: NDArray[np.float64]) -> NDArray[np.complex128]:
+            if h_batch is not None:
+                return np.asarray(h_batch(pts), dtype=np.complex128)
+            return np.array(
+                [hamiltonian._matrix_at(float(p[0]), float(p[1]), float(p[2])) for p in pts],
+                dtype=np.complex128,
+            )
+
+        dk = 1.0e-4
+        eye = np.eye(nb, dtype=bool)
+        per_point_max = np.empty(K.shape[0], dtype=np.float64)
+        berry_max = 0.0
+        worst: tuple[float, float, float] | None = None
+        block = 20_000
+        for s in range(0, K.shape[0], block):
+            Kb = K[s:s + block]
+            evals, U = np.linalg.eigh(H_of(Kb))                     # (M,nb),(M,nb,nb)
+            Udag = np.conj(np.swapaxes(U, -1, -2))
+            gap = np.abs(evals[:, :, None] - evals[:, None, :])     # (M,nb,nb)
+            # Diagonal -> inf (|A_nn| is not a singularity); floor the off-diagonal
+            # gap so an exact band touching gives a huge-but-finite |A| (no 0-div).
+            gap_safe = np.where(eye[None, :, :], np.inf, np.maximum(gap, 1.0e-12))
+            pt_max = np.zeros(Kb.shape[0], dtype=np.float64)
+            for a in active:
+                step = np.zeros(3, dtype=float)
+                step[a] = dk
+                dH = (H_of(Kb + step) - H_of(Kb - step)) / (2.0 * dk)
+                v = Udag @ dH @ U                                   # (M,nb,nb)
+                berry = np.abs(v) / gap_safe
+                pt_max = np.maximum(pt_max, berry.reshape(Kb.shape[0], -1).max(axis=1))
+            per_point_max[s:s + Kb.shape[0]] = pt_max
+            i = int(np.argmax(pt_max))
+            if pt_max[i] > berry_max:
+                berry_max = float(pt_max[i])
+                worst = (float(Kb[i, 0]), float(Kb[i, 1]), float(Kb[i, 2]))
+
+        berry_p90 = float(np.percentile(per_point_max, 90)) if per_point_max.size else 0.0
+        return berry_max, berry_p90, worst
 
     def _warn_if_grid_hits_degeneracy(
         self,
