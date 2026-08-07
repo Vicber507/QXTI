@@ -33,6 +33,7 @@ import re
 __all__ = [
     "resolve_worker_count",
     "available_cpus",
+    "physical_cpus",
     "slurm_cpu_allocation",
     "configure_thread_env",
     "configure_runtime_env",
@@ -70,6 +71,45 @@ def available_cpus() -> int:
         except OSError:
             pass
     return max(1, os.cpu_count() or 1)
+
+
+def physical_cpus() -> int:
+    """Best-effort PHYSICAL core count (excludes hyperthreads / SMT siblings).
+
+    A GIL-bound ThreadPool (e.g. the ptddm/CMD k-loop) does not scale past the
+    physical cores — extra hyperthreads just add GIL and cache contention and make
+    it SLOWER — so those engines cap their worker count here.  Bounded by
+    :func:`available_cpus` so an affinity mask / SLURM binding still wins, and falls
+    back to the logical count when the physical layout can't be read (never 0)."""
+    logical = available_cpus()
+    system = platform.system()
+    try:
+        if system == "Linux":
+            pairs, pid, cid = set(), None, None
+            with open("/proc/cpuinfo") as fh:
+                for line in fh:
+                    if line.startswith("physical id"):
+                        pid = line.split(":", 1)[1].strip()
+                    elif line.startswith("core id"):
+                        cid = line.split(":", 1)[1].strip()
+                    elif not line.strip():
+                        if pid is not None and cid is not None:
+                            pairs.add((pid, cid))
+                        pid = cid = None
+            if pid is not None and cid is not None:
+                pairs.add((pid, cid))
+            if pairs:
+                return max(1, min(len(pairs), logical))
+        elif system == "Darwin":
+            import subprocess  # noqa: PLC0415
+            out = subprocess.run(["sysctl", "-n", "hw.physicalcpu"],
+                                 capture_output=True, text=True, timeout=1.0)
+            n = int(out.stdout.strip())
+            if n > 0:
+                return max(1, min(n, logical))
+    except Exception:
+        pass
+    return logical
 
 
 def _macos_performance_cores() -> int | None:
@@ -123,7 +163,7 @@ def _auto_worker_count() -> int:
 
 
 def resolve_worker_count(
-    requested: int | None = None, *, cap: int | None = None
+    requested: int | None = None, *, cap: int | None = None, gil_bound: bool = False
 ) -> int:
     """Return the worker count to use (always ``>= 1``).
 
@@ -131,11 +171,22 @@ def resolve_worker_count(
     wins over everything (this is the "o en su defecto el colocado en los input
     params" rule).  ``cap`` bounds the result (e.g. by the number of frequencies
     or a RAM budget).
+
+    ``gil_bound=True`` marks a Python-GIL-bound ThreadPool engine (ptddm/CMD):
+    when the count is auto-resolved it is capped at the PHYSICAL core count, since
+    extra hyperthreads only add GIL/cache contention and make it slower.  An
+    explicit ``requested`` or ``QXTI_NUM_WORKERS`` still wins (the user asked).
     """
     if requested is not None and int(requested) > 0:
         n = int(requested)
     else:
-        n = _env_worker_count() or _auto_worker_count()
+        env = _env_worker_count()
+        if env:
+            n = env
+        else:
+            n = _auto_worker_count()
+            if gil_bound:
+                n = min(n, max(1, physical_cpus()))
     if cap is not None and int(cap) > 0:
         n = min(n, int(cap))
     return max(1, n)

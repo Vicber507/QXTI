@@ -33,18 +33,20 @@ _DEFAULT_WORKERS_CACHE: int | None = None
 def _default_worker_count() -> int:
     """Best default thread count for the GIL-bound parallel k-loop.
 
-    Delegates to :func:`qxti.utils.parallel.resolve_worker_count`, the single
-    cross-platform source of truth: it uses the SLURM allocation on a cluster
-    (all of it, never a fraction), the CPU-affinity mask on Linux, and the
-    performance-core count on local Apple Silicon.  See
-    ``docs/vault/Concept - Memory and Parallelism`` and ``Cluster and SLURM``.
+    Delegates to :func:`qxti.utils.parallel.resolve_worker_count` with
+    ``gil_bound=True``: the CMD k-loop is a ThreadPool whose per-k Python glue holds
+    the GIL, so it does NOT scale past the PHYSICAL cores — extra hyperthreads only
+    add GIL/cache contention and make it slower (this is why ptddm got worse as
+    n_workers grew toward the logical-CPU count).  A cluster SLURM allocation or an
+    explicit ``n_workers`` still wins.  See ``docs/vault/Concept - Memory and
+    Parallelism`` and ``Cluster and SLURM``.
     """
     global _DEFAULT_WORKERS_CACHE
     if _DEFAULT_WORKERS_CACHE is not None:
         return _DEFAULT_WORKERS_CACHE
     from qxti.utils.parallel import resolve_worker_count  # noqa: PLC0415
 
-    _DEFAULT_WORKERS_CACHE = resolve_worker_count()
+    _DEFAULT_WORKERS_CACHE = resolve_worker_count(gil_bound=True)
     return _DEFAULT_WORKERS_CACHE
 
 
