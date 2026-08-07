@@ -72,6 +72,13 @@ ComplexArray = NDArray[np.complex128]
 _PROGRESS_REPORT_EVERY = 16          # flush the step counter this often (cheap)
 _PROGRESS_INTERVAL_S = 2.0           # refresh the printed line at most this fast
 
+# Below this band count the per-time-step numpy work is on tiny (Kb, nb, nb) arrays
+# dominated by Python glue + the GIL, so a ThreadPool stalls at ~1 core; use a
+# ProcessPool instead (true parallelism, identical result).  At/above it the numpy
+# steps release the GIL long enough that threads scale and avoid per-process
+# spawn/pickle overhead.  Measured crossover is small (nb=2 clearly needs processes).
+_TDDM_THREAD_MIN_NB = 16
+
 
 # Set in every ProcessPool worker by the pool initializer: a ``(counter, lock)``
 # pair of Manager proxies the worker bumps as it advances through time steps.
@@ -396,21 +403,23 @@ def _tddm_current_time(
     gamma_coh = 0.0 if ccfg.coherence_time <= 0 or not np.isfinite(ccfg.coherence_time) else 1.0 / float(ccfg.coherence_time)
 
     workers = int(n_workers) if (n_workers and n_workers > 0) else default_worker_count()
-    # Scalar-only models evaluate H per-k in Python (GIL-bound): a ThreadPool won't
-    # parallelise them, but a ProcessPool (separate interpreters) will.  Vectorized
-    # models (H_batch / auto-vec) release the GIL inside NumPy -> ThreadPool is enough.
     vectorized = _h_is_vectorized(hamiltonian)
-    use_procpool = (not vectorized) and workers > 1 and nk >= 2
+    # Choose the pool by REAL per-step cost, not by whether the model exposes
+    # H_batch.  Each time step runs numpy on tiny (Kb, nb, nb) arrays; for small nb
+    # the per-step work is dominated by Python glue + the GIL, so a ThreadPool
+    # stalls at ~1 core even when split into many blocks (measured: Haldane nb=2 ->
+    # ~1.3 cores on threads vs ~all cores on processes, identical result).  Use a
+    # ProcessPool for scalar models AND small-nb models; keep threads only for
+    # large-nb vectorized models whose numpy steps release the GIL long enough.
+    use_procpool = (workers > 1 and nk >= 2
+                    and (not vectorized or nb < _TDDM_THREAD_MIN_NB))
     # Per-k live footprint: a handful of (nb,nb) complex arrays + eigh workspace.
     bytes_per_k = nb * nb * 16 * 12
-    per_block, n_blocks = _mem.pick_block_count(
-        nk, bytes_per_k, reserve_gb=reserve_gb, min_units_per_block=1
-    )
-    per_block = max(1, min(per_block, nk))
-    if use_procpool:
-        # one fat block per worker (each process holds only its own block -> RAM
-        # light), so exactly ~`workers` true-parallel processes chew the grid.
-        per_block = max(1, min(per_block, -(-nk // workers)))
+    # Split into >= workers blocks (subject to the per-worker RAM budget) so EVERY
+    # worker runs -- pick_block_count sized by RAM only, so a grid that fit in RAM
+    # became ONE block and ran serial regardless of the pool (the parallelism bug).
+    per_block, n_blocks = _mem.split_units(
+        nk, bytes_per_k, workers, reserve_gb=reserve_gb, min_units_per_block=1)
     # split k into contiguous blocks of <= per_block points
     starts = list(range(0, nk, per_block))
     blocks = [(s, min(s + per_block, nk)) for s in starts]

@@ -193,6 +193,53 @@ def pick_block_count(
     return per_block, n_blocks
 
 
+def split_units(
+    n_units: int,
+    bytes_per_unit: float,
+    workers: int,
+    *,
+    reserve_gb: float = 1.0,
+    min_units_per_block: int = 1,
+    halo_units: int = 0,
+    cap: int | None = None,
+    concurrency_peak: bool = True,
+) -> tuple[int, int]:
+    """Block sizing that satisfies BOTH the RAM budget AND ``>= workers`` blocks.
+
+    :func:`pick_block_count` picks the LARGEST block that fits RAM, so a grid that
+    fits entirely in memory becomes a single block and only one worker runs — the
+    parallelism bug.  ``split_units`` additionally caps the block at
+    ``ceil(n_units / workers)`` so the work is always cut into at least ``workers``
+    pieces whenever RAM allows; when RAM is tight it falls back to smaller blocks
+    (more of them), streamed across the workers.  Returns ``(units_per_block,
+    n_blocks)`` with ``n_blocks >= min(workers, n_units)`` in the RAM-ample case.
+
+    ``concurrency_peak=True`` (default): up to ``workers`` blocks are live at once
+    (a Thread/Process pool), so the per-block budget is ``budget / workers``.  Set
+    False for strictly one-block-at-a-time streaming.  ``cap`` bounds the block
+    (e.g. by a transverse extent); ``halo_units`` are extra units every block
+    carries (counted against RAM, not reducing the stride).
+    """
+    n_units = int(n_units)
+    workers = max(1, int(workers))
+    if n_units <= 0:
+        return 1, 0
+    if bytes_per_unit <= 0:
+        ram_fit = n_units
+    else:
+        budget = memory_budget_bytes(reserve_gb=reserve_gb)
+        eff_budget = (budget / workers) if concurrency_peak else budget
+        ram_fit = int(eff_budget // bytes_per_unit) - int(halo_units)
+    if cap:
+        ram_fit = min(ram_fit, int(cap))
+    ram_fit = max(1, ram_fit)
+    want = -(-n_units // workers)                       # ceil(n/workers) => >= workers blocks
+    per_block = min(ram_fit, max(want, int(min_units_per_block)))
+    per_block = max(1, min(per_block, n_units))
+    n_blocks = (n_units + per_block - 1) // per_block
+    return per_block, n_blocks
+
+
 # ---------------------------------------------------------------------------
 # Runtime guard: verify headroom before a heavy allocation
 # ---------------------------------------------------------------------------

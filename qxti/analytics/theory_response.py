@@ -598,6 +598,19 @@ def compute_hhg_spectrum(
         n_workers, reserve_gb = _mesh_parallel_settings(config)
         grad_stencil = int(getattr(ccfg, "gradient_stencil", 2) or 2)
         h_batch = _model_h_batch(hamiltonian)
+        # Describe the model so the mesh can run each k-block in a separate PROCESS
+        # (its vectorized per-block numpy is GIL-bound -> a ThreadPool stalls at ~1
+        # core for any nb).  Without a source path we omit it -> mesh keeps threads.
+        _src = str(getattr(hamiltonian, "_module_path", "") or "")
+        model_spec = None
+        if _src:
+            model_spec = {
+                "source_file": _src,
+                "function_name": str(getattr(hamiltonian, "function_name", "H")),
+                "params": dict(getattr(hamiltonian, "params", {}) or {}),
+                "h_batch_name": "H_batch",
+                "dist_name": str(getattr(ccfg, "distribution", "") or ""),
+            }
         if progress:
             print(f"[theory-HHG] orders 1..{max_order}: memory-safe streaming mesh recursion "
                   f"({nk} k-points, up to {n_workers or default_worker_count()} cores, "
@@ -621,7 +634,7 @@ def compute_hhg_spectrum(
             gamma=gamma, gamma_pop=gamma, mu=mu, T_au=temperature, dimension=dim,
             distribution=distribution, n_workers=n_workers, reserve_gb=reserve_gb,
             h_batch=h_batch, return_intraband=True, progress_cb=_block_cb,
-            grad_stencil=grad_stencil)
+            grad_stencil=grad_stencil, model_spec=model_spec)
         if progress:
             _live = _blive.get("p")
             if _live is not None:

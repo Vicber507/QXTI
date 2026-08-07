@@ -310,6 +310,12 @@ def harmonic_currents(band: BandData, weights, E_field, omega, max_order, *,
 # concurrent peak against live RAM before launching.
 _LIVE_ARRAYS_PER_PLANE = 14.0
 
+# Below this estimated per-run work (nk × orders × nb³ ~ diagonalisation cost) the
+# mesh stays on threads: a fast mesh isn't worth the ProcessPool startup (spawn
+# re-imports the model per worker; fork on Linux is cheap so nearly everything real
+# clears this bar).  Above it, blocks run in separate processes for true parallelism.
+_MESH_PROCPOOL_MIN_WORK = 5_000_000
+
 
 def _plan_stream(n0, bytes_per_plane, halo, n_workers_req, reserve_gb, cap):
     """Decide (mode, n_workers, block_planes) for the memory-safe stream.
@@ -324,17 +330,169 @@ def _plan_stream(n0, bytes_per_plane, halo, n_workers_req, reserve_gb, cap):
     through, where the caller's headroom check raises with a clear message.
     """
     budget = _mem.memory_budget_bytes(reserve_gb)
-    if cap >= n0 and (budget <= 0 or n0 * bytes_per_plane <= budget):
-        return "single", 1, n0
     w_cap = max(1, int(n_workers_req))
+    single_fits = (cap >= n0) and (budget <= 0 or n0 * bytes_per_plane <= budget)
+    # Single pass ONLY when there is nothing to parallelise (one worker) or the RAM
+    # budget is unusable.  With >1 worker we split into >= w blocks so every core
+    # runs, even when the whole mesh would fit in one pass -- otherwise a grid that
+    # fits in RAM (the common case) ran serial on 1 core.  Block (real out-of-box
+    # halo) and single (periodic roll) are numerically identical (verified 7e-15,
+    # incl. hexagonal boxes), so this is safe; the blocks then run on a ProcessPool.
+    if (w_cap <= 1 or budget <= 0) and single_fits:
+        return "single", 1, n0
     for w in range(w_cap, 0, -1):
         fit = int((budget / w) // bytes_per_plane) - 2 * halo
         if cap:
             fit = min(fit, int(cap))
         if fit >= 1:
             bs = max(1, min(fit, -(-n0 // w)))    # >= w blocks so workers stay busy
+            if w == 1 and bs >= n0 and single_fits:
+                return "single", 1, n0            # only 1 worker fits -> single pass, no halo cost
             return "block", w, bs
     return "block", 1, max(1, min(int(cap) if cap else 1, 1))
+
+
+def _mesh_block_currents(kb_int, w_int, P, C):
+    """Band build + perturbative recursion on ONE contiguous k-block.
+
+    Module-level (NOT a closure) so it can run in a separate PROCESS.  ``kb_int`` /
+    ``w_int`` are the block's own interior k-points / weights (shape ``P*n1*n2``);
+    the block is padded with a real out-of-box halo so the covariant gradient never
+    wraps at the box edge (identical to the whole-BZ pass, verified 7e-15).  ``C``
+    is the shared read-only context (built once per process / per call).  Returns a
+    length-F list of ``({s: Js(3,)}, {s: Ji(3,)} | None)``.
+    """
+    n1, n2, halo, dim, nb, max_order = C.n1, C.n2, C.halo, C.dim, C.nb, C.max_order
+    if halo > 0:
+        kb, bshape, _, sel = _pad_band_mesh(kb_int, (P, n1, n2), C.bounds, halo, dim)
+    else:                                    # max_order == 1: no gradient, no halo
+        kb, bshape, sel = kb_int, (P, n1, n2), None
+    npad = kb.shape[0]
+    Hm = C.build(kb)
+    energies, U = np.linalg.eigh(Hm)
+    Udag = np.conj(np.swapaxes(U, -1, -2)); del Hm
+    vel = []
+    for a in range(dim):
+        sh = np.zeros(3); sh[a] = C.dk_vel
+        vel.append(Udag @ ((C.build(kb + sh) - C.build(kb - sh)) / (2 * C.dk_vel)) @ U)
+    f = _fermi(energies, C.mu, C.T_au) if C.distribution is None \
+        else np.asarray(C.distribution(energies, C.mu, C.T_au), dtype=np.float64)
+    dfde = _dfde(f, C.T_au)
+    eps = energies[:, :, None] - energies[:, None, :]
+    offdiag = ~np.eye(nb, dtype=bool)
+    valid = offdiag[None] & (np.abs(eps) > 1e-12)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        inv_eps = np.where(valid, 1.0 / eps, 0.0)
+    A = [1j * vel[a] * inv_eps for a in range(dim)]
+    diag = np.arange(nb)
+    fmn = f[:, None, :] - f[:, :, None]
+    U_mesh = U.reshape(*bshape, nb, nb)
+
+    ow1_coh = complex(C.omega + 1j * C.gamma)
+    ow1_pop = complex(C.omega + 1j * C.gamma_pop)
+    Gamma = np.full((nb, nb), C.gamma); np.fill_diagonal(Gamma, C.gamma_pop)
+    iGamma = 1j * Gamma[None]
+    r_c = []
+    for c in range(dim):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            r = np.where(valid, (A[c] * fmn) / (ow1_coh - eps), 0.0)
+        r[:, diag, diag] += (-1j) * dfde * np.real(vel[c][:, diag, diag]) / ow1_pop
+        r_c.append(r)
+    vint = [vel[i] if sel is None else vel[i][sel] for i in range(dim)]
+    wint = w_int
+    vint_diag = [vint[i][:, diag, diag] for i in range(dim)] if C.return_intraband else None
+
+    def cov_grad(R, b):
+        return _wilson_cov_grad(R, b, U_mesh, Udag, bshape, npad, nb, C.dks[b], C.grad_stencil)
+
+    def _trace_J(rho_s):
+        Js = np.zeros(3, dtype=np.complex128)
+        ri = rho_s if sel is None else rho_s[sel]
+        for i in range(dim):
+            tr = np.einsum("kmn,knm->k", vint[i], ri, optimize=True)
+            Js[i] = np.sum(tr * wint)
+        return Js
+
+    def _trace_intra(rho_s):
+        Js = np.zeros(3, dtype=np.complex128)
+        ri_d = (rho_s if sel is None else rho_s[sel])[:, diag, diag]
+        for i in range(dim):
+            Js[i] = np.sum(np.einsum("kn,kn->k", vint_diag[i], ri_d, optimize=True) * wint)
+        return Js
+
+    results = []
+    for ef in range(C.nF):
+        E = C.E_arr[ef]
+        rho = np.zeros((npad, nb, nb), dtype=np.complex128)
+        for c in range(dim):
+            if abs(E[c]) >= 1e-40:
+                rho += E[c] * r_c[c]
+        Js_by_order = {1: _trace_J(rho)}
+        Ji_by_order = {1: _trace_intra(rho)} if C.return_intraband else None
+        for s in range(2, max_order + 1):
+            src = np.zeros((npad, nb, nb), dtype=np.complex128)
+            for b in range(dim):
+                if abs(E[b]) >= 1e-40:
+                    src += E[b] * cov_grad(rho, b)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                denom = s * C.omega + iGamma - eps
+                rho = np.where(np.abs(denom) > 0, src / denom, 0.0)
+            Js_by_order[s] = _trace_J(rho)
+            if C.return_intraband:
+                Ji_by_order[s] = _trace_intra(rho)
+        results.append((Js_by_order, Ji_by_order))
+    return results
+
+
+# Set in each ProcessPool worker by the pool initializer: the read-only mesh
+# context (H builder rebuilt from the model source, physics params) reused for
+# every k-block that worker processes.
+_MESH_WORKER_CTX = None
+
+
+def _mesh_build_from_spec(source_file, function_name, params, h_batch_name):
+    """Rebuild the ``kpts -> (nk, nb, nb)`` H builder inside a worker process, from
+    the model's SOURCE FILE (callables aren't picklable across spawn)."""
+    import importlib.util  # noqa: PLC0415
+    spec = importlib.util.spec_from_file_location("_mesh_model", source_file)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    hb = getattr(mod, h_batch_name, None) if h_batch_name else None
+    if callable(hb):
+        def build(kp):
+            return np.asarray(hb(np.asarray(kp, dtype=float), params), dtype=np.complex128)
+        return build
+    Hfn = getattr(mod, function_name)
+
+    def _hf(kx, ky, kz):
+        return Hfn(kx, ky, kz, params)
+
+    def build(kp):
+        return _build_H_mesh(_hf, np.asarray(kp, dtype=np.float64))
+    return build
+
+
+def _mesh_proc_init(payload):
+    """ProcessPool initializer: rebuild the shared mesh context ONCE per worker."""
+    global _MESH_WORKER_CTX
+    from types import SimpleNamespace  # noqa: PLC0415
+    from qxti.analytics.theory_response import _resolve_distribution  # noqa: PLC0415
+    (source_file, function_name, params, h_batch_name, dist_name, n1, n2, halo, bounds,
+     dim, dk_vel, mu, T_au, nb, omega, gamma, gamma_pop, dks, grad_stencil,
+     return_intraband, max_order, E_arr, nF) = payload
+    build = _mesh_build_from_spec(source_file, function_name, params, h_batch_name)
+    dist = _resolve_distribution(dist_name) if dist_name else None
+    _MESH_WORKER_CTX = SimpleNamespace(
+        n1=n1, n2=n2, halo=halo, bounds=bounds, dim=dim, build=build, dk_vel=dk_vel,
+        distribution=dist, mu=mu, T_au=T_au, nb=nb, omega=omega, gamma=gamma,
+        gamma_pop=gamma_pop, dks=dks, grad_stencil=grad_stencil,
+        return_intraband=return_intraband, max_order=max_order, E_arr=E_arr, nF=nF)
+
+
+def _mesh_proc_worker(task):
+    """ProcessPool task: compute one k-block using this worker's rebuilt context."""
+    kb_int, w_int, P = task
+    return _mesh_block_currents(kb_int, w_int, P, _MESH_WORKER_CTX)
 
 
 def harmonic_currents_meshed(
@@ -361,8 +519,15 @@ def harmonic_currents_meshed(
     return_intraband: bool = False,
     progress_cb: Callable | None = None,
     grad_stencil: int = 2,
+    model_spec: dict | None = None,
 ) -> dict[int, ComplexArray]:
     """Memory-safe + multi-core BZ-summed harmonic currents from ``H_func``.
+
+    ``model_spec`` (optional): ``{source_file, function_name, params, h_batch_name,
+    dist_name}`` describing the model so each k-block can run in a separate PROCESS
+    (true parallelism -- the mesh's vectorized per-block numpy is GIL-bound, so a
+    ThreadPool stalls at ~1 core regardless of nb).  When omitted the blocks run on
+    a ThreadPool (unchanged behaviour).
 
     Same result as ``precompute_band_data`` + ``harmonic_currents`` (bit-exact),
     but streams the k-mesh in blocks of planes (halo = ``max_order-1`` -> the
@@ -411,103 +576,20 @@ def harmonic_currents_meshed(
     mode, n_workers, bs = _plan_stream(n0, bytes_per_plane, halo, n_workers, reserve_gb, cap)
     single = mode == "single"
 
-    def _band_and_current(p_lo, p_hi):
-        """Band build once + recursion per field on ONE block, padded with a real
-        out-of-box halo on every active axis so the covariant gradient never wraps
-        at the BZ box edge (spurious for non-orthogonal / hexagonal reciprocal cells).
+    from types import SimpleNamespace  # noqa: PLC0415
+    # Read-only per-block context, shared by the thread/serial path (built here) and
+    # rebuilt inside each process worker (see _mesh_proc_init).
+    C = SimpleNamespace(
+        n1=n1, n2=n2, halo=halo, bounds=bounds, dim=dim, build=build, dk_vel=dk_vel,
+        distribution=distribution, mu=mu, T_au=T_au, nb=nb, omega=omega, gamma=gamma,
+        gamma_pop=gamma_pop, dks=dks, grad_stencil=grad_stencil,
+        return_intraband=return_intraband, max_order=max_order, E_arr=E_arr, nF=nF)
 
-        Returns a length-F list of ``{s: Js(3,)}`` (F = number of drive fields).
-        """
+    def _band_and_current(p_lo, p_hi):
         P = p_hi - p_lo
         kb_int = kmesh[p_lo:p_hi].reshape(P * n1 * n2, 3)
         w_int = wmesh[p_lo:p_hi].reshape(P * n1 * n2)
-        if halo > 0:
-            kb, bshape, _, sel = _pad_band_mesh(kb_int, (P, n1, n2), bounds, halo, dim)
-        else:                                    # max_order == 1: no gradient, no halo
-            kb, bshape, sel = kb_int, (P, n1, n2), None
-        npad = kb.shape[0]
-        Hm = build(kb)
-        energies, U = np.linalg.eigh(Hm)
-        Udag = np.conj(np.swapaxes(U, -1, -2)); del Hm
-        vel = []
-        for a in range(dim):
-            sh = np.zeros(3); sh[a] = dk_vel
-            vel.append(Udag @ ((build(kb + sh) - build(kb - sh)) / (2 * dk_vel)) @ U)
-        f = _fermi(energies, mu, T_au) if distribution is None \
-            else np.asarray(distribution(energies, mu, T_au), dtype=np.float64)
-        dfde = _dfde(f, T_au)
-        eps = energies[:, :, None] - energies[:, None, :]
-        offdiag = ~np.eye(nb, dtype=bool)
-        valid = offdiag[None] & (np.abs(eps) > 1e-12)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            inv_eps = np.where(valid, 1.0 / eps, 0.0)
-        A = [1j * vel[a] * inv_eps for a in range(dim)]
-        diag = np.arange(nb)
-        fmn = f[:, None, :] - f[:, :, None]
-        U_mesh = U.reshape(*bshape, nb, nb)
-
-        ow1_coh = complex(omega + 1j * gamma)
-        ow1_pop = complex(omega + 1j * gamma_pop)
-        Gamma = np.full((nb, nb), gamma); np.fill_diagonal(Gamma, gamma_pop)
-        iGamma = 1j * Gamma[None]
-        # E-independent order-1 building blocks r_c (coherent + intraband); reused
-        # across all F drive fields so the eigh/velocity build happens ONCE.
-        r_c = []
-        for c in range(dim):
-            with np.errstate(divide="ignore", invalid="ignore"):
-                r = np.where(valid, (A[c] * fmn) / (ow1_coh - eps), 0.0)
-            r[:, diag, diag] += (-1j) * dfde * np.real(vel[c][:, diag, diag]) / ow1_pop
-            r_c.append(r)
-        # BZ sum runs over the INTERIOR (original grid) cells only; the padded halo
-        # cells exist solely to feed the covariant gradient real neighbours.
-        vint = [vel[i] if sel is None else vel[i][sel] for i in range(dim)]
-        wint = w_int
-        vint_diag = [vint[i][:, diag, diag] for i in range(dim)] if return_intraband else None
-
-        def cov_grad(R, b):
-            return _wilson_cov_grad(R, b, U_mesh, Udag, bshape, npad,
-                                    nb, dks[b], grad_stencil)
-
-        def _trace_J(rho_s):
-            """Total current J_i = Σ_k w_k Tr[v_i ρ] = Σ_k w Σ_mn v_mn ρ_nm."""
-            Js = np.zeros(3, dtype=np.complex128)
-            ri = rho_s if sel is None else rho_s[sel]
-            for i in range(dim):
-                tr = np.einsum("kmn,knm->k", vint[i], ri, optimize=True)
-                Js[i] = np.sum(tr * wint)
-            return Js
-
-        def _trace_intra(rho_s):
-            """Intraband (Drude/Bloch) current: Σ_k w Σ_n v_nn ρ_nn (diagonal only).
-            Interband = total − intra (off-diagonal coherences)."""
-            Js = np.zeros(3, dtype=np.complex128)
-            ri_d = (rho_s if sel is None else rho_s[sel])[:, diag, diag]
-            for i in range(dim):
-                Js[i] = np.sum(np.einsum("kn,kn->k", vint_diag[i], ri_d, optimize=True) * wint)
-            return Js
-
-        results = []
-        for ef in range(nF):
-            E = E_arr[ef]
-            rho = np.zeros((npad, nb, nb), dtype=np.complex128)
-            for c in range(dim):
-                if abs(E[c]) >= 1e-40:
-                    rho += E[c] * r_c[c]
-            Js_by_order = {1: _trace_J(rho)}
-            Ji_by_order = {1: _trace_intra(rho)} if return_intraband else None
-            for s in range(2, max_order + 1):
-                src = np.zeros((npad, nb, nb), dtype=np.complex128)
-                for b in range(dim):
-                    if abs(E[b]) >= 1e-40:
-                        src += E[b] * cov_grad(rho, b)
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    denom = s * omega + iGamma - eps
-                    rho = np.where(np.abs(denom) > 0, src / denom, 0.0)
-                Js_by_order[s] = _trace_J(rho)
-                if return_intraband:
-                    Ji_by_order[s] = _trace_intra(rho)
-            results.append((Js_by_order, Ji_by_order))
-        return results
+        return _mesh_block_currents(kb_int, w_int, P, C)
 
     # ---- build the block list (interior plane ranges) ------------------------
     # Each block is the interior [lo,hi); ``_band_and_current`` pads it with the
@@ -547,9 +629,44 @@ def harmonic_currents_meshed(
         if progress_cb is not None:
             progress_cb(done[0], len(jobs))
 
+    # The mesh's per-block numpy is GIL-bound (few big vectorized calls + Python
+    # glue), so a ThreadPool stalls at ~1 core for ANY nb (measured nb=2 and nb=8).
+    # When the caller supplies model_spec, run the blocks in separate PROCESSES
+    # (true parallelism); each block is self-contained, so the result is identical.
+    # Gate on estimated work so short meshes don't pay the pool-startup tax (spawn
+    # re-imports the model per worker on macOS/Windows; fork on Linux is cheap, so
+    # on the cluster this fires for essentially every real run).
+    _est_work = int(n0) * int(n1) * int(n2) * int(max_order) * int(nb) ** 3
+    use_procpool = (model_spec is not None and not single
+                    and n_workers > 1 and len(jobs) > 1
+                    and _est_work >= _MESH_PROCPOOL_MIN_WORK)
     if concurrent <= 1:
         for job in jobs:
             _accumulate(_band_and_current(*job))
+    elif use_procpool:
+        payload = (model_spec["source_file"], model_spec["function_name"],
+                   model_spec["params"], model_spec.get("h_batch_name"),
+                   model_spec.get("dist_name"), n1, n2, halo, bounds, dim, dk_vel,
+                   mu, T_au, nb, omega, gamma, gamma_pop, dks, grad_stencil,
+                   return_intraband, max_order, E_arr, nF)
+        tasks = [(kmesh[lo:hi].reshape((hi - lo) * n1 * n2, 3),
+                  wmesh[lo:hi].reshape((hi - lo) * n1 * n2), hi - lo) for (lo, hi) in jobs]
+        try:
+            from concurrent.futures import ProcessPoolExecutor
+            with ProcessPoolExecutor(max_workers=n_workers, initializer=_mesh_proc_init,
+                                     initargs=(payload,)) as ex:
+                for part in ex.map(_mesh_proc_worker, tasks):
+                    _accumulate(part)
+        except Exception:   # spawn/pickling issue -> reset partial sums, fall back to threads
+            for ef in range(nF):
+                for s in range(1, max_order + 1):
+                    totals[ef][s][:] = 0.0
+                    if return_intraband:
+                        intras[ef][s][:] = 0.0
+            done[0] = 0
+            with ThreadPoolExecutor(max_workers=n_workers) as ex:
+                for part in ex.map(lambda j: _band_and_current(*j), jobs):
+                    _accumulate(part)
     else:
         with ThreadPoolExecutor(max_workers=n_workers) as ex:
             for part in ex.map(lambda j: _band_and_current(*j), jobs):
