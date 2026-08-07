@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import os
 from pathlib import Path
+import platform
 import time
 
 import numpy as np
@@ -29,25 +30,68 @@ FloatArray = NDArray[np.float64]
 
 _DEFAULT_WORKERS_CACHE: int | None = None
 
+# Below this band count the per-k numpy work is on tiny (nb, nb) matrices dominated
+# by Python glue, so the GIL-bound k-loop ThreadPool only gets slower as threads are
+# added (measured: nb=2 fastest at n_workers=1).  Auto -> serial for these; the real
+# multi-core fix for small nb is a ProcessPool (as in tddm), not more threads.
+_CMD_THREAD_MIN_NB = 16
+
 
 def _default_worker_count() -> int:
-    """Best default thread count for the GIL-bound parallel k-loop.
+    """All usable logical cores (SLURM allocation / affinity aware).
 
-    Delegates to :func:`qxti.utils.parallel.resolve_worker_count` with
-    ``gil_bound=True``: the CMD k-loop is a ThreadPool whose per-k Python glue holds
-    the GIL, so it does NOT scale past the PHYSICAL cores — extra hyperthreads only
-    add GIL/cache contention and make it slower (this is why ptddm got worse as
-    n_workers grew toward the logical-CPU count).  A cluster SLURM allocation or an
-    explicit ``n_workers`` still wins.  See ``docs/vault/Concept - Memory and
-    Parallelism`` and ``Cluster and SLURM``.
+    Used for the fork ProcessPool path (small-nb models on Linux), which — like
+    tddm — gets true multi-core parallelism, so it wants every logical CPU.  The
+    large-nb ThreadPool path instead caps at the PHYSICAL cores (GIL-bound), via
+    ``resolve_worker_count(gil_bound=True)`` in ``__init__``.
     """
     global _DEFAULT_WORKERS_CACHE
     if _DEFAULT_WORKERS_CACHE is not None:
         return _DEFAULT_WORKERS_CACHE
     from qxti.utils.parallel import resolve_worker_count  # noqa: PLC0415
 
-    _DEFAULT_WORKERS_CACHE = resolve_worker_count(gil_bound=True)
+    _DEFAULT_WORKERS_CACHE = resolve_worker_count()
     return _DEFAULT_WORKERS_CACHE
+
+
+def _cmd_fork_supported() -> bool:
+    """True when a fork-based ProcessPool is safe (Linux only).
+
+    ``fork`` lets worker processes INHERIT the whole solve state (previous order,
+    band frame, connection cache) via copy-on-write, so the CMD k-loop parallelises
+    across cores with no rebuild and no big-array pickling.  macOS/Windows use spawn
+    (fork is unsafe there) -> small-nb CMD falls back to serial, which is the fastest
+    a GIL-bound ThreadPool can do anyway."""
+    try:
+        import multiprocessing as _mp  # noqa: PLC0415
+        if "fork" not in _mp.get_all_start_methods():
+            return False
+    except Exception:
+        return False
+    # QXTI_FORCE_FORK=1 lets the fork path be exercised on macOS for TESTING (fork is
+    # otherwise unsafe there); production only auto-enables it on Linux.
+    if os.environ.get("QXTI_FORCE_FORK", "").strip() in ("1", "true", "yes", "on"):
+        return True
+    return platform.system() == "Linux"
+
+
+# Set in the parent right before a fork ProcessPool is created; the workers inherit
+# it (copy-on-write) so they never pickle the large solve state.  A tuple of
+# ``(cmd, previous_order_band, previous_order_mesh, connection_cache, vectors_mesh,
+#   field_series, target_times, nt)``.
+_CMD_FORK_STATE = None
+
+
+def _cmd_fork_worker(task):
+    """Fork worker: solve k-points [lo, hi) for the current order and RETURN the
+    density-matrix series (the parent commits all I/O).  Reads the inherited state."""
+    lo, hi = task
+    cmd, prev, prev_mesh, conn, vecs, field, times, nt = _CMD_FORK_STATE
+    nb = int(cmd.hamiltonian.basis_size)
+    out = np.empty((hi - lo, len(times), nb, nb), dtype=np.complex128)
+    for j, ik in enumerate(range(lo, hi)):
+        out[j] = cmd._order_series_at_k(ik, prev, prev_mesh, conn, vecs, field, times, nt)
+    return lo, hi, out
 
 
 class CMD:
@@ -220,7 +264,29 @@ class CMD:
         # of PERFORMANCE cores adding threads only adds GIL/efficiency-core
         # contention and gets SLOWER. The auto default therefore uses the
         # performance-core count, not all logical CPUs.
-        self._n_workers: int = int(_default_worker_count() if n_workers is None else max(1, n_workers))
+        #
+        # nb-aware auto default: the k-loop is a GIL-bound ThreadPool.  For small
+        # Hamiltonians (tiny nb, e.g. 2x2) the per-k numpy work is dominated by
+        # Python glue, so extra threads only add GIL contention and get SLOWER --
+        # measured on a cluster: n_workers=1 -> 13s (fastest), 12 -> 50s, 24 -> 57s
+        # (~90% of CPU is system time / futex at 24).  So auto -> 1 (serial is the
+        # fastest a ThreadPool can do here; true multi-core needs a ProcessPool,
+        # like tddm).  Large-nb models (numpy releases the GIL) auto -> physical
+        # cores.  An explicit n_workers always wins.
+        if n_workers is None:
+            _nb = int(self.hamiltonian.basis_size)
+            if _nb < _CMD_THREAD_MIN_NB:
+                # small nb: GIL-bound on threads.  Linux -> fork ProcessPool over ALL
+                # logical cores (true multi-core, like tddm); elsewhere -> serial (the
+                # fastest a ThreadPool can do -- more threads only add GIL contention).
+                self._n_workers: int = _default_worker_count() if _cmd_fork_supported() else 1
+            else:
+                # large nb: numpy releases the GIL -> ThreadPool scales; cap at the
+                # PHYSICAL cores (hyperthreads only add GIL/cache contention).
+                from qxti.utils.parallel import resolve_worker_count  # noqa: PLC0415
+                self._n_workers = resolve_worker_count(gil_bound=True)
+        else:
+            self._n_workers = max(1, int(n_workers))
         # Pre-compute the k-independent damping matrix once; reused every time step.
         self._damping_cache: ComplexArray = self._damping_matrix()
         # Console progress (set False to silence, e.g. inside parallel workers).
@@ -921,66 +987,46 @@ class CMD:
         _par_lock = _threading.Lock()
         _PAR_HEARTBEAT_S: float = 15.0  # emit at most once per 15 seconds
 
+        def _commit(ik: int, solved_series) -> None:
+            """Write one k-point's solved series to storage + stream it to the
+            observable, then refresh the progress/checkpoint.  Single-owner I/O
+            shared by the serial, ThreadPool and fork-process paths — the fork
+            workers compute the series in a separate process and hand it back here."""
+            if solved is not None:
+                if is_float16_complex_dtype(solved.dtype):
+                    write_complex_to_float16_memmap(solved, ik, solved_series)
+                else:
+                    solved[ik] = solved_series
+            if observe_callback is not None:
+                observe_callback(ik, np.asarray(solved_series, dtype=np.complex128))
+            # Heartbeat: refresh the live ETA line (throttles itself) + checkpoint.
+            now = time.perf_counter()
+            with _par_lock:
+                _par_counter[0] += 1
+                done = _par_counter[0]
+                if progress_timer is not None:
+                    progress_timer.advance()
+                if self._live is not None:
+                    self._live.update(
+                        progress_timer.completed if progress_timer else (completed_solves + done),
+                        message=(f"order {order}/{self.max_order}, "
+                                 f"{100 * (done + resume_from_k) // nk}%"))
+                if now - _par_last_emit[0] >= _PAR_HEARTBEAT_S:
+                    _par_last_emit[0] = now
+                    if checkpoint_path is not None:
+                        try:
+                            Path(checkpoint_path).write_text(
+                                _json.dumps({**checkpoint_meta, "completed_k": resume_from_k + done})
+                            )
+                        except OSError:
+                            pass
+
         def _solve_k_range(start: int, stop: int) -> None:
-            """Process k-points [start, stop) as one thread task.
-
-            Chunking k-points reduces ThreadPoolExecutor scheduling overhead
-            vs. one-task-per-k-point, and keeps each task long enough for the
-            GIL-release benefit of NumPy to dominate.  A time-based heartbeat
-            inside the loop emits periodic progress so long runs do not appear
-            frozen when all threads are busy.
-            """
+            """Serial/thread task: solve k-points [start, stop) and commit each."""
             for ik in range(start, stop):
-                omega_matrix = self.band_gauge_frame.omega_matrix(ik)
-                source_components = self._driving_components_for_k_index(
-                    previous_order_band,
-                    previous_order_mesh,
-                    connection_cache,
-                    ik,
-                    nt=nt,
-                    vectors_mesh=vectors_mesh,
-                )
-                source_series_k = self._field_weighted_source_series(
-                    field_series,
-                    source_components,
-                )
-                solved_series = self._solve_linear_order_band_on_grid(
-                    target_times,
-                    source_series_k,
-                    omega_matrix,
-                )
-                # Each ik writes to a distinct row — no lock needed.
-                if solved is not None:
-                    if is_float16_complex_dtype(solved.dtype):
-                        write_complex_to_float16_memmap(solved, ik, solved_series)
-                    else:
-                        solved[ik] = solved_series
-                # Call the observable accumulator (streaming path).
-                if observe_callback is not None:
-                    observe_callback(ik, np.asarray(solved_series, dtype=np.complex128))
-
-                # Heartbeat: refresh the live ETA line (throttles itself to a few
-                # seconds) and write a resume checkpoint at most once per interval.
-                now = time.perf_counter()
-                with _par_lock:
-                    _par_counter[0] += 1
-                    done = _par_counter[0]
-                    if progress_timer is not None:
-                        progress_timer.advance()
-                    if self._live is not None:
-                        self._live.update(
-                            progress_timer.completed if progress_timer else (completed_solves + done),
-                            message=(f"order {order}/{self.max_order}, "
-                                     f"{100 * (done + resume_from_k) // nk}%"))
-                    if now - _par_last_emit[0] >= _PAR_HEARTBEAT_S:
-                        _par_last_emit[0] = now
-                        if checkpoint_path is not None:
-                            try:
-                                Path(checkpoint_path).write_text(
-                                    _json.dumps({**checkpoint_meta, "completed_k": resume_from_k + done})
-                                )
-                            except OSError:
-                                pass
+                _commit(ik, self._order_series_at_k(
+                    ik, previous_order_band, previous_order_mesh, connection_cache,
+                    vectors_mesh, field_series, target_times, nt))
 
         n_workers = self._effective_n_workers_for_memmap(
             nk, nt, nb, using_memmap=(output_path is not None)
@@ -991,6 +1037,14 @@ class CMD:
         # k-points to actually solve: skip already-completed ones on resume.
         remaining_k_start = resume_from_k
         remaining_nk = nk - resume_from_k
+        # Small-nb models are GIL-bound on a ThreadPool (more threads only add GIL
+        # contention -> slower).  On Linux run the k-loop on a FORK ProcessPool: the
+        # workers INHERIT the whole solve state (previous order, band frame,
+        # connections) copy-on-write -- no rebuild, no big-array pickling, and the
+        # covariant gradient's neighbour access just works -- solve their chunk and
+        # RETURN it; the parent commits all I/O.  Identical numbers, true multi-core.
+        use_forkpool = (_cmd_fork_supported() and n_workers > 1
+                        and nb < _CMD_THREAD_MIN_NB and remaining_nk > 1)
 
         if remaining_nk <= 0:
             self._emit_progress(
@@ -999,6 +1053,39 @@ class CMD:
             completed_solves += nk
             if progress_timer is not None:
                 progress_timer.advance(nk)
+        elif use_forkpool:
+            import multiprocessing as _mp  # noqa: PLC0415
+            global _CMD_FORK_STATE
+            chunk_size = max(1, (remaining_nk + n_workers - 1) // n_workers)
+            chunks = [
+                (remaining_k_start + i * chunk_size,
+                 min(remaining_k_start + (i + 1) * chunk_size, nk))
+                for i in range(min(n_workers, remaining_nk))
+            ]
+            _CMD_FORK_STATE = (self, previous_order_band, previous_order_mesh,
+                               connection_cache, vectors_mesh, field_series,
+                               target_times, nt)
+            try:
+                with ProcessPoolExecutor(max_workers=n_workers,
+                                         mp_context=_mp.get_context("fork")) as ex:
+                    for lo, hi, chunk_rho in ex.map(_cmd_fork_worker, chunks):
+                        for j, ik in enumerate(range(lo, hi)):
+                            _commit(ik, chunk_rho[j])   # parent owns all I/O + streaming
+            finally:
+                _CMD_FORK_STATE = None
+            completed_solves += remaining_nk
+            self._emit_progress(
+                f"CMD order {order}/{self.max_order}: {nk} k-points completed "
+                f"({n_workers} fork workers, {len(chunks)} chunks), "
+                f"global {completed_solves}/{total_order_solves}."
+            )
+            if checkpoint_path is not None:
+                try:
+                    Path(checkpoint_path).write_text(
+                        _json.dumps({**checkpoint_meta, "completed_k": nk})
+                    )
+                except OSError:
+                    pass
         elif n_workers > 1:
             # Distribute remaining k-points across workers in contiguous chunks.
             chunk_size = max(1, (remaining_nk + n_workers - 1) // n_workers)
@@ -1044,6 +1131,20 @@ class CMD:
         if solved is not None and isinstance(solved, np.memmap):
             solved.flush()
         return solved, completed_solves
+
+    def _order_series_at_k(self, ik, previous_order_band, previous_order_mesh,
+                           connection_cache, vectors_mesh, field_series, target_times, nt):
+        """Solve one perturbative order at a single k-point -> ``(nt, nb, nb)`` series.
+
+        Pure compute (reads state, returns an array), so it is called identically by
+        the serial loop, the ThreadPool and the fork worker (which runs it in a
+        separate process on an inherited copy of the state)."""
+        omega_matrix = self.band_gauge_frame.omega_matrix(ik)
+        source_components = self._driving_components_for_k_index(
+            previous_order_band, previous_order_mesh, connection_cache, ik,
+            nt=nt, vectors_mesh=vectors_mesh)
+        source_series_k = self._field_weighted_source_series(field_series, source_components)
+        return self._solve_linear_order_band_on_grid(target_times, source_series_k, omega_matrix)
 
     def _solve_linear_order_band_on_grid(
         self,

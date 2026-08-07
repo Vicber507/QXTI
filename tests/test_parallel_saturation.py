@@ -90,3 +90,32 @@ def test_mesh_procpool_result_matches_serial():
 
     rel = np.max(np.abs(J_proc - J_serial)) / (np.max(np.abs(J_serial)) + 1e-30)
     assert rel < 1e-10, f"mesh ProcessPool changed the result: rel diff {rel:.2e}"
+
+
+def test_cmd_fork_result_matches_serial(monkeypatch):
+    """ptddm/CMD fork ProcessPool must give the same orders as the serial solve."""
+    import pytest
+    monkeypatch.setenv("QXTI_FORCE_FORK", "1")   # exercise the fork path off-Linux too
+    import qxti.response.cmd as C
+    if not C._cmd_fork_supported():
+        pytest.skip("fork start method unavailable on this platform")
+    from qxti.core import QXTIConfig, QXTISimulation
+
+    cfg = QXTIConfig.from_file("inputs/inputParams.haldane_topological.cfg")
+    cfg = replace(cfg, kgrid=replace(cfg.kgrid, k_points=(6, 6)),
+                  laser=replace(cfg.laser, ncycles=3.0), cmd=replace(cfg.cmd, max_order=3))
+
+    def solve(nw):
+        sim = QXTISimulation(config=cfg)
+        ham = sim.build_hamiltonian()
+        cmd = sim.build_cmd(ham)
+        cmd._n_workers = nw
+        cmd.progress_enabled = False
+        return cmd.solve_time_domain_in_memory()
+
+    o_serial = solve(1)   # serial
+    o_fork = solve(4)     # fork ProcessPool
+    for s in o_serial:
+        rel = (np.max(np.abs(np.asarray(o_fork[s]) - np.asarray(o_serial[s])))
+               / (np.max(np.abs(o_serial[s])) + 1e-30))
+        assert rel < 1e-10, f"CMD fork order {s} differs from serial: rel diff {rel:.2e}"
