@@ -915,6 +915,97 @@ def time_domain_currents(band: BandData, weights, E_t, dt, max_order, *,
     return out
 
 
+# Per-plane peak footprint of the multi-laser time-domain solve, in units of
+# (nb*nb*Nt complex128) arrays: inv_denom + rho_omega + rho_t + source + a couple of
+# temporaries.  Kept a touch high so block sizing errs small (the RAM guard checks
+# the true concurrent peak before launching).
+_TD_ARRAYS_PER_PLANE = 6.0
+
+
+def time_domain_currents_meshed(
+    H_func, kpts, shape, bounds, weights, E_t, dt, max_order, *,
+    gamma=1e-3, gamma_pop=None, mu=0.0, T_au=0.0, dimension=3, dk_vel=1e-4,
+    distribution=None, n_workers=None, reserve_gb=1.0, h_batch=None,
+    return_intraband=False, progress_cb=None,
+):
+    """Memory-safe MULTI-LASER (arbitrary ``E(t)``) BZ-summed currents.
+
+    Same physics as ``precompute_band_data`` + :func:`time_domain_currents` on the
+    whole grid, but STREAMS the k-mesh in halo-padded blocks and sums the per-block
+    BZ current — so the ``(nk, nb, nb, Nt)`` frequency-domain tensors NEVER exist for
+    the whole grid.  That all-at-once allocation (``inv_denom``/``ρ(ω)`` sized ``nk ×
+    nb² × Nt``) is what makes the single-shot path OOM at large ``nk`` (petabytes at
+    140³), which is why multi-laser runs fell back to ptddm.  Each block is
+    self-contained (real out-of-box halo for the covariant gradient), so the result
+    is identical to the whole-grid solve (verified in tests).
+
+    Returns ``{"J_t": {s: (Nt, dim)}}`` (+ ``"J_t_intra"`` when requested), each
+    already summed over the Brillouin zone.
+    """
+    n0, n1, n2 = int(shape[0]), int(shape[1]), int(shape[2])
+    dim = int(dimension)
+    E_t = np.asarray(E_t, dtype=np.complex128)
+    Nt = int(E_t.shape[0])
+    halo = max(0, int(max_order) - 1)          # time_domain_currents uses a 2-point stencil
+    n_workers = default_worker_count() if n_workers is None else max(1, int(n_workers))
+
+    build = (lambda kp: np.asarray(h_batch(kp), dtype=np.complex128)) if h_batch is not None \
+        else (lambda kp: _build_H_mesh(H_func, kp))
+    kmesh = np.asarray(kpts, dtype=np.float64).reshape(n0, n1, n2, 3)
+    wmesh = np.asarray(weights, dtype=np.float64).reshape(n0, n1, n2)
+    nb = int(build(kmesh[:1, :1, :1].reshape(1, 3)).shape[1])
+
+    n1p = n1 + (2 * halo if dim >= 2 else 0)
+    n2p = n2 + (2 * halo if dim >= 3 else 0)
+    bytes_per_plane = n1p * n2p * nb * nb * Nt * 16.0 * _TD_ARRAYS_PER_PLANE
+    mode, n_workers, bs = _plan_stream(n0, bytes_per_plane, halo, n_workers, reserve_gb, cap=n0)
+
+    if mode == "single":
+        jobs = [(0, n0)]
+    else:
+        # A covariant-gradient block needs >= 2 interior planes along the streamed
+        # axis: _pad_band_mesh forms the real out-of-box halo by EXTRAPOLATING from
+        # the block's own spacing, and a 1-plane block has no spacing -> no axis-0
+        # halo -> the gradient degenerates and every order >= 2 silently vanishes.
+        # Enforce >= min(2, n0); if that block no longer fits RAM the guard below
+        # raises a clear error instead of returning wrong (zero) higher harmonics.
+        if halo > 0:
+            bs = max(int(bs), min(2, n0))
+        jobs, lo = [], 0
+        while lo < n0:
+            hi = min(lo + bs, n0)
+            jobs.append((lo, hi))
+            lo = hi
+    # Blocks run SERIALLY here, so only ONE (padded) block is live at a time.
+    _mem.ensure_headroom((max(hi - lo for lo, hi in jobs) + 2 * halo) * bytes_per_plane,
+                         reserve_gb=reserve_gb, label="td-multilaser block")
+
+    J_t = {s: np.zeros((Nt, dim), dtype=np.complex128) for s in range(1, max_order + 1)}
+    J_t_intra = ({s: np.zeros((Nt, dim), dtype=np.complex128) for s in range(1, max_order + 1)}
+                 if return_intraband else None)
+
+    for bi, (lo, hi) in enumerate(jobs):
+        block_kpts = kmesh[lo:hi].reshape((hi - lo) * n1 * n2, 3)
+        block_w = wmesh[lo:hi].reshape((hi - lo) * n1 * n2)
+        band = precompute_band_data(
+            H_func, block_kpts, (hi - lo, n1, n2), bounds, mu=mu, T_au=T_au,
+            dimension=dim, dk_vel=dk_vel, distribution=distribution, h_batch=h_batch, halo=halo)
+        td = time_domain_currents(band, block_w, E_t, dt, max_order, gamma=gamma,
+                                  gamma_pop=gamma_pop, return_intraband=return_intraband)
+        for s in range(1, max_order + 1):
+            J_t[s] += np.asarray(td["J_t"][s], dtype=np.complex128)[:, :dim]
+            if return_intraband:
+                J_t_intra[s] += np.asarray(td["J_t_intra"][s], dtype=np.complex128)[:, :dim]
+        del band, td
+        if progress_cb is not None:
+            progress_cb(bi + 1, len(jobs))
+
+    out = {"J_t": J_t}
+    if return_intraband:
+        out["J_t_intra"] = J_t_intra
+    return out
+
+
 def uniform_mp_grid(bounds, shape):
     """Shifted Monkhorst-Pack k-points (C-ordered) + weights for a box ``bounds``."""
     axes = []

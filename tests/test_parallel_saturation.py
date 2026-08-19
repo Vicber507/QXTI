@@ -35,7 +35,7 @@ def test_split_units_ram_tight_makes_more_not_fewer_blocks():
 
 def _tddm_current(cfg, ham, kgrid, weights, dim, A_t, dt, n_workers):
     from qxti.analytics.tddm import _tddm_current_time
-    Jt, _ = _tddm_current_time(
+    Jt, _, _ = _tddm_current_time(
         ham, kgrid, weights, A_t, dt, dim, cfg.cmd,
         n_workers=n_workers, reserve_gb=1.0, progress=False)
     return Jt
@@ -119,3 +119,111 @@ def test_cmd_fork_result_matches_serial(monkeypatch):
         rel = (np.max(np.abs(np.asarray(o_fork[s]) - np.asarray(o_serial[s])))
                / (np.max(np.abs(o_serial[s])) + 1e-30))
         assert rel < 1e-10, f"CMD fork order {s} differs from serial: rel diff {rel:.2e}"
+
+
+def test_cmd_streaming_currents_match_in_memory():
+    """The streaming ptddm path (no full-rho in RAM) must give the SAME observed
+    currents J^(s)(t) as tracing v.rho from the in-memory density matrix."""
+    from qxti.core import QXTIConfig, QXTISimulation
+
+    cfg = QXTIConfig.from_file("inputs/inputParams.haldane_topological.cfg")
+    # complex128 scratch so the check isolates the streaming ALGORITHM from the
+    # reduced-precision disk scratch (the default complex64/float16 scratch makes
+    # higher orders differ from the complex128 in-memory path -- precision, not a bug).
+    cfg = replace(cfg, kgrid=replace(cfg.kgrid, k_points=(6, 6)),
+                  laser=replace(cfg.laser, ncycles=3.0),
+                  cmd=replace(cfg.cmd, max_order=3, basis="band",
+                              rho_storage_dtype="complex128",
+                              scratch_rho_storage_dtype="complex128"))
+    sim = QXTISimulation(config=cfg)
+    ham = sim.build_hamiltonian()
+    dim = int(ham.dimension)
+    directions = ("x", "y", "z")[:dim]
+    nk = int(np.asarray(sim.build_kgrid(ham).points()).shape[0])
+    weights = np.full(nk, 1.0 / nk)   # any consistent weights (they cancel in the check)
+
+    # streaming: J^(s)(t) accumulated on the fly, full rho never in RAM
+    cmd_s = sim.build_cmd(ham)
+    cmd_s.progress_enabled = False
+    acc = cmd_s.solve_currents_streaming(weights)
+
+    # in-memory reference: trace the stored rho with the SAME weights + operators
+    cmd_m = sim.build_cmd(ham)
+    cmd_m.progress_enabled = False
+    orders = cmd_m.solve_time_domain_in_memory()      # {s: (nk, nt, nb, nb)} band basis
+
+    J_ref = {}
+    for s in range(1, int(cfg.cmd.max_order) + 1):
+        rho = np.asarray(orders[s], dtype=np.complex128)      # (nk, nt, nb, nb)
+        Js = np.zeros((rho.shape[1], 3), dtype=np.float64)
+        for axis, d in enumerate(directions):
+            v = np.asarray(cmd_m.band_gauge_frame.current(d), dtype=np.complex128)  # (nk, nb, nb)
+            Js[:, axis] = np.real(np.einsum("k,kmn,ktnm->t", weights, v, rho, optimize=True))
+        J_ref[s] = Js
+    # Normalise the tolerance by the GLOBAL current scale: some orders are exactly
+    # zero by symmetry (e.g. the 2nd-harmonic current in centrosymmetric Haldane), so
+    # a per-order relative error would divide machine noise by ~0.
+    scale = max(float(np.max(np.abs(v))) for v in J_ref.values()) + 1e-300
+    for s in J_ref:
+        abs_err = float(np.max(np.abs(acc.current_time(s) - J_ref[s])))
+        assert abs_err < 1e-10 * scale, (
+            f"order {s}: streaming vs in-memory current differ by {abs_err:.2e} "
+            f"(global scale {scale:.2e})")
+
+
+def test_multilaser_streaming_matches_all_k():
+    """The memory-safe block-streamed MULTI-LASER path must equal the whole-grid
+    time-domain solve (incl. the mixing frequencies) to machine precision.
+
+    Uses ``valence_occupation`` + a field strong enough that orders 2/3 are clearly
+    NONZERO, and FORCES thin blocks (so _plan_stream would pick a 1-plane block).  A
+    1-plane block can't form the axis-0 halo, which used to silently zero the higher
+    orders -- the assertions below (order 3 nonzero AND matching the whole-grid pass)
+    guard that regression."""
+    import qxti.analytics.mesh_response as MR
+    from qxti.core import QXTIConfig, QXTISimulation
+    from qxti.analytics.theory_response import build_k_integration_weights, _resolve_distribution
+
+    cfg = QXTIConfig.from_file("inputs/inputParams.haldane_topological.cfg")
+    cfg = replace(cfg, kgrid=replace(cfg.kgrid, k_points=(12, 12)))
+    sim = QXTISimulation(config=cfg)
+    ham = sim.build_hamiltonian()
+    kg = sim.build_kgrid(ham)
+    w = build_k_integration_weights(cfg, hamiltonian=ham, kgrid=kg)
+    kp = kg.points()
+    shape = tuple(int(kg.shape[a]) for a in range(3))
+    bnd = ham.reciprocal_box_bounds()
+    dim = int(ham.dimension)
+    dist = _resolve_distribution("valence_occupation")
+    mo, Nt, dt = 3, 400, 0.08
+    t = np.arange(Nt) * dt
+    env = np.exp(-((t - Nt * dt / 2) / (Nt * dt / 5)) ** 2)
+    E = np.zeros((Nt, 3))
+    E[:, 0] = 1.6e-3 * (np.cos(0.09 * t) + 0.7 * np.cos(0.13 * t)) * env  # two carriers, mixing
+    if dim >= 2:
+        E[:, 1] = 1.6e-3 * 0.5 * np.cos(0.11 * t) * env
+
+    band = MR.precompute_band_data(ham._matrix_at, kp, shape, bnd, dimension=dim,
+                                   halo=mo - 1, distribution=dist)
+    ref = MR.time_domain_currents(band, w, E, dt, mo, gamma=1e-3)
+    # sanity: the reference actually HAS nonzero higher-order content (else 0==0)
+    assert float(np.max(np.abs(ref["J_t"][3]))) > 1e-6, "test setup has no order-3 signal"
+
+    orig = MR._plan_stream
+    MR._plan_stream = lambda n0, bpp, halo, nw, rg, cap: ("block", 4, 1)  # force 1-plane -> exercises the >=2 guard
+    try:
+        blk = MR.time_domain_currents_meshed(
+            ham._matrix_at, kp, shape, bnd, w, E, dt, mo,
+            gamma=1e-3, mu=0.0, T_au=0.0, distribution=dist, dimension=dim)
+    finally:
+        MR._plan_stream = orig
+
+    # normalise by order 1 (always well-defined); the forbidden even harmonic can be
+    # a 0/0 NaN in the base solve, so compare NaN-safe.
+    scale = float(np.max(np.abs(np.nan_to_num(ref["J_t"][1])))) + 1e-300
+    for s in range(1, mo + 1):
+        d = np.nan_to_num(np.asarray(blk["J_t"][s])) - np.nan_to_num(np.asarray(ref["J_t"][s])[:, :dim])
+        abs_err = float(np.max(np.abs(d)))
+        assert abs_err < 1e-8 * scale, f"multi-laser order {s} streamed vs all-k differ: {abs_err:.2e}"
+    # the ODD order-3 mixing content must survive the block streaming (the bug zeroed it)
+    assert float(np.max(np.abs(np.nan_to_num(blk["J_t"][3])))) > 1e-6, "order 3 vanished (block bug)"

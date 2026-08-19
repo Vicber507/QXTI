@@ -413,41 +413,47 @@ def _hhg_multilaser_result(config, hamiltonian, kgrid, dim, nk, max_order, gamma
     (omega_i +/- omega_j +/- ...) appears automatically in the FFT of the current.
     Reduces to the closed form for a single laser (validated in the study).
     """
-    from qxti.analytics.mesh_response import precompute_band_data, time_domain_currents
-    from qxti.utils.progress import format_duration
+    from qxti.analytics.mesh_response import time_domain_currents_meshed, default_worker_count
+    from qxti.utils.progress import format_duration, LiveProgress
 
     weights = build_k_integration_weights(config, hamiltonian=hamiltonian, kgrid=kgrid,
                                           extra_k_weight_mask=extra_k_weight_mask)
     k_points = kgrid.points()
     shape = tuple(int(kgrid.shape[a]) for a in range(3))
     bounds = hamiltonian.reciprocal_box_bounds()
+    n_workers, reserve_gb = _mesh_parallel_settings(config)
+    h_batch = _model_h_batch(hamiltonian)
     if progress:
         print(f"[theory-HHG] MULTI-LASER ({int(getattr(kgrid,'total_points',nk))} k-points): "
-              f"time-domain perturbative recursion over the full E(t) "
-              f"({Nt} time steps, window [{t_axis[0]:.1f}, {t_axis[-1]:.1f}] a.u.). "
-              "Progress with ETA below.", flush=True)
+              f"memory-safe STREAMING time-domain recursion over the full E(t) "
+              f"({Nt} time steps, window [{t_axis[0]:.1f}, {t_axis[-1]:.1f}] a.u.), "
+              f">={reserve_gb:g} GB RAM kept free. Live progress with ETA below.", flush=True)
     _t_band = time.perf_counter()
-    # Pad the mesh so the covariant gradient reads real out-of-box neighbours at the
-    # box edge (no periodic wrap); time_domain_currents uses the 2-point stencil.
-    band = precompute_band_data(hamiltonian._matrix_at, k_points, shape, bounds,
-                                mu=mu, T_au=temperature, dimension=dim,
-                                distribution=distribution, halo=max(0, max_order - 1))
+    _blive: dict[str, LiveProgress] = {}   # lazy: #blocks is known only in the callback
+
+    def _block_cb(done, total):
+        if not progress:
+            return
+        lv = _blive.get("p")
+        if lv is None:
+            lv = _blive["p"] = LiveProgress("theory-HHG", max(1, total))
+        lv.update(done, message="multi-laser mesh")
+
+    # Stream the k-mesh in halo-padded blocks so the (nk, nb, nb, Nt) frequency
+    # tensors never exist for the whole grid (that all-at-once allocation is what
+    # OOM'd multi-laser at large nk -> the reason such runs needed ptddm).
+    td = time_domain_currents_meshed(
+        hamiltonian._matrix_at, k_points, shape, bounds, weights, E_t[:, :3], dt, max_order,
+        gamma=gamma, gamma_pop=gamma, mu=mu, T_au=temperature, dimension=dim,
+        distribution=distribution, n_workers=n_workers, reserve_gb=reserve_gb,
+        h_batch=h_batch, return_intraband=True, progress_cb=_block_cb)
     if progress:
-        print(f"[theory-HHG] band data ready (batched eigh): "
-              f"elapsed {format_duration(time.perf_counter() - _t_band)}.", flush=True)
-    from qxti.utils.progress import LiveProgress
-    _olive = LiveProgress("theory-HHG", max_order) if progress else None
-
-    def _order_cb(s):
-        if _olive is not None:
-            _olive.update(s, message=f"order {s}/{max_order} (time-domain)")
-
-    td = time_domain_currents(band, weights, E_t[:, :3], dt, max_order,
-                              gamma=gamma, gamma_pop=gamma, return_intraband=True,
-                              progress_cb=_order_cb)
-    if _olive is not None:
-        _olive.update(max_order, force=True)
-        _olive.close()
+        lv = _blive.get("p")
+        if lv is not None:
+            lv.update(lv.total, force=True)
+            lv.close()
+        print(f"[theory-HHG] multi-laser mesh recursion done: elapsed "
+              f"{format_duration(time.perf_counter() - _t_band)}.", flush=True)
 
     # Per-order physical current in time (real) and its spectrum; plus the REAL
     # intra/inter split (intraband = Σ_n v_nn ρ_nn diagonal, inter = total − intra).
