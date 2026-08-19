@@ -205,13 +205,16 @@ def _propagate_block(
     gamma_pop: float,         # 1/T1 (0 => no population relaxation)
     gamma_coh: float,         # 1/T2 (0 => no dephasing)
     progress_cb: Callable[[int], None] | None = None,
-) -> tuple[FloatArray, FloatArray, FloatArray]:
+    pop_stride: int = 0,      # >0 => record band populations n(k,t) every pop_stride steps
+) -> tuple:
     """Integrate ρ_k(t) for one block of k-points and return the block's partial
     current contribution.
 
-    Returns ``(J_total (Nt, 3), J_intra (Nt, 3), J_dc (3,))`` — all already summed
-    over the block's k-points with the BZ weights.  The caller subtracts J_DC and
-    sums the blocks.
+    Returns ``(J_total (Nt, 3), J_intra (Nt, 3), J_dc (3,), pops)`` — currents are
+    already summed over the block's k-points with the BZ weights; ``pops`` is the
+    NON-perturbative band populations ``n(k, t)`` for THIS block (kept per-k, not
+    summed) sampled every ``pop_stride`` grid times, shape ``(n_frames, Kb, nb)`` in
+    the instantaneous (Houston) eigenbasis, or ``None`` when ``pop_stride <= 0``.
     """
     Nt = int(A_t.shape[0])
     Kb = int(kpts_block.shape[0])
@@ -250,6 +253,7 @@ def _propagate_block(
     # progress accounting: report work in k·time-step units (Kb per step) so the
     # caller can aggregate a global fraction across all blocks/workers.
     pending_steps = 0
+    pops = [] if pop_stride and pop_stride > 0 else None
 
     for it in range(Nt):
         # ---- current at this grid time t_it: TOTAL is exact (no eigh); the
@@ -261,6 +265,8 @@ def _propagate_block(
         Em, Vm = np.linalg.eigh(Hf(kAm))                 # instantaneous eigenbasis @ midpoint
         Vmd = Vm.conj()
         rho_diag = np.einsum("kin,kij,kjn->kn", Vmd, rho, Vm).real   # populations
+        if pops is not None and (it % pop_stride == 0):
+            pops.append(rho_diag.astype(np.float32).copy())          # n(k,t) this frame
         for a in range(dim):
             tr = np.einsum("kij,kji->k", vA[a], rho).real            # Tr[v_a ρ]
             J_total[it, a] = -np.sum(w_block * tr)
@@ -290,7 +296,8 @@ def _propagate_block(
     if progress_cb is not None and pending_steps:
         progress_cb(Kb * pending_steps)
 
-    return J_total, J_intra, J_dc
+    pops_arr = np.stack(pops, axis=0) if pops else None   # (n_frames, Kb, nb) or None
+    return J_total, J_intra, J_dc, pops_arr
 
 
 def _relax_half_(rt: ComplexArray, f_inst: FloatArray, dpop_half, dcoh_half, diag) -> None:
@@ -329,7 +336,7 @@ def _tddm_block_worker(payload: tuple):
     from qxti.analytics.theory_response import _resolve_distribution
 
     (source_file, function_name, params, nb, kblock, wblock, A_t, dt, dim, dk_vel,
-     dist_name, mu, temp, gpop, gcoh) = payload
+     dist_name, mu, temp, gpop, gcoh, pop_stride) = payload
 
     spec = importlib.util.spec_from_file_location("_tddm_model", source_file)
     mod = importlib.util.module_from_spec(spec)
@@ -362,7 +369,8 @@ def _tddm_block_worker(payload: tuple):
         progress_cb = None
 
     return _propagate_block(Hf, kblock, wblock, A_t, dt, dim, dk_vel,
-                            dist, mu, temp, gpop, gcoh, progress_cb=progress_cb)
+                            dist, mu, temp, gpop, gcoh, progress_cb=progress_cb,
+                            pop_stride=pop_stride)
 
 
 # ---------------------------------------------------------------------------
@@ -381,8 +389,13 @@ def _tddm_current_time(
     reserve_gb: float,
     progress: bool,
     progress_label: str = "tddm",
-) -> tuple[FloatArray, FloatArray]:
-    """Return ``(J_total (Nt,3), J_intra (Nt,3))`` from the non-perturbative solve.
+    pop_stride: int = 0,
+) -> tuple:
+    """Return ``(J_total (Nt,3), J_intra (Nt,3), populations)`` from the solve.
+
+    ``populations`` is ``None`` unless ``pop_stride > 0``, in which case it is the
+    band occupations ``n(k, t)`` sampled every ``pop_stride`` grid times, shape
+    ``(n_frames, nk, nb)`` (per-k, NOT summed) — the density-matrix diagonal.
 
     Streams over contiguous k-blocks (no halo — the velocity gauge has no k
     coupling), running blocks concurrently on a ThreadPool while keeping
@@ -439,17 +452,22 @@ def _tddm_current_time(
     J_intra = np.zeros((Nt, 3), dtype=np.float64)
     J_dc = np.zeros(3, dtype=np.float64)
 
+    pop_blocks: list = []          # per-block populations, in block (k) order
+
     def _run(block, progress_cb=None):
         lo, hi = block
         return _propagate_block(
             Hf, k_points[lo:hi], weights[lo:hi], A_t, dt, dim, dk_vel,
-            distribution, mu, temperature, gamma_pop, gamma_coh, progress_cb=progress_cb)
+            distribution, mu, temperature, gamma_pop, gamma_coh,
+            progress_cb=progress_cb, pop_stride=pop_stride)
 
     def _accumulate(res):
-        jt, ji, jdc = res
+        jt, ji, jdc, pops = res
         J_total[...] += jt
         J_intra[...] += ji
         J_dc[...] += jdc
+        if pops is not None:
+            pop_blocks.append(pops)
 
     def _drain(futures, get_done):
         """Poll ``get_done()`` while ``futures`` run, refreshing the ETA line."""
@@ -470,7 +488,8 @@ def _tddm_current_time(
         hparams = dict(getattr(hamiltonian, "params", {}) or {})
         payloads = [
             (source_file, function_name, hparams, nb, k_points[lo:hi], weights[lo:hi],
-             A_t, dt, dim, dk_vel, ccfg.distribution, mu, temperature, gamma_pop, gamma_coh)
+             A_t, dt, dim, dk_vel, ccfg.distribution, mu, temperature, gamma_pop, gamma_coh,
+             pop_stride)
             for (lo, hi) in blocks
         ]
         try:
@@ -529,7 +548,8 @@ def _tddm_current_time(
 
     # subtract the equilibrium (DC) current from every time sample
     J_total -= J_dc[None, :]
-    return J_total, J_intra
+    populations = np.concatenate(pop_blocks, axis=1) if pop_blocks else None  # (n_frames, nk, nb)
+    return J_total, J_intra, populations
 
 
 # ---------------------------------------------------------------------------
@@ -579,6 +599,7 @@ def compute_hhg_spectrum_tddm(
     progress: bool = True,
     extra_k_weight_mask: FloatArray | None = None,
     field_scale: float = 1.0,
+    pop_stride: int = 0,
 ) -> dict[str, Any]:
     """Full non-perturbative HHG current spectrum J(ω) (velocity gauge).
 
@@ -617,9 +638,9 @@ def compute_hhg_spectrum_tddm(
         config, hamiltonian=hamiltonian, kgrid=kgrid, extra_k_weight_mask=extra_k_weight_mask)
     n_workers, reserve_gb = _mesh_parallel_settings(config)
 
-    J_total3, J_intra3 = _tddm_current_time(
+    J_total3, J_intra3, populations = _tddm_current_time(
         hamiltonian, kgrid, weights, A_t, dt, dim, ccfg,
-        n_workers=n_workers, reserve_gb=reserve_gb, progress=progress)
+        n_workers=n_workers, reserve_gb=reserve_gb, progress=progress, pop_stride=pop_stride)
 
     current_time = np.zeros((Nt, 3), dtype=np.float64)
     current_time[:, :dim] = J_total3[:, :dim]
@@ -636,7 +657,7 @@ def compute_hhg_spectrum_tddm(
         from qxti.utils.progress import format_duration
         print(f"[tddm] non-perturbative HHG current spectrum done "
               f"(elapsed {format_duration(runtime)}).", flush=True)
-    return {
+    result = {
         "omega_axis": freq,
         "J_total": current_spectrum[:, :dim],
         "J_order": {},
@@ -648,6 +669,18 @@ def compute_hhg_spectrum_tddm(
         "method": "tddm",
         "dataset": dataset,
     }
+    if populations is not None:
+        shp = tuple(int(kgrid.shape[a]) for a in range(3))
+        nfr, _, nbp = populations.shape
+        kmesh = np.asarray(kgrid.points(), dtype=np.float64).reshape(shp[0], shp[1], shp[2], 3)
+        result["populations"] = {
+            # n(kx, ky, band) at each sampled frame (non-perturbative, Houston basis)
+            "frames": populations.reshape(nfr, shp[0], shp[1], nbp),
+            "frame_times": t_axis[::max(1, pop_stride)][:nfr],
+            "kx_grid": kmesh[:, :, 0, 0], "ky_grid": kmesh[:, :, 0, 1],
+            "stride": int(pop_stride),
+        }
+    return result
 
 
 # ---------------------------------------------------------------------------

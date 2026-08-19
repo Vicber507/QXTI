@@ -704,6 +704,18 @@ class QXTISimulation:
         if method == "pfddm":
             return self._generate_hhg_theory(hamiltonian)[0]
         if method == "ptddm":
+            # The per-k CMD and the vectorized mesh do the SAME length-gauge
+            # time-domain perturbative recursion.  For MULTI-laser (mixing
+            # frequencies) route to the vectorized + STREAMED mesh path: identical
+            # physics, but fast AND memory-safe -- the per-k CMD is ~10^3x slower and
+            # materialises the full rho(k,t) (OOM at large nk, the reason multi-laser
+            # runs used to be impractical).  Single laser keeps the exact per-k CMD.
+            if self.build_laser_system().number_of_lasers() > 1:
+                self._emit_progress(
+                    "ptddm multi-laser -> vectorized + streamed time-domain recursion "
+                    "(same recursion as the per-k CMD, optimized for speed and memory)."
+                )
+                return self._generate_hhg_theory(hamiltonian)[0]
             return self._generate_cmd_simulation(hamiltonian)
         if method == "tddm":
             return self._generate_hhg_tddm(hamiltonian)[0]

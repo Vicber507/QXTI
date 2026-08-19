@@ -105,8 +105,8 @@ def test_tddm_independent_of_n_workers():
     E = np.array([ls.electric_field(x) for x in t]); A = _vector_potential_from_field(E, dt)
     W = build_k_integration_weights(cfg, hamiltonian=ham, kgrid=kg)
     dim = int(ham.dimension)
-    J1, _ = _tddm_current_time(ham, kg, W, A, dt, dim, cfg.cmd, n_workers=1, reserve_gb=1.0, progress=False)
-    J4, _ = _tddm_current_time(ham, kg, W, A, dt, dim, cfg.cmd, n_workers=4, reserve_gb=1.0, progress=False)
+    J1, _, _ = _tddm_current_time(ham, kg, W, A, dt, dim, cfg.cmd, n_workers=1, reserve_gb=1.0, progress=False)
+    J4, _, _ = _tddm_current_time(ham, kg, W, A, dt, dim, cfg.cmd, n_workers=4, reserve_gb=1.0, progress=False)
     # blocks are independent -> result must not depend on the worker count
     assert np.allclose(J1, J4, rtol=1e-10, atol=1e-14)
 
@@ -170,7 +170,7 @@ def test_tddm_matches_perturbative_pulsed_weakfield():
                                 T_au=float(cfg.cmd.temperature), dimension=dim, distribution=dist)
     td = time_domain_currents(band, W, E[:, :3], dt, 3, gamma=g, gamma_pop=g)
     Jp = sum(td["J_t"][s][:, :dim].real for s in (1, 2, 3))
-    Jf, _ = _tddm_current_time(ham, kg, W, A, dt, dim, cfg.cmd, n_workers=0, reserve_gb=1.0, progress=False)
+    Jf, _, _ = _tddm_current_time(ham, kg, W, A, dt, dim, cfg.cmd, n_workers=0, reserve_gb=1.0, progress=False)
     Jf = Jf[:, :dim]
     w0 = float(cfg.laser.omega)
     win = np.hanning(Nt)[:, None]

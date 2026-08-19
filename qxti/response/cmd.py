@@ -360,6 +360,58 @@ class CMD:
 
         return self.solve_time_domain_in_memory()
 
+    def solve_currents_streaming(self, integration_weights, *, scratch_dir=None):
+        """Per-order macroscopic currents J^(s)(t) / P^(s)(t) WITHOUT ever holding
+        the full ``(Nk, Nt, Nb, Nb)`` density matrix in RAM.
+
+        This is the pfddm/tddm-style *streaming* path for ptddm: ρ^(s)(k, t) is solved
+        k-by-k and its observable traces
+        ``J^(s)_i(t) = Σ_k w_k Tr[v_i ρ^(s)(k,t)]`` (plus P and the intra/inter split)
+        are accumulated on the fly.  Intermediate orders go to DISK scratch (they feed
+        the next order's source term) and are reclaimed order-by-order; the last order
+        is pure-streamed (never stored).  So RAM stays bounded by a few
+        ``(Nt, Nb, Nb)`` arrays instead of ``Nk·Nt·Nb²`` — the in-memory path needs
+        e.g. ~3 TB of RAM at 140³, this needs a few GB (the intermediate ρ lives on
+        disk instead).  The numbers are IDENTICAL to tracing the stored ρ (same
+        arithmetic; verified in ``tests/test_parallel_saturation.py``).
+
+        ``integration_weights``: BZ weights ``(Nk,)`` — the same you would use to
+        trace the current from a stored ρ.  Returns a
+        :class:`~qxti.data.StreamingCurrentAccumulator`; query it with
+        ``current_time(order)`` / ``current_intra_time`` / ``current_inter_time`` /
+        ``polarization_time`` (all ``(Nt, 3)`` real arrays).
+        """
+        from qxti.data import StreamingCurrentAccumulator  # noqa: PLC0415
+        import tempfile  # noqa: PLC0415
+
+        dim = int(self.hamiltonian.dimension)
+        directions = ("x", "y", "z")[:max(1, min(3, dim))]
+        acc = StreamingCurrentAccumulator(
+            nt=int(self.timegrid.Nt),
+            integration_weights=np.asarray(integration_weights, dtype=np.float64),
+            current_operators={d: self.band_gauge_frame.current(d) for d in directions},
+            dipole_operators={d: self.band_gauge_frame.connection(d) for d in directions},
+            active_dimension=dim,
+        )
+        callbacks: dict[int, object] = {0: acc.make_equilibrium_callback(0)}
+        for s in range(1, self.max_order + 1):
+            callbacks[s] = acc.make_callback(s)
+
+        _tmp = None
+        if scratch_dir is None:
+            _tmp = tempfile.TemporaryDirectory(prefix="qxti_cmd_stream_")
+            scratch_dir = _tmp.name
+        try:
+            self.solve_time_domain(
+                scratch_dir,
+                order_observe_callbacks=callbacks,
+                reclaim_intermediate_orders=True,
+            )
+        finally:
+            if _tmp is not None:
+                _tmp.cleanup()
+        return acc
+
     def solve_frequency_domain(self) -> dict[int, ComplexArray]:
         """FFT-transform the time-domain density matrices along the time axis."""
 
