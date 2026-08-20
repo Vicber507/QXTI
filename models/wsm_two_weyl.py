@@ -14,7 +14,8 @@ con autovalores E_pm(k) = B0(k) +/- sqrt(B1^2 + B2^2 + B3^2).
 
 Coeficientes (kw es la posicion del nodo de Weyl):
     B0 = gamma [cos(2 a0 kx) - cos(a0 kw)] [cos(a2 kz) - cos(a0 kw)]
-    B1 = -{ M0 [1 - cos(a2 kz) - cos(a1 ky)] + 2 tx [cos(a0 kx) - cos(a0 kw)] }
+    B1 = -{ M0 [1 - cos^2(a2 kz) - cos(a1 ky)] + 2 tx [cos(a0 kx) - cos(a0 kw)] }
+         (nota: 1 - cos^2(a2 kz) = sin^2(a2 kz))
     B2 = -2 ty sin(a1 ky)
     B3 = -2 tz cos(a2 kz)
 
@@ -153,7 +154,7 @@ def _b_components(kx: float, ky: float, kz: float, params: dict[str, object]) ->
     cos_shift_z = np.cos(a2 * kz) - cos_k0
 
     b0 = gamma * cos_shift_2x * cos_shift_z
-    b1 = -(M0 * (1.0 - np.cos(a2 * kz)**2 - np.cos(a1 * ky)) + 2.0 * tx * cos_shift_x)
+    b1 = -(M0 * (1.0 - np.cos(a2 * kz) ** 2 - np.cos(a1 * ky)) + 2.0 * tx * cos_shift_x)
     b2 = -2.0 * ty * np.sin(a1 * ky)
     b3 = -2.0 * tz * np.cos(a2 * kz)
     return np.array([b0, b1, b2, b3], dtype=float)
@@ -216,7 +217,7 @@ def H_batch(kpts, params=None):
     cos_shift_z = np.cos(a2 * kz) - cos_k0
 
     b0 = gamma * cos_shift_2x * cos_shift_z
-    b1 = -(M0 * (1.0 - np.cos(a2 * kz) - np.cos(a1 * ky)) + 2.0 * tx * cos_shift_x)
+    b1 = -(M0 * (1.0 - np.cos(a2 * kz) ** 2 - np.cos(a1 * ky)) + 2.0 * tx * cos_shift_x)
     b2 = -2.0 * ty * np.sin(a1 * ky)
     b3 = -2.0 * tz * np.cos(a2 * kz)
 
@@ -268,7 +269,7 @@ def current_matrices(kx: float, ky: float, kz: float, params: dict[str, object] 
     yder[2] = -2.0 * a1 * ty * np.cos(a1 * float(ky))
 
     zder[0] = -a2 * gamma * cos_shift_2x * np.sin(a2 * float(kz))
-    zder[1] = -a2 * M0 * np.sin(a2 * float(kz))
+    zder[1] = -a2 * M0 * np.sin(2.0 * a2 * float(kz))   # d/dkz[-M0(1 - cos^2(a2 kz))] = -a2 M0 sin(2 a2 kz)
     zder[3] = 2.0 * a2 * tz * np.sin(a2 * float(kz))
 
     def _assemble(d: np.ndarray) -> np.ndarray:
