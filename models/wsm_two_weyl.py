@@ -153,7 +153,7 @@ def _b_components(kx: float, ky: float, kz: float, params: dict[str, object]) ->
     cos_shift_z = np.cos(a2 * kz) - cos_k0
 
     b0 = gamma * cos_shift_2x * cos_shift_z
-    b1 = -(M0 * (1.0 - np.cos(a2 * kz) - np.cos(a1 * ky)) + 2.0 * tx * cos_shift_x)
+    b1 = -(M0 * (1.0 - np.cos(a2 * kz)**2 - np.cos(a1 * ky)) + 2.0 * tx * cos_shift_x)
     b2 = -2.0 * ty * np.sin(a1 * ky)
     b3 = -2.0 * tz * np.cos(a2 * kz)
     return np.array([b0, b1, b2, b3], dtype=float)
