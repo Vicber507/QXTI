@@ -10,6 +10,7 @@ import os
 import pytest
 
 from qxti.utils import parallel
+from qxti.response.cmd import _contiguous_chunks
 
 
 _ENV_KEYS = (
@@ -109,3 +110,11 @@ def test_parallel_plan_mentions_source(monkeypatch):
     monkeypatch.setenv("SLURM_CPUS_PER_TASK", "64")
     plan = parallel.parallel_plan()
     assert "64" in plan and "SLURM" in plan
+
+
+def test_cmd_chunks_remain_valid_when_workers_exceed_remaining_points():
+    chunks = _contiguous_chunks(start=1, stop=9, n_workers=168)
+
+    assert chunks == [(index, index + 1) for index in range(1, 9)]
+    assert all(lo < hi for lo, hi in chunks)
+    assert [index for lo, hi in chunks for index in range(lo, hi)] == list(range(1, 9))

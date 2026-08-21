@@ -61,8 +61,14 @@ DEFAULT_LATTICE = {
         # Vectores primitivos de Bravais en a.u.
         # a1 = sqrt(3)*a0 * x_hat
         # a2 = sqrt(3)/2*a0 * x_hat + 3/2*a0 * y_hat
-        "a1": [ 8.0508, 0.0    ],
-        "a2": [ 4.0254, 6.9719 ],
+        # Keep these expressions exact. Rounded decimal vectors change the
+        # Cartesian-to-reduced k conversion and create a spurious cross-code
+        # band error even though H(k) itself is correct.
+        "a1": [np.sqrt(3.0) * DEFAULT_PARAMS["a0"], 0.0],
+        "a2": [
+            np.sqrt(3.0) * DEFAULT_PARAMS["a0"] / 2.0,
+            1.5 * DEFAULT_PARAMS["a0"],
+        ],
     },
     "BZorigin": [0.0, 0.0, 0.0],
     "BZaxis": [

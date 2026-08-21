@@ -30,11 +30,18 @@ test = [
     "matplotlib>=3.8",
     "pytest>=8.0",
 ]
+validation = [
+    "matplotlib>=3.8",
+    "pytest>=8.0",
+    "pythtb>=2.0,<3",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "external_validation: compares QXTI against an independent external package",
+    "scientific_validation: runs paper-grade benchmarks against independent references",
 ]
 
 [tool.setuptools.packages.find]

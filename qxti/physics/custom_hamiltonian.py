@@ -103,12 +103,9 @@ class CustomHamiltonian(Hamiltonian):
     def default_lattice(self) -> dict[str, Any]:
         """Return default lattice information declared by the external model file."""
 
-        lattice = getattr(self._module, "DEFAULT_LATTICE", None)
-        if lattice is not None:
-            if not isinstance(lattice, dict):
-                raise TypeError("DEFAULT_LATTICE in the external model must be a dict.")
-            return deepcopy(lattice)
-
+        # Prefer a callable provider because it can derive the lattice from the
+        # resolved input parameters (for example an anisotropic a2 or a TBLG
+        # twist angle). A static DEFAULT_LATTICE remains the fallback.
         provider = getattr(self._module, "default_lattice", None)
         if callable(provider):
             signature = inspect.signature(provider)
@@ -123,6 +120,12 @@ class CustomHamiltonian(Hamiltonian):
             lattice = provider(dict(self.params)) if supports_params else provider()
             if not isinstance(lattice, dict):
                 raise TypeError("default_lattice() in the external model must return a dict.")
+            return deepcopy(lattice)
+
+        lattice = getattr(self._module, "DEFAULT_LATTICE", None)
+        if lattice is not None:
+            if not isinstance(lattice, dict):
+                raise TypeError("DEFAULT_LATTICE in the external model must be a dict.")
             return deepcopy(lattice)
 
         return {}
