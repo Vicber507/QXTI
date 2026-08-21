@@ -300,7 +300,7 @@ def test_total_electric_field_matches_sum_of_lasers() -> None:
     system = LaserSystem([laser_x, laser_y])
     t = np.linspace(-2.0, 2.0, 200)
 
-    expected = laser_x.electric_field(t) + laser_y.electric_field(t) - system.initial_evec
+    expected = laser_x.electric_field(t) + laser_y.electric_field(t)
     total = system.electric_field(t)
 
     assert total.shape == (200, 3)
@@ -313,7 +313,7 @@ def test_total_vector_potential_matches_sum_of_lasers() -> None:
     system = LaserSystem([laser_x, laser_y])
     t = np.linspace(-2.0, 2.0, 200)
 
-    expected = laser_x.vector_potential(t) + laser_y.vector_potential(t) - system.initial_avec
+    expected = laser_x.vector_potential(t) + laser_y.vector_potential(t)
     total = system.vector_potential(t)
 
     assert total.shape == (200, 3)
@@ -357,11 +357,34 @@ def test_laser_system_temporal_bounds_cover_all_pulses() -> None:
     assert np.isclose(t_max, 10.0)
 
 
-def test_system_subtracts_initial_offsets_at_atmin() -> None:
-    system = LaserSystem([build_laser_x(), build_laser_y()], blaser=1.5, alaser=0.5)
+def test_system_does_not_inject_offset() -> None:
+    """Regression: LaserSystem returns the PURE analytic sum of the pulses — it no longer
+    subtracts E(atmin)/A(atmin).  The old subtraction forced the field to exactly zero at
+    the window edge but INJECTED a spurious DC (~1e-5 of the peak) → spurious even
+    harmonics (pfddm) and a DC ramp when integrated (tddm)."""
+    lx, ly = build_laser_x(), build_laser_y()
+    system = LaserSystem([lx, ly], blaser=1.5, alaser=0.5)
+    t = np.linspace(system.atmin, system.atmax, 1000)
 
-    assert np.allclose(system.electric_field(system.atmin), np.zeros(3), atol=1.0e-12)
-    assert np.allclose(system.vector_potential(system.atmin), np.zeros(3), atol=1.0e-12)
+    # no constant subtracted anywhere: system field/A == raw per-pulse sum, exactly
+    assert np.allclose(system.electric_field(t), lx.electric_field(t) + ly.electric_field(t))
+    assert np.allclose(system.vector_potential(t), lx.vector_potential(t) + ly.vector_potential(t))
+
+    # the window edge is NO LONGER forced to exactly zero: it keeps the natural raw value
+    edge_sys = system.electric_field(system.atmin)
+    edge_raw = lx.electric_field(system.atmin) + ly.electric_field(system.atmin)
+    assert np.allclose(edge_sys, edge_raw)
+
+
+def test_realistic_gaussian_pulse_has_no_injected_dc() -> None:
+    """A well-resolved Gaussian pulse has ~zero DC; the LaserSystem must not add one back
+    (the removed E(atmin)-subtraction used to inject ~1.5e-5 of the peak)."""
+    laser = Laser(omega=1.0, E0=1.0, ellip=0.0, ncycles=cycles_for_fwhm(1.0, 8.0), envname="gauss")
+    system = LaserSystem([laser])
+    t = np.linspace(*system.temporal_bounds(), 40001)
+    E = system.electric_field(t)
+    peak = np.abs(E).max()
+    assert np.abs(E.mean(axis=0)).max() < 1e-6 * peak, "electric field carries a spurious DC"
 
 
 def test_scalar_time_is_supported() -> None:

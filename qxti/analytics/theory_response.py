@@ -574,7 +574,11 @@ def compute_hhg_spectrum(
         spec = np.fft.fft(E_t[:, d])
         spec_a = np.zeros_like(spec)
         spec_a[pos] = 2.0 * spec[pos]
-        spec_a[np.abs(freq) < 1e-30] = spec[np.abs(freq) < 1e-30]
+        # DROP the DC bin: the pulse envelope is the modulation of the CARRIER only.
+        # Keeping DC would make |analytic| = A(t) + E_dc·cos(φ) — a ripple at the
+        # carrier frequency — which beats against exp(-i s ω0 t) in the reconstruction
+        # and injects SPURIOUS even harmonics (2ω0, 4ω0, ...).  See docs/INTEGRATORS.md.
+        spec_a[np.abs(freq) < 1e-30] = 0.0
         analytic[:, d] = np.fft.ifft(spec_a)
     env_t = np.abs(analytic).max(axis=1)
     env_peak = float(env_t.max()) if env_t.max() > 0 else 1.0
