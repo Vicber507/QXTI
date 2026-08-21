@@ -199,32 +199,6 @@ of all pulses (`laser_system.temporal_bounds()`: first onset → last end, plus 
 configured pre/post offsets), so two pulses with a temporal offset are integrated
 over their full span.
 
-### `pfddm_pulse` — realistic single-pulse response on demand
-
-For a **single** pulse the fast closed form does **not** solve the pulse: it takes the
-CW harmonic amplitude `χ⁽ˢ⁾(sω₀)` and simply **dresses it with the envelope**,
-`J⁽ˢ⁾(t) = χ⁽ˢ⁾ · env(t)ˢ · e^{−isω₀t}`.  This is the **quasi-CW / adiabatic
-approximation**: it places harmonic `s` exactly at `sω₀`, broadened only by `envˢ`.
-It is exact for **many-cycle** pulses but misses the true harmonic **bandwidth**,
-**spectral shift/chirp**, and **few-cycle** effects — and it is what depends on the
-Hilbert-envelope reconstruction.
-
-The input flag **`[cmd] pfddm_pulse`** chooses the single-pulse treatment:
-
-| value | meaning |
-|---|---|
-| `envelope` *(default)* | fast closed-form `χ⁽ˢ⁾(sω₀) × envˢ` — quasi-CW, exact for many-cycle pulses |
-| `full_field` | route the single pulse through the **same full-field `time_domain_currents` recursion** used for multi-colour drives → the **realistic pulsed response** (true harmonic bandwidth, chirp, few-cycle; immune to the envelope reconstruction) |
-
-Multi-colour drives (>1 laser) **always** use the full-field path regardless of the
-flag.  A single pulse run with `full_field` is reported with
-`method = "pfddm-full-field"` (so it is not mistaken for a genuine multi-colour run);
-it reproduces the closed-form peaks in the many-cycle limit and agrees with the
-`envelope` result on the gauge-invariant linear response H1 (validated in
-`tests/test_pfddm_pulse.py`).  The cost is that of the time-domain solve (`Nt` steps,
-`(nk,nb,nb,Nt)` per-order frequency tensors), so `envelope` stays the default for
-speed and `full_field` is opt-in for when pulse realism matters.
-
 **Validation** (`tools/study_time_domain_engine.py` →
 `outputs/time_domain_engine_study.png`):
 

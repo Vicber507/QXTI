@@ -267,25 +267,6 @@ def _canonical_tddm_propagator(value: str | None, *, default: str = "cfm2") -> s
     return canonical
 
 
-# pfddm single-pulse treatment (see qxti/analytics/theory_response.py).
-_PFDDM_PULSE_ALIASES = {
-    "envelope": "envelope", "env": "envelope", "adiabatic": "envelope", "cw": "envelope",
-    "full_field": "full_field", "full": "full_field", "fullfield": "full_field",
-    "full-field": "full_field", "exact": "full_field", "pulsed": "full_field",
-}
-
-
-def _canonical_pfddm_pulse(value: str | None, *, default: str = "envelope") -> str:
-    """Map a pfddm single-pulse mode (incl. aliases) to envelope | full_field."""
-    s = (str(value).strip().lower() if value is not None else "") or default
-    canonical = _PFDDM_PULSE_ALIASES.get(s)
-    if canonical is None:
-        raise ValueError(
-            f"Unsupported pfddm_pulse '{value}'. Choose from envelope | full_field."
-        )
-    return canonical
-
-
 @dataclass(slots=True)
 class CMDConfig:
     enabled: bool = False
@@ -340,14 +321,6 @@ class CMDConfig:
     # "rkf45" = Runge–Kutta–Fehlberg 4(5), fixed step on the grid; "ab2" = 2-step
     # Adams–Bashforth.  Only cfm2 preserves unitarity/positivity.  See docs/INTEGRATORS.md.
     tddm_propagator: str = "cfm2"
-    # How the frequency-domain perturbative engine (pfddm) treats a SINGLE pulse:
-    #   "envelope"   = fast closed-form χ⁽ˢ⁾(sω₀) dressed with envelope^s (quasi-CW /
-    #                  adiabatic; DEFAULT, exact for many-cycle pulses);
-    #   "full_field" = drive the SAME perturbative recursion with the full pulse field
-    #                  E(t) (the realistic pulsed response: true harmonic bandwidth,
-    #                  spectral shift/chirp, few-cycle effects; heavier).  Multi-color
-    #                  drives ALWAYS use full_field regardless.  See docs/MESH_RESPONSE.md.
-    pfddm_pulse: str = "envelope"
 
 
 @dataclass(slots=True)
@@ -891,7 +864,6 @@ class QXTIConfig:
             tddm_amplitude_ladder=tuple(_parse_float_list(section.get("tddm_amplitude_ladder", fallback=""))),
             gradient_stencil=section.getint("gradient_stencil", fallback=2),
             tddm_propagator=_canonical_tddm_propagator(section.get("tddm_propagator", fallback="cfm2")),
-            pfddm_pulse=_canonical_pfddm_pulse(section.get("pfddm_pulse", fallback="envelope")),
         )
 
     @staticmethod
