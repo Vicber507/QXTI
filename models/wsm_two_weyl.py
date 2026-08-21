@@ -110,6 +110,35 @@ DEFAULT_LATTICE = {
 }
 
 
+def default_lattice(params: dict[str, object] | None = None) -> dict[str, object]:
+    """Lattice metadata consistent with the resolved anisotropic parameters."""
+    resolved = _resolved_params(params)
+    a0 = float(resolved["a0"])
+    a1 = float(resolved["a1"])
+    a2 = float(resolved["a2"])
+    return {
+        "lattice_type": "3D simple orthorhombic (two-Weyl-node model)",
+        "lattice_constants": {
+            "a0": a0,
+            "a": a0,
+            "a1_length": a1,
+            "a2_length": a2,
+            "gamma_deg": 90.0,
+        },
+        "real_space_vectors": {
+            "a1": [a0, 0.0, 0.0],
+            "a2": [0.0, a1, 0.0],
+            "a3": [0.0, 0.0, a2],
+        },
+        "BZorigin": [0.0, 0.0, 0.0],
+        "BZaxis": [
+            [2.0 * np.pi / a0, 0.0, 0.0],
+            [0.0, 2.0 * np.pi / a1, 0.0],
+            [0.0, 0.0, 2.0 * np.pi / a2],
+        ],
+    }
+
+
 def default_params() -> dict[str, object]:
     """Devuelve una copia de los parametros por defecto."""
     return dict(DEFAULT_PARAMS)

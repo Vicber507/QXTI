@@ -37,6 +37,16 @@ _DEFAULT_WORKERS_CACHE: int | None = None
 _CMD_THREAD_MIN_NB = 16
 
 
+def _contiguous_chunks(start: int, stop: int, n_workers: int) -> list[tuple[int, int]]:
+    """Split ``[start, stop)`` into non-empty contiguous worker chunks."""
+    remaining = max(0, int(stop) - int(start))
+    if remaining == 0:
+        return []
+    workers = max(1, min(int(n_workers), remaining))
+    chunk_size = (remaining + workers - 1) // workers
+    return [(lo, min(lo + chunk_size, stop)) for lo in range(start, stop, chunk_size)]
+
+
 def _default_worker_count() -> int:
     """All usable logical cores (SLURM allocation / affinity aware).
 
@@ -1108,12 +1118,7 @@ class CMD:
         elif use_forkpool:
             import multiprocessing as _mp  # noqa: PLC0415
             global _CMD_FORK_STATE
-            chunk_size = max(1, (remaining_nk + n_workers - 1) // n_workers)
-            chunks = [
-                (remaining_k_start + i * chunk_size,
-                 min(remaining_k_start + (i + 1) * chunk_size, nk))
-                for i in range(min(n_workers, remaining_nk))
-            ]
+            chunks = _contiguous_chunks(remaining_k_start, nk, n_workers)
             _CMD_FORK_STATE = (self, previous_order_band, previous_order_mesh,
                                connection_cache, vectors_mesh, field_series,
                                target_times, nt)
@@ -1140,12 +1145,7 @@ class CMD:
                     pass
         elif n_workers > 1:
             # Distribute remaining k-points across workers in contiguous chunks.
-            chunk_size = max(1, (remaining_nk + n_workers - 1) // n_workers)
-            chunks = [
-                (remaining_k_start + i * chunk_size,
-                 min(remaining_k_start + (i + 1) * chunk_size, nk))
-                for i in range(min(n_workers, remaining_nk))
-            ]
+            chunks = _contiguous_chunks(remaining_k_start, nk, n_workers)
             with ThreadPoolExecutor(max_workers=n_workers) as executor:
                 list(executor.map(lambda ab: _solve_k_range(*ab), chunks))
             completed_solves += remaining_nk

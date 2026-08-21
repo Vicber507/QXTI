@@ -208,38 +208,42 @@ class KGridConvergenceTester:
         for name, value in observables.items():
             if not np.isfinite(value):
                 raise ValueError(f"Observable {name!r} is not finite: {value}")
-            
-kgrids = [
-    KGrid.uniform(dimension=3, num_points=4),
-    KGrid.uniform(dimension=3, num_points=6),
-    KGrid.uniform(dimension=3, num_points=8),
-    KGrid.uniform(dimension=3, num_points=10),
-    KGrid.uniform(dimension=3, num_points=12),
-]
+
+def _example() -> None:
+    """Illustrative convergence workflow; intentionally not run by pytest."""
+
+    kgrids = [
+        KGrid.uniform(dimension=3, num_points=4),
+        KGrid.uniform(dimension=3, num_points=6),
+        KGrid.uniform(dimension=3, num_points=8),
+        KGrid.uniform(dimension=3, num_points=10),
+        KGrid.uniform(dimension=3, num_points=12),
+    ]
+
+    def run_simulation_for_kgrid(kgrid: KGrid):
+        simulation = QXTISimulation(...)
+        simulation.kgrid = kgrid
+        return simulation.run()
+
+    def extract_observables(result) -> dict[str, float]:
+        return {
+            "energy": result.energy,
+            "gap": result.gap,
+            "main_observable": result.observable,
+        }
+
+    tester = KGridConvergenceTester(
+        runner=run_simulation_for_kgrid,
+        extractor=extract_observables,
+        relative_tolerance=1e-2,
+        absolute_tolerance=1e-6,
+        require_consecutive=2,
+    )
+
+    results = tester.run(kgrids)
+    tester.summary_table(results)
+    tester.recommended_kgrid(results)
 
 
-def run_simulation_for_kgrid(kgrid: KGrid):
-    simulation = QXTISimulation(...)
-    simulation.kgrid = kgrid
-    return simulation.run()
-
-
-def extract_observables(result) -> dict[str, float]:
-    return {
-        "energy": result.energy,
-        "gap": result.gap,
-        "main_observable": result.observable,
-    }
-
-
-tester = KGridConvergenceTester(
-    runner=run_simulation_for_kgrid,
-    extractor=extract_observables,
-    relative_tolerance=1e-2,
-    absolute_tolerance=1e-6,
-    require_consecutive=2,
-)
-
-results = tester.run(kgrids)
-table = tester.summary_table(results)
-recommended = tester.recommended_kgrid(results)
+if __name__ == "__main__":
+    _example()

@@ -163,6 +163,28 @@ def test_custom_hamiltonian_default_lattice_matches_external_model_defaults() ->
     assert np.isclose(defaults["lattice_constants"]["a0"], hamiltonian.params["a0"])
 
 
+def test_parameter_dependent_lattice_provider_takes_precedence() -> None:
+    hamiltonian = CustomHamiltonian(
+        source_file="wsm_two_weyl.py",
+        params={"a0": 6.0, "a1": 7.0, "a2": 12.0},
+    )
+
+    np.testing.assert_allclose(
+        hamiltonian.real_space_axis_lengths(),
+        np.array([6.0, 7.0, 12.0]),
+    )
+    np.testing.assert_allclose(
+        hamiltonian.reciprocal_box_bounds(),
+        np.array(
+            [
+                [-np.pi / 6.0, np.pi / 6.0],
+                [-np.pi / 7.0, np.pi / 7.0],
+                [-np.pi / 12.0, np.pi / 12.0],
+            ]
+        ),
+    )
+
+
 def test_custom_hamiltonian_uses_explicit_brillouin_zone_box_from_model() -> None:
     hamiltonian = build_surface_model()
     bounds = np.asarray(hamiltonian.reciprocal_box_bounds(), dtype=float)
