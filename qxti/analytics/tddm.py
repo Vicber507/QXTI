@@ -190,11 +190,12 @@ def analytic_vector_potential(laser_system, t_axis, field_scale: float = 1.0) ->
 
     ``A_i(t) = Σ_pulses avlaser_i(t)`` straight from the closed-form pulse formula
     (``Laser.vector_potential`` = the analytic ``avlaser_2d``).  There is **no time
-    integral** and **no constant offset**: it does NOT use ``A = −∫E dt`` (which would
-    turn the tiny ``initial_evec`` field offset into a spurious linear DC ramp) and it
-    does NOT subtract ``initial_avec`` (a constant) the way
-    ``LaserSystem.vector_potential`` does.  So nothing artificial contaminates the
-    velocity-gauge drive or the measured current.  See ``docs/INTEGRATORS.md``.
+    integral** and **no constant offset**: it does NOT build A via ``A = −∫E dt`` (a
+    trapezoid, only O(dt²) accurate and which would integrate any residual field DC
+    into a spurious linear ramp).  Equivalent to ``LaserSystem.vector_potential`` now
+    that the latter no longer subtracts a constant offset; kept explicit so the
+    velocity-gauge drive is unambiguously the pure analytic A.  See
+    ``docs/INTEGRATORS.md``.
     """
     ta = np.atleast_1d(np.asarray(t_axis, dtype=float))
     A = np.zeros((ta.shape[0], 3), dtype=np.float64)

@@ -22,8 +22,6 @@ class LaserSystem:
     major0: float = field(init=False, default=0.0)
     atmin: float = field(init=False, default=0.0)
     atmax: float = field(init=False, default=0.0)
-    initial_avec: FloatArray = field(init=False, repr=False, default_factory=lambda: np.zeros(3, dtype=float))
-    initial_evec: FloatArray = field(init=False, repr=False, default_factory=lambda: np.zeros(3, dtype=float))
 
     def __post_init__(self) -> None:
         self.blaser = float(self.blaser)
@@ -46,16 +44,25 @@ class LaserSystem:
         self._refresh_window()
 
     def electric_field(self, t: ArrayLike) -> FloatArray:
-        """Return the total electric field with the initial offset removed."""
+        """Return the total electric field: the PURE analytic sum of the pulses.
 
-        raw = self._sum_raw_vectors("electric_field", t)
-        return np.asarray(raw - self.initial_evec, dtype=float)
+        No constant offset is subtracted.  The analytic pulse already has ~zero DC
+        and ~zero net area; subtracting ``E(atmin)`` (as the reference code did to
+        force the field to start at exactly zero) does NOT clean anything — it shifts
+        the whole signal by a constant, i.e. it INJECTS a spurious DC offset (~1e-5 of
+        the peak, the value of the Gaussian tail at the window edge).  That DC beats
+        against the carrier and produces spurious even harmonics (pfddm envelope) and
+        a DC ramp when integrated (tddm).  See docs/INTEGRATORS.md.
+        """
+
+        return np.asarray(self._sum_raw_vectors("electric_field", t), dtype=float)
 
     def vector_potential(self, t: ArrayLike) -> FloatArray:
-        """Return the total vector potential with the initial offset removed."""
+        """Return the total vector potential: the PURE analytic sum of the pulses.
 
-        raw = self._sum_raw_vectors("vector_potential", t)
-        return np.asarray(raw - self.initial_avec, dtype=float)
+        No constant offset is subtracted (see :meth:`electric_field`)."""
+
+        return np.asarray(self._sum_raw_vectors("vector_potential", t), dtype=float)
 
     def get_electric_field(self, t: ArrayLike) -> FloatArray:
         """Backward-compatible alias for :meth:`electric_field`."""
@@ -90,8 +97,6 @@ class LaserSystem:
             self.major0 = 0.0
             self.atmin = 0.0
             self.atmax = 0.0
-            self.initial_avec = np.zeros(3, dtype=float)
-            self.initial_evec = np.zeros(3, dtype=float)
             return
 
         start_time = [laser.t0 - laser.twidth for laser in self.lasers]
@@ -100,14 +105,6 @@ class LaserSystem:
         self.major0 = float(max(end_time))
         self.atmin = self.minus0 - self.blaser
         self.atmax = self.major0 + self.alaser
-        self.initial_avec = np.asarray(
-            self._sum_raw_vectors("vector_potential", self.atmin),
-            dtype=float,
-        )
-        self.initial_evec = np.asarray(
-            self._sum_raw_vectors("electric_field", self.atmin),
-            dtype=float,
-        )
 
     def _sum_raw_vectors(self, method_name: str, t: ArrayLike) -> FloatArray:
         time = np.asarray(t, dtype=float)
