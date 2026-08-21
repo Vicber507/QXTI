@@ -46,6 +46,14 @@ import numpy as np
 from numpy.typing import NDArray
 
 from qxti.core.config import QXTIConfig
+from qxti.analytics.propagators import (
+    ab2_step,
+    apply_unitary,
+    rkf45_node_offsets,
+    rkf45_step,
+    unitary_from_hermitian,
+    vn_derivative,
+)
 from qxti.analytics.theory_response import (
     build_k_integration_weights,
     _model_h_batch,
@@ -178,10 +186,13 @@ def _velocity_batch(Hf: Callable, kA: FloatArray, dim: int, dk: float) -> list[C
 
 
 def _vector_potential_from_field(E_t: FloatArray, dt: float) -> FloatArray:
-    """A(t) = −∫_{t0}^t E dt' by cumulative trapezoid, with A(t0)=0.
+    """DEPRECATED — trapezoidal A(t) = −∫_{t0}^t E dt' (O(dt²) accurate), A(t0)=0.
 
-    Guarantees ``E = −dA/dt`` exactly (to the quadrature), so the velocity gauge is
-    consistent with the length-gauge E(t) the perturbative engines drive with.
+    The tddm engine NO LONGER uses this: it now drives with the ANALYTIC vector
+    potential ``laser_system.vector_potential(t)`` (consistent with E=−dA/dt after the
+    laser envelope-derivative fix, and with no quadrature error — required for the
+    high-order propagators).  Kept only for a few standalone tools that still import
+    it; do not use in new code.  See ``docs/INTEGRATORS.md``.
     """
     A_t = np.zeros_like(E_t)
     A_t[1:] = -np.cumsum(0.5 * (E_t[1:] + E_t[:-1]) * dt, axis=0)
@@ -206,6 +217,9 @@ def _propagate_block(
     gamma_coh: float,         # 1/T2 (0 => no dephasing)
     progress_cb: Callable[[int], None] | None = None,
     pop_stride: int = 0,      # >0 => record band populations n(k,t) every pop_stride steps
+    propagator: str = "cfm2", # "cfm2" (exp-midpoint, default) | "rkf45" | "ab2"
+    A_mid: FloatArray | None = None,     # (Nt,3) A(t+dt/2), analytic (cfm2 midpoint / relax basis)
+    A_stages: FloatArray | None = None,  # (Nt,6,3) A at RKF45 stage nodes (only for rkf45)
 ) -> tuple:
     """Integrate ρ_k(t) for one block of k-points and return the block's partial
     current contribution.
@@ -246,9 +260,15 @@ def _propagate_block(
 
     # A(t) at interval MIDPOINTS -> exponential-midpoint propagation (2nd order in
     # dt: evaluating H at t+dt/2 cancels the leading local error, important for the
-    # amplitude of the higher harmonics).
-    A_mid = A_t.copy()
-    A_mid[:-1] = 0.5 * (A_t[:-1] + A_t[1:])
+    # amplitude of the higher harmonics).  A_mid is passed in ANALYTIC (the exact
+    # vector potential at t+dt/2); the averaging below is a legacy fallback only.
+    if A_mid is None:
+        A_mid = A_t.copy()
+        A_mid[:-1] = 0.5 * (A_t[:-1] + A_t[1:])
+    prop = str(propagator).lower()
+    if prop == "rkf45" and A_stages is None:
+        raise ValueError("rkf45 propagator requires A_stages (A at the Fehlberg nodes).")
+    f_prev = None            # AB2 history: coherent RHS at the previous grid point
 
     # progress accounting: report work in k·time-step units (Kb per step) so the
     # caller can aggregate a global fraction across all blocks/workers.
@@ -273,19 +293,45 @@ def _propagate_block(
             vband = np.einsum("kin,kij,kjn->kn", Vmd, vA[a], Vm).real  # group velocity
             J_intra[it, a] = -np.sum(w_block * np.sum(vband * rho_diag, axis=1))
 
-        # ---- exp-midpoint step: propagate ρ over [t_it, t_it+dt] with H(t_it+dt/2),
-        #      Strang-split with the T1/T2 relaxation half-steps (all in the Vm basis) ----
-        rt = np.einsum("kin,kij,kjm->knm", Vmd, rho, Vm)   # ρ̃ = Vm† ρ Vm
+        # ---- coherent advance of ρ over [t_it, t_it+dt] with the selected propagator,
+        #      Strang-split with the T1/T2 relaxation half-steps (in the midpoint basis) ----
         if relax:
             f_inst = np.asarray(distribution(Em, mu, temperature), dtype=np.float64)
             if f_inst.ndim == 0:
                 f_inst = np.broadcast_to(f_inst, Em.shape).copy()
-            _relax_half_(rt, f_inst, dpop_half, dcoh_half, diag)
-        ph = np.exp(-1j * Em * dt)                         # exp(−i E_mid dt)
-        rt *= ph[:, :, None] * ph.conj()[:, None, :]
-        if relax:
-            _relax_half_(rt, f_inst, dpop_half, dcoh_half, diag)
-        rho = np.einsum("kin,knm,kjm->kij", Vm, rt, Vmd)   # back to orbital basis
+
+        if prop == "cfm2":
+            # 2nd-order commutator-free Magnus (exponential midpoint), in the Vm basis:
+            rt = np.einsum("kin,kij,kjm->knm", Vmd, rho, Vm)   # ρ̃ = Vm† ρ Vm
+            if relax:
+                _relax_half_(rt, f_inst, dpop_half, dcoh_half, diag)
+            ph = np.exp(-1j * Em * dt)                         # exp(−i E_mid dt)
+            rt *= ph[:, :, None] * ph.conj()[:, None, :]
+            if relax:
+                _relax_half_(rt, f_inst, dpop_half, dcoh_half, diag)
+            rho = np.einsum("kin,knm,kjm->kij", Vm, rt, Vmd)   # back to orbital basis
+        else:
+            # rkf45 / ab2: coherent step in the ORBITAL basis; relaxation is Strang-split
+            # around it (half-step, in the midpoint eigenbasis) to match cfm2's structure.
+            if relax:
+                rho = _relax_half_orbital(rho, Vm, Vmd, f_inst, dpop_half, dcoh_half, diag)
+            if prop == "rkf45":
+                H_st = np.stack(
+                    [np.asarray(Hf(kpts_block + A_stages[it, j][None, :]))
+                     for j in range(A_stages.shape[1])], axis=0)   # (6, Kb, nb, nb)
+                rho, _ = rkf45_step(rho, H_st, dt)
+            elif prop == "ab2":
+                Hg = np.asarray(Hf(kA))                           # H at the grid time t_it
+                f_now = vn_derivative(Hg, rho)                    # -i[H(t_it), ρ]
+                if f_prev is None:                                # bootstrap: one cfm2 step
+                    rho = apply_unitary(unitary_from_hermitian(np.asarray(Hf(kAm)), dt), rho)
+                else:
+                    rho = ab2_step(rho, f_now, f_prev, dt)
+                f_prev = f_now
+            else:
+                raise ValueError(f"Unknown tddm propagator '{propagator}'.")
+            if relax:
+                rho = _relax_half_orbital(rho, Vm, Vmd, f_inst, dpop_half, dcoh_half, diag)
 
         if progress_cb is not None:
             pending_steps += 1
@@ -312,6 +358,16 @@ def _relax_half_(rt: ComplexArray, f_inst: FloatArray, dpop_half, dcoh_half, dia
     rt[..., diag, diag] = new_d                           # ...then overwrite diagonal
 
 
+def _relax_half_orbital(rho, Vm, Vmd, f_inst, dpop_half, dcoh_half, diag):
+    """Return ρ after a T1/T2 relaxation half-step, transforming to the midpoint
+    eigenbasis and back (used by the rkf45/ab2 propagators, whose coherent step
+    lives in the orbital basis)."""
+    diag_idx = np.arange(rho.shape[-1])
+    rt = np.einsum("kin,kij,kjm->knm", Vmd, rho, Vm)
+    _relax_half_(rt, f_inst, dpop_half, dcoh_half, diag_idx)
+    return np.einsum("kin,knm,kjm->kij", Vm, rt, Vmd)
+
+
 def _h_is_vectorized(hamiltonian: Any) -> bool:
     """True if H can be evaluated for many k in one numpy call (H_batch or a
     verified auto-vectorized scalar H) -> a ThreadPool suffices.  False for
@@ -336,7 +392,7 @@ def _tddm_block_worker(payload: tuple):
     from qxti.analytics.theory_response import _resolve_distribution
 
     (source_file, function_name, params, nb, kblock, wblock, A_t, dt, dim, dk_vel,
-     dist_name, mu, temp, gpop, gcoh, pop_stride) = payload
+     dist_name, mu, temp, gpop, gcoh, pop_stride, propagator, A_mid, A_stages) = payload
 
     spec = importlib.util.spec_from_file_location("_tddm_model", source_file)
     mod = importlib.util.module_from_spec(spec)
@@ -370,7 +426,8 @@ def _tddm_block_worker(payload: tuple):
 
     return _propagate_block(Hf, kblock, wblock, A_t, dt, dim, dk_vel,
                             dist, mu, temp, gpop, gcoh, progress_cb=progress_cb,
-                            pop_stride=pop_stride)
+                            pop_stride=pop_stride, propagator=propagator,
+                            A_mid=A_mid, A_stages=A_stages)
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +447,9 @@ def _tddm_current_time(
     progress: bool,
     progress_label: str = "tddm",
     pop_stride: int = 0,
+    propagator: str = "cfm2",
+    A_mid: FloatArray | None = None,
+    A_stages: FloatArray | None = None,
 ) -> tuple:
     """Return ``(J_total (Nt,3), J_intra (Nt,3), populations)`` from the solve.
 
@@ -459,7 +519,8 @@ def _tddm_current_time(
         return _propagate_block(
             Hf, k_points[lo:hi], weights[lo:hi], A_t, dt, dim, dk_vel,
             distribution, mu, temperature, gamma_pop, gamma_coh,
-            progress_cb=progress_cb, pop_stride=pop_stride)
+            progress_cb=progress_cb, pop_stride=pop_stride,
+            propagator=propagator, A_mid=A_mid, A_stages=A_stages)
 
     def _accumulate(res):
         jt, ji, jdc, pops = res
@@ -489,7 +550,7 @@ def _tddm_current_time(
         payloads = [
             (source_file, function_name, hparams, nb, k_points[lo:hi], weights[lo:hi],
              A_t, dt, dim, dk_vel, ccfg.distribution, mu, temperature, gamma_pop, gamma_coh,
-             pop_stride)
+             pop_stride, propagator, A_mid, A_stages)
             for (lo, hi) in blocks
         ]
         try:
@@ -628,10 +689,25 @@ def compute_hhg_spectrum_tddm(
     E_t = np.array([laser_system.electric_field(t) for t in t_axis], dtype=np.float64)
     if field_scale != 1.0:
         E_t = E_t * field_scale
-    # Velocity-gauge vector potential = the EXACT integral of the SAME E(t) that the
-    # length-gauge perturbative engines use (A(t0)=0).  Using the laser's independent
-    # A(t) instead breaks E=−dA/dt at the ~% level (envelope) and the gauges disagree.
-    A_t = _vector_potential_from_field(E_t, dt)
+
+    # Velocity-gauge vector potential, ANALYTIC.  The laser now satisfies E = −dA/dt
+    # exactly (envelope-derivative fix), so the analytic A(t) is consistent with the
+    # SAME E(t) the length-gauge engines use — with NO O(dt²) trapezoidal-integration
+    # error.  We evaluate it at the grid times, the interval midpoints (cfm2), and the
+    # Fehlberg stage nodes (rkf45), which is what lets a high-order propagator reach
+    # its formal order (a numerically-integrated A would cap the scheme at 2nd order).
+    propagator = str(getattr(ccfg, "tddm_propagator", "cfm2")).lower()
+
+    def _A_at(times: FloatArray) -> FloatArray:
+        A = np.array([laser_system.vector_potential(float(t)) for t in times], dtype=np.float64)
+        return A * field_scale if field_scale != 1.0 else A
+
+    A_t = _A_at(t_axis)                                 # A at the grid times
+    A_mid = _A_at(t_axis + 0.5 * dt)                    # A at the interval midpoints
+    A_stages = None
+    if propagator == "rkf45":
+        C = rkf45_node_offsets()                        # 6 Fehlberg node offsets
+        A_stages = np.stack([_A_at(t_axis + float(c) * dt) for c in C], axis=1)  # (Nt,6,3)
     freq = np.fft.fftfreq(Nt, d=dt) * 2.0 * np.pi
 
     weights = build_k_integration_weights(
@@ -640,7 +716,8 @@ def compute_hhg_spectrum_tddm(
 
     J_total3, J_intra3, populations = _tddm_current_time(
         hamiltonian, kgrid, weights, A_t, dt, dim, ccfg,
-        n_workers=n_workers, reserve_gb=reserve_gb, progress=progress, pop_stride=pop_stride)
+        n_workers=n_workers, reserve_gb=reserve_gb, progress=progress, pop_stride=pop_stride,
+        propagator=propagator, A_mid=A_mid, A_stages=A_stages)
 
     current_time = np.zeros((Nt, 3), dtype=np.float64)
     current_time[:, :dim] = J_total3[:, :dim]

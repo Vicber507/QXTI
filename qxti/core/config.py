@@ -248,6 +248,25 @@ def _canonical_method(value: str | None, *, default: str = "ptddm") -> str:
     return _ENGINE_ALIASES.get(s, s)
 
 
+# tddm-engine time integrators (see qxti/analytics/propagators.py).
+_TDDM_PROPAGATOR_ALIASES = {
+    "cfm2": "cfm2", "magnus2": "cfm2", "exp_midpoint": "cfm2", "midpoint": "cfm2",
+    "rkf45": "rkf45", "rkf": "rkf45", "fehlberg": "rkf45", "rk45": "rkf45",
+    "ab2": "ab2", "adams_bashforth_2": "ab2", "adams-bashforth-2": "ab2",
+}
+
+
+def _canonical_tddm_propagator(value: str | None, *, default: str = "cfm2") -> str:
+    """Map a tddm-propagator name (incl. aliases) to cfm2 | rkf45 | ab2."""
+    s = (str(value).strip().lower() if value is not None else "") or default
+    canonical = _TDDM_PROPAGATOR_ALIASES.get(s)
+    if canonical is None:
+        raise ValueError(
+            f"Unsupported tddm_propagator '{value}'. Choose from cfm2 | rkf45 | ab2."
+        )
+    return canonical
+
+
 @dataclass(slots=True)
 class CMDConfig:
     enabled: bool = False
@@ -296,6 +315,12 @@ class CMDConfig:
     # order (error O(Δk⁴), ~1.5x/point but far less grid error, so a coarser mesh
     # reaches the same accuracy). Halo widens to 2·(max_order−1) when 4.
     gradient_stencil: int = 2
+    # Non-perturbative tddm engine time integrator (velocity-gauge von Neumann
+    # equation dρ/dt = −i[H(k+A(t)),ρ]).  "cfm2" = 2nd-order commutator-free Magnus /
+    # exponential-midpoint (unitary, structure-preserving, DEFAULT and recommended);
+    # "rkf45" = Runge–Kutta–Fehlberg 4(5), fixed step on the grid; "ab2" = 2-step
+    # Adams–Bashforth.  Only cfm2 preserves unitarity/positivity.  See docs/INTEGRATORS.md.
+    tddm_propagator: str = "cfm2"
 
 
 @dataclass(slots=True)
@@ -838,6 +863,7 @@ class QXTIConfig:
             reserve_gb=section.getfloat("reserve_gb", fallback=1.0),
             tddm_amplitude_ladder=tuple(_parse_float_list(section.get("tddm_amplitude_ladder", fallback=""))),
             gradient_stencil=section.getint("gradient_stencil", fallback=2),
+            tddm_propagator=_canonical_tddm_propagator(section.get("tddm_propagator", fallback="cfm2")),
         )
 
     @staticmethod

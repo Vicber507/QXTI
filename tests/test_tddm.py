@@ -191,3 +191,41 @@ def test_tddm_matches_perturbative_pulsed_weakfield():
     # pulsed current is not machine-ground-truth for the nonlinear regime -- which is
     # exactly the regime tddm exists for.
     assert 0.3 < r3 < 3.0, f"H3 tddm/pert = {r3:.3f} (order-of-magnitude sanity only)"
+
+
+def test_tddm_propagator_default_is_cfm2():
+    """The shipped default integrator is the unitary exponential-midpoint (cfm2)."""
+    assert QXTIConfig.from_file(CFG).cmd.tddm_propagator == "cfm2"
+
+
+def test_tddm_propagators_agree_and_are_selectable():
+    """cfm2 (default), rkf45 and ab2 integrate the SAME velocity-gauge von Neumann
+    equation, so on a resolved grid they must agree on the current; and each must be
+    selectable from the input file via [cmd] tddm_propagator."""
+    from qxti.analytics.tddm import compute_hhg_spectrum_tddm
+
+    base = _small_cfg(grid=6, dt=0.2, ncycles=2.0, order=2)
+    J = {}
+    for prop in ("cfm2", "rkf45", "ab2"):
+        cfg = R(base, cmd=R(base.cmd, tddm_propagator=prop))
+        res = compute_hhg_spectrum_tddm(cfg, progress=False)
+        Jt = np.asarray(res["dataset"]["current_time"])
+        assert np.isfinite(Jt).all(), f"{prop} produced non-finite current"
+        J[prop] = Jt
+
+    def rel_l2(a, b):
+        return float(np.linalg.norm(a - b) / (np.linalg.norm(b) + 1e-30))
+
+    # higher-order rkf45 tracks the unitary cfm2 closely; 2nd-order ab2 a bit looser
+    assert rel_l2(J["rkf45"], J["cfm2"]) < 0.10, "rkf45 disagrees with cfm2"
+    assert rel_l2(J["ab2"], J["cfm2"]) < 0.25, "ab2 disagrees with cfm2"
+
+
+def test_tddm_invalid_propagator_rejected():
+    """An unknown integrator name is rejected at config-parse time."""
+    from qxti.core.config import _canonical_tddm_propagator
+
+    assert _canonical_tddm_propagator("magnus2") == "cfm2"     # alias
+    assert _canonical_tddm_propagator("rk45") == "rkf45"       # alias
+    with pytest.raises(ValueError):
+        _canonical_tddm_propagator("euler_supreme")
