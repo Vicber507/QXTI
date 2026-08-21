@@ -552,12 +552,25 @@ def compute_hhg_spectrum(
     freq = np.fft.fftfreq(Nt, d=dt) * 2.0 * np.pi
 
     # Multi-laser / multi-frequency drive: the single-carrier harmonic peaks are
-    # ill-defined, so integrate the perturbative response in the TIME domain over
-    # the full multi-pulse field E(t).  Single laser keeps the fast closed form.
-    if int(laser_system.number_of_lasers()) > 1:
-        return _hhg_multilaser_result(
+    # ill-defined, so integrate the perturbative response over the FULL field E(t).
+    # A single laser normally keeps the fast closed form + envelope^s dressing
+    # (pfddm_pulse = "envelope", the quasi-CW / adiabatic approximation), but setting
+    # [cmd] pfddm_pulse = "full_field" routes it through the SAME full-field recursion
+    # used for multi-color drives -> the REALISTIC pulsed response (true harmonic
+    # bandwidth, spectral shift/chirp, few-cycle effects; no quasi-CW approximation
+    # and immune to the envelope/Hilbert reconstruction).  See docs/INTEGRATORS.md.
+    pfddm_pulse = str(getattr(ccfg, "pfddm_pulse", "envelope")).lower()
+    if int(laser_system.number_of_lasers()) > 1 or pfddm_pulse == "full_field":
+        res = _hhg_multilaser_result(
             config, hamiltonian, kgrid, dim, nk, max_order, gamma, mu, temperature,
             distribution, Nt, dt, t_axis, E_t, freq, progress, extra_k_weight_mask, t_start)
+        if int(laser_system.number_of_lasers()) == 1:
+            # single pulse via the full-field recursion (pfddm_pulse=full_field): relabel
+            # so it is not mistaken for a genuine multi-colour run.
+            res["method"] = "pfddm-full-field"
+            if isinstance(res.get("dataset"), dict):
+                res["dataset"]["engine"] = "pfddm-full-field"
+        return res
 
     # --- Order 1: from the SAME mesh recursion as orders >=2 (single, consistent
     #     path). J^(1) = sum_k w_k Tr[-v rho^(1)] is the FULL linear current --
