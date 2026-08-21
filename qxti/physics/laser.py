@@ -223,13 +223,19 @@ class Laser:
         phase = self._phase_argument(t)
         envelope = np.asarray(self.f_envelope(tau, is_dt=False), dtype=float)
         envelope_dt = np.asarray(self.f_envelope(tau, is_dt=True), dtype=float)
+        # E = -dA/dt exactly.  For A_x = -A0x*sin(phase)*f and A_y = +A0y*cos(phase)*f
+        # (see avlaser_2d), with A0 = E0/omega, the envelope-derivative term is
+        #   E_x = +E0x*cos*f + A0x*sin*f'   and   E_y = +E0y*sin*f - A0y*cos*f'.
+        # (Historic bug, shared with the reference laser.h: these f' signs were flipped,
+        #  which broke E = -dA/dt at the ~few-% level on the pulse flanks and left a
+        #  spurious int E dt != 0 -> DC vector-potential ramp -> even harmonics.)
         values = (
             self.E0x * np.cos(phase) * envelope
-            - self.A0x * np.sin(phase) * envelope_dt
+            + self.A0x * np.sin(phase) * envelope_dt
             + 1j
             * (
                 self.E0y * np.sin(phase) * envelope
-                + self.A0y * np.cos(phase) * envelope_dt
+                - self.A0y * np.cos(phase) * envelope_dt
             )
         )
         return self._scalar_or_array_complex(np.asarray(values, dtype=complex))
