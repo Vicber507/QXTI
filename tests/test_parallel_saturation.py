@@ -44,7 +44,6 @@ def _tddm_current(cfg, ham, kgrid, weights, dim, A_t, dt, n_workers):
 def test_tddm_result_independent_of_worker_count():
     """The physical current must not depend on how many workers/blocks are used."""
     from qxti.core import QXTIConfig, QXTISimulation
-    from qxti.analytics.tddm import _vector_potential_from_field
     from qxti.analytics.theory_response import build_k_integration_weights
 
     cfg = QXTIConfig.from_file("inputs/inputParams.haldane_topological.cfg")
@@ -57,9 +56,10 @@ def test_tddm_result_independent_of_worker_count():
 
     Nt, dt = 200, 0.08
     t = np.arange(Nt) * dt
-    E = np.zeros((Nt, 3))
-    E[:, 0] = 3.5e-4 * np.sin(0.09 * t) * np.exp(-((t - Nt * dt / 2) / (Nt * dt / 5)) ** 2)
-    A_t = _vector_potential_from_field(E, dt)
+    # synthetic smooth vector potential (worker-count invariance is field-independent;
+    # no laser and no integral needed here).
+    A_t = np.zeros((Nt, 3))
+    A_t[:, 0] = 3.5e-4 * np.sin(0.09 * t) * np.exp(-((t - Nt * dt / 2) / (Nt * dt / 5)) ** 2)
 
     J_serial = _tddm_current(cfg, ham, kgrid, weights, dim, A_t, dt, n_workers=1)
     J_par = _tddm_current(cfg, ham, kgrid, weights, dim, A_t, dt, n_workers=4)  # ProcessPool (nb=2)

@@ -185,18 +185,24 @@ def _velocity_batch(Hf: Callable, kA: FloatArray, dim: int, dk: float) -> list[C
     return vels
 
 
-def _vector_potential_from_field(E_t: FloatArray, dt: float) -> FloatArray:
-    """DEPRECATED — trapezoidal A(t) = −∫_{t0}^t E dt' (O(dt²) accurate), A(t0)=0.
+def analytic_vector_potential(laser_system, t_axis, field_scale: float = 1.0) -> FloatArray:
+    """Analytic velocity-gauge vector potential A(t), evaluated in closed form.
 
-    The tddm engine NO LONGER uses this: it now drives with the ANALYTIC vector
-    potential ``laser_system.vector_potential(t)`` (consistent with E=−dA/dt after the
-    laser envelope-derivative fix, and with no quadrature error — required for the
-    high-order propagators).  Kept only for a few standalone tools that still import
-    it; do not use in new code.  See ``docs/INTEGRATORS.md``.
+    ``A_i(t) = Σ_pulses avlaser_i(t)`` straight from the closed-form pulse formula
+    (``Laser.vector_potential`` = the analytic ``avlaser_2d``).  There is **no time
+    integral** and **no constant offset**: it does NOT use ``A = −∫E dt`` (which would
+    turn the tiny ``initial_evec`` field offset into a spurious linear DC ramp) and it
+    does NOT subtract ``initial_avec`` (a constant) the way
+    ``LaserSystem.vector_potential`` does.  So nothing artificial contaminates the
+    velocity-gauge drive or the measured current.  See ``docs/INTEGRATORS.md``.
     """
-    A_t = np.zeros_like(E_t)
-    A_t[1:] = -np.cumsum(0.5 * (E_t[1:] + E_t[:-1]) * dt, axis=0)
-    return A_t
+    ta = np.atleast_1d(np.asarray(t_axis, dtype=float))
+    A = np.zeros((ta.shape[0], 3), dtype=np.float64)
+    for laser in laser_system.lasers:                    # raw per-pulse closed-form A
+        A += np.asarray(laser.vector_potential(ta), dtype=np.float64).reshape(ta.shape[0], 3)
+    if field_scale != 1.0:
+        A = A * field_scale
+    return A
 
 
 # ---------------------------------------------------------------------------
@@ -690,17 +696,15 @@ def compute_hhg_spectrum_tddm(
     if field_scale != 1.0:
         E_t = E_t * field_scale
 
-    # Velocity-gauge vector potential, ANALYTIC.  The laser now satisfies E = −dA/dt
-    # exactly (envelope-derivative fix), so the analytic A(t) is consistent with the
-    # SAME E(t) the length-gauge engines use — with NO O(dt²) trapezoidal-integration
-    # error.  We evaluate it at the grid times, the interval midpoints (cfm2), and the
-    # Fehlberg stage nodes (rkf45), which is what lets a high-order propagator reach
+    # Velocity-gauge vector potential: the analytic closed-form laser A(t) — no time
+    # integral (no A=−∫E dt trapezoid → no spurious DC ramp) and no constant offset.
+    # Evaluated at the grid times, the interval midpoints (cfm2) and the Fehlberg stage
+    # nodes (rkf45); an exact analytic A is also what lets a high-order propagator reach
     # its formal order (a numerically-integrated A would cap the scheme at 2nd order).
     propagator = str(getattr(ccfg, "tddm_propagator", "cfm2")).lower()
 
     def _A_at(times: FloatArray) -> FloatArray:
-        A = np.array([laser_system.vector_potential(float(t)) for t in times], dtype=np.float64)
-        return A * field_scale if field_scale != 1.0 else A
+        return analytic_vector_potential(laser_system, times, field_scale)
 
     A_t = _A_at(t_axis)                                 # A at the grid times
     A_mid = _A_at(t_axis + 0.5 * dt)                    # A at the interval midpoints

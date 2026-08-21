@@ -30,7 +30,7 @@ Las **partes** de la ecuación, cada una con su tratamiento numérico:
 |---|---|---|---|
 | **coherente** (unitaria) | $-i[H(\mathbf k+\mathbf A(t)),\rho]$ | lineal, **rígida y oscilatoria** (frecuencia = gap de banda), preserva unitariedad | integrador exponencial (§3) |
 | **relajación** RTA | $\mathcal R = \tfrac1{T_1}(\rho_{\rm diag}-f)\ +\ \tfrac1{T_2}\rho_{\rm off}$ | disipativa, hacia las ocupaciones instantáneas $f_n(\mathbf k+\mathbf A)$ | **Strang split** (medio paso a cada lado del paso coherente) |
-| **campo** $\mathbf A(t)$ | $\mathbf A(t)=-\!\int^t \mathbf E\,dt'$ | no autónomo (depende de t) | **analítico** del láser (§2) |
+| **campo** $\mathbf A(t)$ | $\mathbf A(t)=\sum_{\text{pulsos}}\mathbf A_{\text{avlaser}}(t)$ | no autónomo (depende de t) | **analítico** del láser, sin integral ni constante (§2) |
 
 La relajación por defecto está **apagada** ($T_1=T_2=\infty$): el uso principal (HHG) es
 puramente coherente. Cuando está activa, el `_relax_half_` se aplica en la base propia
@@ -38,25 +38,41 @@ instantánea (Houston) del punto medio, con la misma estructura para todos los i
 
 ---
 
-## 2. El potencial vector `A(t)`: analítico, no integrado
+## 2. El potencial vector `A(t)`: analítico, sin integrales ni constantes
 
-El propagador solo "ve" `A(t)` (gauge de velocidad; el campo `E(t)` no entra en la dinámica,
-solo se reporta y normaliza el espectro). Por eso **la precisión de `A(t)` limita el orden de
-todo el esquema**.
+El propagador solo "ve" `A(t)` (gauge de velocidad; `E(t)` no entra en la dinámica, solo se
+reporta). Como **la medición depende únicamente de `A(t)`**, tiene que estar **limpio de todo
+artefacto numérico**. QXTI lo evalúa directamente de la **fórmula cerrada del pulso**, sumando
+sobre pulsos ([`analytic_vector_potential`](../qxti/analytics/tddm.py)):
 
-Históricamente `A(t)` se construía por **trapecio** `A=−∫E dt` (`_vector_potential_from_field`),
-que es **solo $O(\Delta t^2)$** — techo de 2º orden aunque el propagador fuese de orden mayor.
-Ahora que el láser cumple $E=-dA/dt$ **exacto** (fix del signo de la derivada de envolvente,
-ver `docs`/`qxti/physics/laser.py`), usamos la **A analítica** `laser_system.vector_potential(t)`,
-que:
+$$
+\mathbf A(t)=\sum_{\text{pulsos}}\mathbf A_{\text{avlaser}}(t),\qquad
+A_x=-A_{0x}\sin(\varphi)\,f(t),\quad A_y=+A_{0y}\cos(\varphi)\,f(t),\ \dots
+$$
 
-- es **consistente** con la misma `E(t)` de los motores perturbativos (sin discrepancia de gauge),
-- **no tiene error de cuadratura** → no capa el orden del propagador,
-- puede evaluarse en **cualquier instante** (puntos de malla, puntos medios, nodos de Gauss),
-  que es justo lo que un integrador de orden alto necesita.
+**Sin nada añadido:**
 
-> La función trapezoidal `_vector_potential_from_field` queda **deprecada** (solo la usan
-> algunas herramientas sueltas en `tools/`); el motor `tddm` ya no la usa.
+- **Sin integral temporal.** No se usa `A=−∫E dt` (trapecio). Esa cuadratura (i) es solo
+  $O(\Delta t^2)$ — techo de 2º orden aunque el propagador fuese de orden mayor — y (ii)
+  convertía la minúscula constante `initial_evec` (el valor del campo en el borde de la ventana,
+  ≈$10^{-8}$ a.u., restado para que $E$ arranque en cero) en una **rampa lineal DC espuria** en
+  $A$: valía ~0.35 % de $A_0$ al final de la ventana, arrastraba el mar de Fermi, dejaba una
+  corriente DC residual tras el pulso y su peso espectral de baja frecuencia caía **justo encima
+  de H2**. La función `_vector_potential_from_field` fue **borrada** del código (core, tools y
+  tests).
+- **Sin resta de constantes.** No se usa `LaserSystem.vector_potential` (que resta `initial_avec`).
+  La A analítica es un pulso genuino: **arranca y termina en ~0 por sí sola** (colas de la envolvente),
+  sin retoques.
+
+Verificación numérica (config `bi2se3_bicircular`): A analítica → `|A(inicio)|/A₀ = 8·10⁻¹⁰ %`,
+`|A(fin)|/A₀ = 2·10⁻⁵ %` (**sin rampa**), y `−dA/dt` coincide con la $E$ analítica a
+$10^{-4}$. La antigua A trapezoidal daba `|A(fin)|/A₀ = 0.35 %` (la rampa).
+
+> **Consistencia:** tras el fix de la derivada de envolvente del láser, $E=-dA/dt$ es exacto
+> ([`qxti/physics/laser.py`](../qxti/physics/laser.py)); la A analítica es entonces
+> coherente con la $E$ del láser hasta todos los órdenes en $\Delta t$, y puede evaluarse en
+> **cualquier instante** (malla, puntos medios, nodos de Gauss) — justo lo que un integrador de
+> orden alto necesita.
 
 ---
 

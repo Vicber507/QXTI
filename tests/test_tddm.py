@@ -56,7 +56,7 @@ def test_tddm_dataset_schema_and_split():
 def test_tddm_trace_and_hermiticity_conserved():
     """Tr ρ = N_occ and ρ stays Hermitian throughout the propagation (per k)."""
     from qxti.analytics.tddm import (_make_h_evaluator, _propagate_block,
-                                     _vector_potential_from_field)
+                                     analytic_vector_potential)
     from qxti.core.simulation import QXTISimulation
     from qxti.analytics.theory_response import _resolve_distribution
 
@@ -66,7 +66,7 @@ def test_tddm_trace_and_hermiticity_conserved():
     tg = sim.build_timegrid(ls)
     Nt = int(tg.Nt); dt = (float(tg.tf) - float(tg.t0)) / max(Nt - 1, 1)
     t = float(tg.t0) + np.arange(Nt) * dt
-    E = np.array([ls.electric_field(x) for x in t]); A = _vector_potential_from_field(E, dt)
+    E = np.array([ls.electric_field(x) for x in t]); A = analytic_vector_potential(ls, t)
     Hf = _make_h_evaluator(ham)
     kpts = np.asarray(kg.points())[:8]
     w = np.ones(kpts.shape[0])
@@ -93,7 +93,7 @@ def test_tddm_trace_and_hermiticity_conserved():
 
 
 def test_tddm_independent_of_n_workers():
-    from qxti.analytics.tddm import _tddm_current_time, _vector_potential_from_field
+    from qxti.analytics.tddm import _tddm_current_time, analytic_vector_potential
     from qxti.core.simulation import QXTISimulation
     from qxti.analytics.theory_response import build_k_integration_weights
     cfg = _small_cfg(grid=8, dt=0.5, ncycles=1.5)
@@ -102,7 +102,7 @@ def test_tddm_independent_of_n_workers():
     tg = sim.build_timegrid(ls)
     Nt = int(tg.Nt); dt = (float(tg.tf) - float(tg.t0)) / max(Nt - 1, 1)
     t = float(tg.t0) + np.arange(Nt) * dt
-    E = np.array([ls.electric_field(x) for x in t]); A = _vector_potential_from_field(E, dt)
+    E = np.array([ls.electric_field(x) for x in t]); A = analytic_vector_potential(ls, t)
     W = build_k_integration_weights(cfg, hamiltonian=ham, kgrid=kg)
     dim = int(ham.dimension)
     J1, _, _ = _tddm_current_time(ham, kg, W, A, dt, dim, cfg.cmd, n_workers=1, reserve_gb=1.0, progress=False)
@@ -142,7 +142,7 @@ def test_tddm_matches_perturbative_pulsed_weakfield():
     Both engines: PULSED, identical E(t)/grid/dt/FFT, A=−∫E, Hann-windowed (the H1
     peak is ~3 orders above H3; its leakage otherwise swamps the raw H3 bin).
     """
-    from qxti.analytics.tddm import _tddm_current_time, _vector_potential_from_field
+    from qxti.analytics.tddm import _tddm_current_time, analytic_vector_potential
     from qxti.core.simulation import QXTISimulation
     from qxti.analytics.theory_response import (build_k_integration_weights, _resolve_distribution)
     from qxti.analytics.mesh_response import precompute_band_data, time_domain_currents
@@ -159,7 +159,7 @@ def test_tddm_matches_perturbative_pulsed_weakfield():
     dim = int(ham.dimension); Nt = int(tg.Nt); dt = (float(tg.tf) - float(tg.t0)) / max(Nt - 1, 1)
     t = float(tg.t0) + np.arange(Nt) * dt
     E = np.array([ls.electric_field(x) for x in t]) * field_scale
-    A = _vector_potential_from_field(E, dt)
+    A = analytic_vector_potential(ls, t, field_scale)
     freq = np.fft.fftfreq(Nt, d=dt) * 2 * np.pi
     W = build_k_integration_weights(cfg, hamiltonian=ham, kgrid=kg)
     dist = _resolve_distribution(cfg.cmd.distribution)
