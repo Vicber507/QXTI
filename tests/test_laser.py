@@ -288,6 +288,56 @@ def test_field_and_vector_potential_have_expected_center_values() -> None:
     np.testing.assert_allclose(potential_center, laser.A0y * laser.ydir, atol=1.0e-12)
 
 
+def _gauge_consistency_laser() -> Laser:
+    """Short elliptical pulse with a CEP: exercises both in-plane field components
+    and a large envelope derivative on the flanks (where E = -dA/dt is easiest to
+    break)."""
+
+    return Laser(
+        omega=0.05,
+        E0=1.0e-3,
+        ellip=0.6,
+        ncycles=cycles_for_fwhm(0.05, 3.0 * (2.0 * np.pi / 0.05)),
+        cep=0.7,
+        envname="gauss",
+        t0=0.0,
+    )
+
+
+def test_electric_field_equals_minus_dA_dt() -> None:
+    """Regression: E(t) must equal -dA/dt (velocity- and length-gauge consistency).
+
+    The envelope-derivative (f') term in ``elaser_2d`` historically carried the
+    wrong sign (shared with the reference laser.h), breaking this at the ~few-%
+    level on the pulse flanks.  Compare the analytic E against a numerical -dA/dt.
+    """
+
+    laser = _gauge_consistency_laser()
+    t = np.linspace(-laser.twidth, laser.twidth, 200001)
+    dt = t[1] - t[0]
+
+    vector_potential = laser.vector_potential(t)
+    electric_field = laser.electric_field(t)
+    minus_dA_dt = -np.gradient(vector_potential, dt, axis=0)
+
+    scale = np.abs(electric_field).max()
+    relative_error = np.abs(minus_dA_dt - electric_field).max() / scale
+    assert relative_error < 1.0e-6, f"E != -dA/dt (rel. error {relative_error:.2e})"
+
+
+def test_pulse_has_zero_net_electric_field_area() -> None:
+    """A physical pulse satisfies int E dt = A(t0) - A(inf) = 0.  A non-zero area is
+    a spurious DC vector-potential ramp (the symptom of the flipped f' sign)."""
+
+    laser = _gauge_consistency_laser()
+    t = np.linspace(-laser.twidth, laser.twidth, 200001)
+    electric_field = laser.electric_field(t)
+
+    area = np.trapezoid(electric_field, t, axis=0)
+    peak = np.abs(electric_field).max() * (t[-1] - t[0])
+    assert np.all(np.abs(area) / peak < 1.0e-6), f"int E dt not zero: {area}"
+
+
 def test_laser_preview_generation(tmp_path: Path) -> None:
     if not HAS_MATPLOTLIB:
         return
@@ -308,6 +358,8 @@ if __name__ == "__main__":
     test_ellipticity_sign_sets_rotation_sense()
     test_rotation_matrix_is_orthonormal()
     test_field_and_vector_potential_have_expected_center_values()
+    test_electric_field_equals_minus_dA_dt()
+    test_pulse_has_zero_net_electric_field_area()
     print("Core Laser checks passed.")
 
     if HAS_MATPLOTLIB:
