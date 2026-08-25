@@ -1,6 +1,7 @@
-"""NatPhys_TaAs 4-band Weyl model (the antelope material) — QXTI port.
+"""NatPhys TaAs four-band Weyl model used by the Antelope comparison.
 
-Exact transcription of antelope's NatPhys_TaAs.h GenHamiltonian:
+This is Eq. 2 of Wu et al., Nature Physics 13, 350-355 (2017), expanded
+in the spin x orbital basis. DOI: 10.1038/nphys3969. The explicit matrix is:
     Bx  = t (cos kx + my (1-cos ky) + mz (1-cos kz))
     By1 = t sin(ky)
     By2 = Delta t cos(ky)
@@ -8,7 +9,7 @@ Exact transcription of antelope's NatPhys_TaAs.h GenHamiltonian:
     H =  [[0,        Bx-iBy1,  Bz,       -iBy2   ],
           [Bx+iBy1,  0,        iBy2,     -Bz     ],
           [Bz,      -iBy2,     0,        Bx-iBy1 ],
-          [iBy2,     Bz,       Bx+iBy1,  0       ]]
+          [iBy2,    -Bz,       Bx+iBy1,  0       ]]
 Everything in atomic units (a0 in Bohr, energies in Hartree), same as the RCP run.
 Used to check the C4v-type selection rule chi^(2)_xxx = 0 (M_x mirror: H is even
 in kx, so chi_xxx must vanish).
@@ -63,7 +64,7 @@ def H(kx, ky, kz, params=None):
             [0.0,          Bx - 1j * By1, Bz,           -1j * By2],
             [Bx + 1j * By1, 0.0,          1j * By2,     -Bz],
             [Bz,          -1j * By2,      0.0,          Bx - 1j * By1],
-            [1j * By2,     Bz,            Bx + 1j * By1, 0.0],
+            [1j * By2,    -Bz,            Bx + 1j * By1, 0.0],
         ],
         dtype=np.complex128,
     )
@@ -98,6 +99,6 @@ def H_batch(kpts, params=None):
     H[:, 2, 1] = -1j * By2
     H[:, 2, 3] = Bx - 1j * By1
     H[:, 3, 0] = 1j * By2
-    H[:, 3, 1] = Bz
+    H[:, 3, 1] = -Bz
     H[:, 3, 2] = Bx + 1j * By1
     return H
