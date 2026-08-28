@@ -22,6 +22,7 @@ Un módulo cargado por [[qxti.physics|CustomHamiltonian]] debe exponer:
 
 | Modelo | Qué es | Notas |
 | --- | --- | --- |
+| `bkagome_flux`, `bkagome_flux_2l` | Kagome breathing con flujo, mono/bicapa | Port directo de Antelope; la bicapa rota la segunda capa pero no incluye hopping interlayer |
 | `graphene`, `graphene_bilayer` | Grafeno mono/bicapa | casos de prueba 2D |
 | `haldane` | Haldane 2D | topológico; único con LDOS `finite` |
 | `wsm_two_weyl` | Semimetal de Weyl (2 nodos) | el WSM "de trabajo" del mapa de elipticidad |
@@ -34,7 +35,7 @@ Un módulo cargado por [[qxti.physics|CustomHamiltonian]] debe exponer:
 
 ## Inputs (`inputs/inputParams.<x>.cfg`)
 
-`frank8`, `frank_zhang_ldos`, `graphene`, `graphene_bilayer`, `haldane_topological`,
+`bkagome_flux`, `bkagome_flux_2l`, `frank8`, `frank_zhang_ldos`, `graphene`, `graphene_bilayer`, `haldane_topological`,
 `haldane_trivial`, `taas_tb`, `tblg`, `wsm`, `wsm_orenstein`.
 
 Secciones: `[hamiltonian]` (obligatoria), `[hamiltonian_plots]`, `[kgrid]`, `[timegrid]`,
