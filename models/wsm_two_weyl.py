@@ -14,14 +14,25 @@ con autovalores E_pm(k) = B0(k) +/- sqrt(B1^2 + B2^2 + B3^2).
 
 Coeficientes (kw es la posicion del nodo de Weyl):
     B0 = gamma [cos(2 a0 kx) - cos(a0 kw)] [cos(a2 kz) - cos(a0 kw)]
-    B1 = -{ M0 [1 - cos^2(a2 kz) - cos(a1 ky)] + 2 tx [cos(a0 kx) - cos(a0 kw)] }
-         (nota: 1 - cos^2(a2 kz) = sin^2(a2 kz))
+    B1 = -{ M0 [1 - cos(a2 kz) - cos(a1 ky)] + 2 tx [cos(a0 kx) - cos(a0 kw)] }
+         (masa en kz a PRIMEROS vecinos.  McCormick Eq. (11) escribe cos^2(a2 kz),
+          que tiene periodo pi y dota al modelo de la simetria accidental
+          P' = [k -> -k + G_z/2] (x) sigma_x.  Esa P' anula EXACTAMENTE toda la
+          respuesta optica de orden PAR (SHG incluido) para cualquier polarizacion,
+          en contra del SHG gigante medido en TaAs [Wu et al., Nat. Phys. 13, 350
+          (2017)].  Con 1 - cos(a2 kz) (periodo 2pi) P' desaparece, los cuatro nodos
+          y su quiralidad no cambian, y los armonicos pares son finitos.  Es tambien
+          la forma que usa el codigo SBE de referencia Antelope (WSM_2Weyl.h).)
     B2 = -2 ty sin(a1 ky)
     B3 = -2 tz cos(a2 kz)
 
 Nodos de Weyl (donde B1 = B2 = B3 = 0 con gamma = 0) en
 
-    (+/- kw, 0, +/- kw),   kw = pi / (2 a0)  por defecto.
+    (+/- kw, 0, +/- kz0),   kw = pi / (2 a0)  por defecto,  kz0 = pi / (2 a2).
+
+    (kz0 lo fija B3 = -2 tz cos(a2 kz) = 0, luego depende de a2 y NO de a0.  Solo
+     coincide con kw en el caso cubico a2 = a0; con los defaults tetragonales
+     kw = 0.2445 y kz0 = 0.1309.)
 
 Reglas de seleccion / fisica:
 --------------------------------
@@ -298,7 +309,7 @@ def current_matrices(kx: float, ky: float, kz: float, params: dict[str, object] 
     yder[2] = -2.0 * a1 * ty * np.cos(a1 * float(ky))
 
     zder[0] = -a2 * gamma * cos_shift_2x * np.sin(a2 * float(kz))
-    zder[1] = -a2 * M0 * np.sin(2.0 * a2 * float(kz))   # d/dkz[-M0(1 - cos^2(a2 kz))] = -a2 M0 sin(2 a2 kz)
+    zder[1] = -a2 * M0 * np.sin(a2 * float(kz))         # d/dkz[-M0(1 - cos(a2 kz))] = -a2 M0 sin(a2 kz)
     zder[3] = 2.0 * a2 * tz * np.sin(a2 * float(kz))
 
     def _assemble(d: np.ndarray) -> np.ndarray:
@@ -314,15 +325,23 @@ def current_matrices(kx: float, ky: float, kz: float, params: dict[str, object] 
 
 
 def weyl_node_momenta(params: dict[str, object] | None = None) -> np.ndarray:
-    """Devuelve las cuatro posiciones de los nodos de Weyl (+/-kw, 0, +/-kw)."""
+    """Devuelve las cuatro posiciones de los nodos de Weyl (+/-kw, 0, +/-kz0).
+
+    kx: B1 = 0 con ky = 0, kz = kz0  ->  cos(a0 kx) = cos(a0 kw)  ->  kx = +/-kw.
+    kz: B3 = -2 tz cos(a2 kz) = 0    ->  kz = +/- pi/(2 a2) = kz0.
+
+    OJO: kz0 = pi/(2 a2), NO kw = pi/(2 a0).  Solo coinciden en el caso cubico
+    (a2 = a0); con los defaults TETRAGONALES (a2 = 12) son distintos.
+    """
     resolved = _resolved_params(params)
-    k0 = _kw_internal(resolved)
+    kw = _kw_internal(resolved)
+    kz0 = float(np.pi / (2.0 * float(resolved["a2"])))
     return np.array(
         [
-            [-k0, 0.0, -k0],
-            [-k0, 0.0, +k0],
-            [+k0, 0.0, -k0],
-            [+k0, 0.0, +k0],
+            [-kw, 0.0, -kz0],
+            [-kw, 0.0, +kz0],
+            [+kw, 0.0, -kz0],
+            [+kw, 0.0, +kz0],
         ],
         dtype=float,
     )
