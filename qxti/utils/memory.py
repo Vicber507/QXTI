@@ -106,21 +106,70 @@ def _available_windows() -> int | None:
     return None
 
 
+def _available_cgroup() -> int | None:
+    """RAM still allowed by the process's cgroup memory limit (Linux only; None if
+    unlimited/unknown).  Under SLURM (``--mem``), Docker or a login-node cgroup the
+    whole-machine MemAvailable is a lie: the job gets OOM-killed at the cgroup
+    limit.  Supports cgroup v1 (``memory.limit_in_bytes`` / ``memory.usage_in_bytes``)
+    and v2 (``memory.max`` / ``memory.current``)."""
+    try:
+        with open("/proc/self/cgroup", "r") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return None
+    candidates: list[tuple[str, str, str]] = []
+    for ln in lines:
+        parts = ln.split(":", 2)
+        if len(parts) != 3:
+            continue
+        _, ctrl, path = parts
+        if "memory" in ctrl.split(","):                                   # v1
+            candidates.append((f"/sys/fs/cgroup/memory{path}", "memory.limit_in_bytes", "memory.usage_in_bytes"))
+        elif ctrl == "":                                                  # v2 (unified)
+            candidates.append((f"/sys/fs/cgroup{path}", "memory.max", "memory.current"))
+    tot = 0
+    for base, f_lim, f_use in candidates:
+        try:
+            with open(os.path.join(base, f_lim), "r") as fh:
+                raw = fh.read().strip()
+            if raw == "max":
+                continue
+            limit = int(raw)
+            if limit <= 0 or limit >= (1 << 60):
+                continue
+            if tot == 0:
+                tot = total_bytes()
+            if tot and limit >= tot:
+                continue                                                  # no real limit
+            with open(os.path.join(base, f_use), "r") as fh:
+                usage = int(fh.read().strip())
+            return max(limit - usage, 0)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
 def available_bytes() -> int:
-    """Best-effort physically-available RAM in bytes (0 if unknowable)."""
+    """Best-effort physically-available RAM in bytes (0 if unknowable).
+
+    Honors a cgroup memory limit (SLURM ``--mem``, containers, login-node caps):
+    the result is ``min(system available, cgroup limit - cgroup usage)``."""
     val = _available_psutil()
-    if val is not None:
-        return val
-    system = platform.system()
-    if system == "Linux":
-        val = _available_linux()
-    elif system == "Darwin":
-        val = _available_darwin()
-    elif system == "Windows":
-        val = _available_windows()
-    else:
-        val = None
-    return int(val) if val else 0
+    if val is None:
+        system = platform.system()
+        if system == "Linux":
+            val = _available_linux()
+        elif system == "Darwin":
+            val = _available_darwin()
+        elif system == "Windows":
+            val = _available_windows()
+        else:
+            val = None
+    val = int(val) if val else 0
+    cg = _available_cgroup() if platform.system() == "Linux" else None
+    if cg is not None:
+        val = min(val, cg) if val else cg
+    return val
 
 
 def total_bytes() -> int:
