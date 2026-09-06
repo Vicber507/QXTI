@@ -39,3 +39,6 @@ inputs/inputParams.bi2se3_floquet.cfg
 
 # Local analysis / plotting scripts (not part of the published package)
 tools/
+
+# configs de trabajo locales (barridos, tests) - no versionar
+inputs/local/
