@@ -202,12 +202,37 @@ def _pvec(params):
     return np.array([r[k] for k in _PARAM_ORDER], float), float(r["Delta"])
 
 
-def _H_from_k(k, pvec, delta):
-    """k: (...,3) en 1/Ang.  Devuelve (...,4,4) en eV."""
+_GEOM_CACHE = {}
+
+
+def _geom(params):
+    """(z0, cp) en Ang pedidos en params (claves opcionales 'z0', 'cp'); por defecto la geometria del modulo."""
+    if not params:
+        return Z0_ANG, CP_ANG
+    return float(params.get("z0", Z0_ANG)), float(params.get("cp", CP_ANG))
+
+
+def _tables_for(params):
+    """Tablas de enlaces (D, ORB, S) para la geometria de params.  Geometria por defecto -> tablas
+    globales (bit a bit lo mismo de siempre); otra (z0, cp) -> se reconstruyen una vez y se cachean."""
+    z0, cp = _geom(params)
+    if abs(z0 - Z0_ANG) < 1e-12 and abs(cp - CP_ANG) < 1e-12:
+        return _D, _ORB, _S
+    key = (round(z0, 9), round(cp, 9))
+    if key not in _GEOM_CACHE:
+        if len(_GEOM_CACHE) > 64:
+            _GEOM_CACHE.clear()
+        _GEOM_CACHE[key] = _Builder(A_ANG, cp, z0).build().tables()
+    return _GEOM_CACHE[key]
+
+
+def _H_from_k(k, pvec, delta, tables=None):
+    """k: (...,3) en 1/Ang.  Devuelve (...,4,4) en eV.  ``tables`` = (D, ORB, S) (default: globales)."""
+    D, ORB, S = (_D, _ORB, _S) if tables is None else tables
     k = np.asarray(k, float)
     sh = k.shape[:-1]
-    ph = np.exp(1j * np.tensordot(k, _D, axes=([-1], [1]))) * pvec[_ORB]
-    H = (ph @ _S).reshape(sh + (4, 4))
+    ph = np.exp(1j * np.tensordot(k, D, axes=([-1], [1]))) * pvec[ORB]
+    H = (ph @ S).reshape(sh + (4, 4))
     H[..., [0, 1, 2, 3], [0, 1, 2, 3]] += np.array([delta, delta, -delta, -delta])
     return H
 
@@ -224,7 +249,7 @@ def _H_from_k(k, pvec, delta):
 def H_batch(kpts, params=None):
     """Interfaz QXTI (VECTORIZADA): kpts (nk,3) en 1/Bohr -> (nk,4,4) en Hartree."""
     kpts_ang = np.asarray(kpts, float) * AU_PER_ANGSTROM        # 1/Bohr -> 1/Ang
-    return _H_from_k(kpts_ang, *_pvec(params)) * HARTREE_PER_EV
+    return _H_from_k(kpts_ang, *_pvec(params), tables=_tables_for(params)) * HARTREE_PER_EV
 
 
 def H(kx, ky, kz, params=None):
@@ -241,7 +266,7 @@ h_batch_au = H_batch
 def H_batch_ev(kpts, params=None):
     """Version en unidades de estructura de bandas: kpts (nk,3) en 1/Ang -> (nk,4,4) en eV."""
     pvec, delta = _pvec(params)
-    return _H_from_k(np.asarray(kpts, float), pvec, delta)
+    return _H_from_k(np.asarray(kpts, float), pvec, delta, tables=_tables_for(params))
 
 
 def H_ev(kx, ky, kz, params=None):
@@ -317,9 +342,10 @@ def chemical_potential(params=None, nk=20, filling=2):
 
 def default_lattice(params=None):
     """Metadatos de red en UNIDADES ATOMICAS (Bohr / 1-Bohr), como espera QXTI."""
+    z0_ang, cp_ang = _geom(params)       # geometria opcional via params (z0, cp en Ang)
     a = A_ANG * AU_PER_ANGSTROM          # 6.4909 Bohr
-    cp = CP_ANG * AU_PER_ANGSTROM        # 5.4993 Bohr
-    z0 = Z0_ANG * AU_PER_ANGSTROM        # 3.6866 Bohr
+    cp = cp_ang * AU_PER_ANGSTROM        # 5.4993 Bohr por defecto
+    z0 = z0_ang * AU_PER_ANGSTROM        # 3.6866 Bohr por defecto
     return {
         "lattice_type": "3D simple tetragonal P4mm (TaAs 'desenroscado', 2 sitios con espin)",
         "lattice_constants": {"a": a, "a1_length": a, "a2_length": cp,
@@ -335,7 +361,7 @@ def default_lattice(params=None):
 def brillouin_zone_bounds(params=None):
     """Caja reciproca en 1/Bohr (interfaz QXTI)."""
     a = A_ANG * AU_PER_ANGSTROM
-    cp = CP_ANG * AU_PER_ANGSTROM
+    cp = _geom(params)[1] * AU_PER_ANGSTROM
     return {"kx": (-np.pi / a, np.pi / a),
             "ky": (-np.pi / a, np.pi / a),
             "kz": (-np.pi / cp, np.pi / cp)}
