@@ -36,6 +36,10 @@ DEFAULT_PARAMS = {
     "t1": 0.551219, "t2": -0.775686, "tT": -1.913595, "tA": 1.844665,
     "tTz": -1.877263, "tAz": 0.012071, "t2T": -0.095731, "t2A": -0.363665,
     "l1": -0.998485, "l2": -1.190587, "l3": 0.052546, "Delta": 2.531344,
+    # --- extension 2026-09-07: vecinos MIXTOS plano/eje-c y SOC en el enlace largo.
+    # A cero reproducen exactamente el modelo original.  Controlan el reparto de la
+    # corriente entre e1 y e2 en el plano (112), que es lo que le faltaba al ajuste.
+    "tTxz": 0.0, "tAxz": 0.0, "l4": 0.0,
 }
 W1_FRAC_DEFAULT = (0.0072, 0.450)
 
@@ -50,7 +54,7 @@ PRESET_ENERGETICO = {
 }
 PRESETS = {"hhg": DEFAULT_PARAMS, "cono_exacto": PRESET_CONO_EXACTO, "energetico": PRESET_ENERGETICO}
 W1_FRAC_PRESET = {"hhg": (0.0072, 0.450), "cono_exacto": (0.0072, 0.4827), "energetico": (0.0078, 0.4831)}
-_PARAM_ORDER = ["t1", "t2", "tT", "tA", "tTz", "tAz", "t2T", "t2A", "l1", "l2", "l3"]
+_PARAM_ORDER = ["t1", "t2", "tT", "tA", "tTz", "tAz", "t2T", "t2A", "l1", "l2", "l3", "tTxz", "tAxz", "l4"]
 
 
 def _lattice(a=A_ANG, cp=CP_ANG, z0=Z0_ANG):
@@ -162,6 +166,13 @@ class _Builder:
             self.add(tag, seed)
         n = np.cross([0, 0, 1.0], d_dn); n = n / np.linalg.norm(n)
         self.add("l3", [(0, 1, d_dn, 1j * np.tensordot(n, _SIG, 1))])
+        # vecinos MIXTOS (a,0,cp): unicos saltos que mezclan el plano basal con el eje polar c.
+        # Sin ellos el modelo no puede repartir la corriente entre e1 y e2 en el plano (112).
+        self.add("tTxz", [(0, 0, np.array([a, 0.0, cp]), _s0)])
+        self.add("tAxz", [(1, 1, np.array([a, 0.0, cp]), _s0)])
+        # SOC en el enlace LARGO Ta-As (analogo de l3, que solo actua sobre el corto)
+        n4 = np.cross([0, 0, 1.0], d_up); n4 = n4 / np.linalg.norm(n4)
+        self.add("l4", [(0, 1, d_up, 1j * np.tensordot(n4, _SIG, 1))])
         return self
 
     def tables(self):

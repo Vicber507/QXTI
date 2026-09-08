@@ -185,7 +185,10 @@ class BandData:
         self.energies = energies; self.U = U; self.Udag = Udag
         self.U_mesh = U.reshape(*shape, nb, nb)
         self.vel = vel
-        self.A = [1j * vel[a] * inv_eps for a in range(dim)]
+        # Berry connection, STANDARD sign: A_mn = i<m|d_k n> = i v_mn/(E_n - E_m) for
+        # m != n.  ``eps[m,n] = E_m - E_n`` so this is -i v/eps (same convention as
+        # ``physics.operators.berry_connection`` and the CMD engine).
+        self.A = [-1j * vel[a] * inv_eps for a in range(dim)]
         self.f = f; self.dfde = dfde; self.eps = eps
         self.valid = valid; self.inv_eps = inv_eps
         self.dks = [(float(bounds[a][1]) - float(bounds[a][0])) / shape[a] for a in range(dim)]
@@ -263,7 +266,8 @@ def harmonic_currents(band: BandData, weights, E_field, omega, max_order, *,
             continue
         with np.errstate(divide="ignore", invalid="ignore"):
             r = np.where(valid, (A[c] * fmn) / (ow1_coh - eps), 0.0)
-        r[:, diag, diag] += (-1j) * dfde * np.real(vel[c][:, diag, diag]) / ow1_pop
+        # i (D_k rho0)_nn = i (df/dE) v_nn  (Drude/intraband source)
+        r[:, diag, diag] += (1j) * dfde * np.real(vel[c][:, diag, diag]) / ow1_pop
         rho1 += E[c] * r
     rhos = {1: rho1}
 
@@ -282,9 +286,11 @@ def harmonic_currents(band: BandData, weights, E_field, omega, max_order, *,
             if abs(E[b]) < 1e-40:
                 continue
             src += E[b] * cov_grad(rhos[s - 1], b)
+        # rho^(s) = i E.D_k rho^(s-1) / (s w + i Gamma - eps)   (the i is physical:
+        # it comes from solving d rho/dt = -(i eps + Gamma) rho + E.D_k rho in frequency)
         with np.errstate(divide="ignore", invalid="ignore"):
             denom = s * omega + iGamma - eps
-            rhos[s] = np.where(np.abs(denom) > 0, src / denom, 0.0)
+            rhos[s] = np.where(np.abs(denom) > 0, 1j * src / denom, 0.0)
         if progress_cb is not None:
             progress_cb(s)
 
@@ -383,7 +389,7 @@ def _mesh_block_currents(kb_int, w_int, P, C):
     valid = offdiag[None] & (np.abs(eps) > 1e-12)
     with np.errstate(divide="ignore", invalid="ignore"):
         inv_eps = np.where(valid, 1.0 / eps, 0.0)
-    A = [1j * vel[a] * inv_eps for a in range(dim)]
+    A = [-1j * vel[a] * inv_eps for a in range(dim)]      # standard sign (see BandData)
     diag = np.arange(nb)
     fmn = f[:, None, :] - f[:, :, None]
     U_mesh = U.reshape(*bshape, nb, nb)
@@ -396,7 +402,7 @@ def _mesh_block_currents(kb_int, w_int, P, C):
     for c in range(dim):
         with np.errstate(divide="ignore", invalid="ignore"):
             r = np.where(valid, (A[c] * fmn) / (ow1_coh - eps), 0.0)
-        r[:, diag, diag] += (-1j) * dfde * np.real(vel[c][:, diag, diag]) / ow1_pop
+        r[:, diag, diag] += (1j) * dfde * np.real(vel[c][:, diag, diag]) / ow1_pop
         r_c.append(r)
     vint = [vel[i] if sel is None else vel[i][sel] for i in range(dim)]
     wint = w_int
@@ -436,7 +442,7 @@ def _mesh_block_currents(kb_int, w_int, P, C):
                     src += E[b] * cov_grad(rho, b)
             with np.errstate(divide="ignore", invalid="ignore"):
                 denom = s * C.omega + iGamma - eps
-                rho = np.where(np.abs(denom) > 0, src / denom, 0.0)
+                rho = np.where(np.abs(denom) > 0, 1j * src / denom, 0.0)
             Js_by_order[s] = _trace_J(rho)
             if C.return_intraband:
                 Ji_by_order[s] = _trace_intra(rho)
@@ -770,7 +776,7 @@ def time_domain_currents(band: BandData, weights, E_t, dt, max_order, *,
     band basis makes the propagator a per-element frequency denominator):
 
         S^(N)(t) = Σ_α E_α(t) [D_k ρ^(N-1)(t)]_α          (Wilson covariant grad)
-        ρ^(N)(ω) = FFT_t[S^(N)(t)] / (ω − ω_mn + iΓ_mn)    (Γ: T1 diag, T2 offdiag)
+        ρ^(N)(ω) = i·FFT_t[S^(N)(t)] / (ω − ω_mn + iΓ_mn)  (Γ: T1 diag, T2 offdiag)
         ρ^(N)(t) = IFFT_ω[ρ^(N)(ω)]
 
     with ρ^(0) = diag(f).  Reduces to the closed form at every sω peak when E(t)
@@ -790,6 +796,8 @@ def time_domain_currents(band: BandData, weights, E_t, dt, max_order, *,
     -------
     dict with ``freq`` (Nt, angular), ``J_omega`` {s: (Nt, dim) complex spectrum},
     ``J_t`` {s: (Nt, dim) complex time-domain current}, one per order s=1..max_order.
+    Both hold the RAW trace Σ_k w_k Tr[v ρ^(s)] (same convention as
+    ``harmonic_currents``); the physical electron current is ``J = -J_t``.
     """
     E_t = np.asarray(E_t, dtype=np.complex128)
     Nt, dim_in = E_t.shape
@@ -813,7 +821,7 @@ def time_domain_currents(band: BandData, weights, E_t, dt, max_order, *,
     if k_chunk is None:
         k_chunk = max(1, int(2_000_000 // (nb * nb * max(Nt, 1))))
 
-    # The propagator 1/(−ω − ε_mn + iΓ_mn) is ORDER-INDEPENDENT: build it ONCE
+    # The propagator i/(−ω − ε_mn + iΓ_mn) is ORDER-INDEPENDENT: build it ONCE
     # (chunked to bound the temporary) so every order is a multiply, not a divide.
     # Sign of ω follows numpy's ifft convention x(t)=Σ X(ω)e^{+iωt}: the physical
     # response at output frequency Ω (e^{-iΩt}) sits in the −Ω bin, so (Ω − ε_mn + iΓ)
@@ -831,10 +839,12 @@ def time_domain_currents(band: BandData, weights, E_t, dt, max_order, *,
     vwT = [(vel_int[i] * w_k[:, None, None]).swapaxes(1, 2).copy() for i in range(dim)]
 
     def _current(rho_omega, s):
-        # J^(s)_i(ω) = i^(s-1) Σ_k w_k Tr[v_i ρ^(s)(ω)] (physical phase -> J(t) real).
-        phase = 1j ** (s - 1)
+        # Σ_k w_k Tr[v_i ρ^(s)(ω)] -- the RAW trace, same convention as
+        # ``harmonic_currents`` (the caller applies the electron charge, J = -Tr[v ρ]).
+        # ρ^(s) carries its physical phase, so J(t) comes out real with no patch.
+        phase = 1.0
         ro = rho_omega if interior is None else rho_omega[interior]
-        Jw = np.empty((Nt, 3), dtype=np.complex128)
+        Jw = np.zeros((Nt, 3), dtype=np.complex128)     # inactive axes must be 0, not garbage
         for i in range(dim):
             Jw[:, i] = phase * np.tensordot(vwT[i], ro, axes=([0, 1, 2], [0, 1, 2]))
         return Jw, np.fft.ifft(Jw, axis=0)
@@ -844,8 +854,8 @@ def time_domain_currents(band: BandData, weights, E_t, dt, max_order, *,
     vdw = [(vel_int[i][:, diag, diag] * w_k[:, None]) for i in range(dim)] if return_intraband else None
 
     def _current_intra(rho_omega, s):
-        phase = 1j ** (s - 1)
-        Jw = np.empty((Nt, 3), dtype=np.complex128)
+        phase = 1.0
+        Jw = np.zeros((Nt, 3), dtype=np.complex128)
         rho_d = (rho_omega if interior is None else rho_omega[interior])[:, diag, diag, :]
         for i in range(dim):
             Jw[:, i] = phase * np.tensordot(vdw[i], rho_d, axes=([0, 1], [0, 1]))
@@ -880,8 +890,9 @@ def time_domain_currents(band: BandData, weights, E_t, dt, max_order, *,
     E_w = np.fft.fft(E_t, axis=0)                          # (Nt, dim)
     num = np.zeros((nk, nb, nb, Nt), dtype=np.complex128)
     for c in range(dim):
+        # Sc = i D_k rho0 (standard A): interband A_mn (f_n - f_m), diagonal i f' v_nn
         Sc = np.where(valid, A[c] * fmn, 0.0 + 0.0j)
-        Sc[:, diag, diag] += (-1j) * dfde * np.real(vel[c][:, diag, diag])
+        Sc[:, diag, diag] += (1j) * dfde * np.real(vel[c][:, diag, diag])
         num += Sc[:, :, :, None] * E_w[None, None, None, :, c]
     rho_omega = num * inv_denom
     del num
@@ -899,7 +910,7 @@ def time_domain_currents(band: BandData, weights, E_t, dt, max_order, *,
         S_t = np.zeros((nk, nb, nb, Nt), dtype=np.complex128)
         for b in active_dirs:
             S_t += cov_grad_t(rho_t_prev, b) * E_t[None, None, None, :, b]
-        rho_omega = np.fft.fft(S_t, axis=-1) * inv_denom
+        rho_omega = 1j * np.fft.fft(S_t, axis=-1) * inv_denom    # rho^(s) = i S / (-w - eps + iG)
         del S_t
         J_omega[s], J_t[s] = _current(rho_omega, s)
         if return_intraband:

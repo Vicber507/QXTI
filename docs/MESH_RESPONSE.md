@@ -182,15 +182,21 @@ recursion in the **time domain** with the FULL field E(t):
 
 ```
 S^(N)(t) = Σ_α E_α(t) [D_k ρ^(N-1)(t)]_α          # Wilson covariant grad, per t
-ρ^(N)(ω) = FFT_t[S^(N)(t)] / (−ω − ω_mn + iΓ_mn)   # H_0 diagonal → per-element solve
+ρ^(N)(ω) = i·FFT_t[S^(N)(t)] / (−ω − ω_mn + iΓ_mn)  # H_0 diagonal → per-element solve
 ρ^(N)(t) = IFFT_ω[ρ^(N)(ω)]
 ```
 
 Every mixing product appears automatically in the FFT of the current — no
 enumeration of the ~F^N frequency channels.  Because H_0 is diagonal in the band
 basis the propagator is an exact per-element frequency denominator (no time-
-stepping error).  The observable current carries the documented per-order phase
-`i^(s-1)`, which makes `J^(s)(t)` **real** (physical, Hermitian spectrum).
+stepping error).  The factor `i` is the one from solving
+`dρ/dt = −(iω_mn+Γ)ρ + E·D_kρ` in frequency (e^{−iωt} convention); with it (and the
+standard-sign Berry connection) `ρ^(N)` carries its physical phase, `J^(N)(t)` is
+real with no extra per-order factor, and the closed form and this path agree in
+COMPLEX amplitude at every sω (H1 to 1e-6, H3 to <1%).  (An earlier version had a
+sign-flipped `A_mn` and no `i`, patched at the current stage by `i^(s-1)`; that
+combination left the linear current with the wrong overall sign — `Re σ_xx < 0` —
+and reversed the helicity of an elliptical drive in the single-laser branch.)
 
 **Auto-dispatch (both engines).** `compute_hhg_spectrum` (cmd) and
 `compute_susceptibility_spectrum` (xtp) select automatically: **1 laser → the fast

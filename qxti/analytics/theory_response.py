@@ -283,7 +283,7 @@ def compute_linear_response_spectrum(
         for a in range(dim):
             Ja = -vel[a]                                      # (C,n,m)
             for b in range(dim):
-                Ab = 1j * vel[b] * inv_eps                    # A_b,nm
+                Ab = -1j * vel[b] * inv_eps                   # A_b,nm = i v_nm/(e_m - e_n)
                 # num[c,n,m] = J_a,mn * A_b,nm * (f_m - f_n) * w_k
                 num = (np.transpose(Ja, (0, 2, 1)) * Ab) * fmn * w_c[:, None, None]
                 sigma[:, a, b] += np.einsum("cnm,cwnm->w", num, inv_denom, optimize=True)
@@ -361,7 +361,7 @@ def order2_tensor_at_omega(hamiltonian, kgrid, omega, weights, ccfg):
     with np.errstate(divide="ignore", invalid="ignore"):
         inv_eps = np.where(valid, 1.0 / eps, 0.0)
         dfde = (-f * (1.0 - f) / T) if T > 1e-15 else np.zeros_like(f)
-    A = [1j * vel[a] * inv_eps for a in range(dim)]
+    A = [-1j * vel[a] * inv_eps for a in range(dim)]     # standard Berry sign
     ow1 = omega + 1j * gamma
     ow2 = 2.0 * omega + 1j * gamma
     diagidx = np.arange(nb)
@@ -370,7 +370,7 @@ def order2_tensor_at_omega(hamiltonian, kgrid, omega, weights, ccfg):
     rho1 = []
     for c in range(dim):
         r = np.where(valid, (A[c] * fmn) / (ow1 - eps), 0.0 + 0.0j)
-        diag_src = (-1j) * dfde * np.real(np.diagonal(vel[c], axis1=1, axis2=2))
+        diag_src = (1j) * dfde * np.real(np.diagonal(vel[c], axis1=1, axis2=2))
         r[:, diagidx, diagidx] += diag_src / ow1
         rho1.append(np.where(valid_diag, r, 0.0))
 
@@ -394,7 +394,7 @@ def order2_tensor_at_omega(hamiltonian, kgrid, omega, weights, ccfg):
             # separate commutator is subtracted (adding it double-counts the Berry
             # connection and cancels the intraband/population channel).
             dpart = (Wp @ rp @ Wp_d - Wm @ rm @ Wm_d) / (2.0 * dks[b])
-            rho2 = dpart * inv_d2
+            rho2 = 1j * dpart * inv_d2                     # rho^(2) = i E.D_k rho^(1) / (2w - eps)
             for i in range(dim):
                 tr = np.einsum("kmn,knm->k", -vel[i], rho2, optimize=True)
                 Tt[i, b, c] = np.conj(np.sum(tr * w))
@@ -461,9 +461,9 @@ def _hhg_multilaser_result(config, hamiltonian, kgrid, dim, nk, max_order, gamma
     current_dim = np.zeros((Nt, dim), dtype=np.float64)
     intra_dim = np.zeros((Nt, dim), dtype=np.float64)
     for s in range(1, max_order + 1):
-        Js_t = td["J_t"][s][:, :dim].real
+        Js_t = -td["J_t"][s][:, :dim].real            # J = -sum_k w Tr[v rho^(s)] (electron)
         current_dim += Js_t
-        intra_dim += td["J_t_intra"][s][:, :dim].real
+        intra_dim += -td["J_t_intra"][s][:, :dim].real
         J_order[s] = np.fft.fft(Js_t, axis=0)
 
     current_time = np.zeros((Nt, 3), dtype=np.float64)
@@ -584,11 +584,18 @@ def compute_hhg_spectrum(
     env_peak = float(env_t.max()) if env_t.max() > 0 else 1.0
     env_norm = env_t / env_peak                       # (Nt,) normalized to 1
     i_peak = int(np.argmax(env_norm))
-    # +omega0 complex amplitude per direction (half the analytic amplitude at peak).
-    E_cw = 0.5 * analytic[i_peak, :dim]
+    # Complex amplitude of the e^{-i w0 t} carrier at the envelope peak, per direction.
+    # numpy's positive-frequency analytic signal of E(t) = Re[a env e^{-i w0 t}] is
+    # conj(a) env e^{+i w0 t}, so the e^{-i w0 t} amplitude (the one the recursion
+    # takes, and the one that fixes the HELICITY of an elliptical drive) is
+    # conj(analytic) e^{+i w0 t}; the closed form uses E(t) = E_cw e^{-i w0 t} + c.c.,
+    # hence the 1/2.  (Using ``analytic`` itself would drive the recursion with the
+    # conjugate amplitude, i.e. the OPPOSITE helicity.)
+    E_cw = 0.5 * np.conj(analytic[i_peak, :dim]) * np.exp(1j * omega0 * t_axis[i_peak])
 
     # --- Orders 1..max: harmonic peaks via analytic rho^(s)(k, s*omega0) ---
     harmonic_peaks: dict[int, np.ndarray] = {}
+    harmonic_peaks_intra: dict[int, np.ndarray] = {}   # diagonal (Drude/Bloch) part, per order
     J_harm_t = np.zeros((Nt, dim), dtype=np.float64)
     J_harm_t_intra = np.zeros((Nt, dim), dtype=np.float64)   # diagonal (Drude/Bloch) part
     if max_order >= 1:
@@ -656,6 +663,7 @@ def compute_hhg_spectrum(
             Js = -np.asarray(J_all[s][:dim], dtype=np.complex128)         # sum_k w Tr[-v rho^(s)]
             Js_intra = -np.asarray(J_intra_all[s][:dim], dtype=np.complex128)  # diagonal (intraband)
             harmonic_peaks[s] = Js
+            harmonic_peaks_intra[s] = Js_intra
             if s == 1:
                 J_order[1] = Js                                     # order 1 (inter + intraband)
             # Time-domain harmonic, modulated by the pulse envelope^s at s*omega0:
@@ -712,6 +720,8 @@ def compute_hhg_spectrum(
         "J_total": current_spectrum[:, :dim],
         "J_order": J_order,
         "harmonic_peaks": harmonic_peaks,
+        # Exact per-order intraband amplitude at s*omega0 (interband = total - intra).
+        "harmonic_peaks_intraband": harmonic_peaks_intra,
         "omega0": omega0,
         "max_order": max_order,
         "runtime_seconds": runtime,
@@ -1030,7 +1040,7 @@ def _order2_gridbased(hamiltonian, kgrid, omega_axis, weights, ccfg, *, progress
         diag_src_flat: ComplexArray,
         ow1_flat: ComplexArray,
     ) -> tuple[ComplexArray, ComplexArray]:
-        Aj_flat = 1j * vel_j_flat * inv_eps_flat
+        Aj_flat = -1j * vel_j_flat * inv_eps_flat           # standard Berry sign
         drive = Aj_flat * fmn_flat
         denom1 = ow1_flat[None, :, None, None] - eps_flat[:, None, :, :]
         with np.errstate(divide="ignore", invalid="ignore"):
@@ -1053,7 +1063,7 @@ def _order2_gridbased(hamiltonian, kgrid, omega_axis, weights, ccfg, *, progress
             )
         sig2[:, :, j, j] = 0.0 + 0.0j
         diag_src_mesh = np.asarray(
-            (-1j) * dfde_mesh * np.real(np.diagonal(vel_mesh[j], axis1=-2, axis2=-1)),
+            (1j) * dfde_mesh * np.real(np.diagonal(vel_mesh[j], axis1=-2, axis2=-1)),
             dtype=np.complex128,
         )
         n_slices = int(shape[j])
@@ -1142,7 +1152,7 @@ def _order2_gridbased(hamiltonian, kgrid, omega_axis, weights, ccfg, *, progress
                         1.0 / (ow2_flat[None, :, None, None] - eps_curr[:, None, :, :]),
                         0.0 + 0.0j,
                     )
-                rho2 = dpart * inv_d2_curr
+                rho2 = 1j * dpart * inv_d2_curr
                 weights_curr = _take_weights(j, slice_index)
 
                 for i in range(dim):

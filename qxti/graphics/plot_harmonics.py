@@ -111,6 +111,47 @@ DEFAULT_HARMONIC_PLOT_CONFIG = {
 HARMONIC_PLOT_CONFIG = copy.deepcopy(DEFAULT_HARMONIC_PLOT_CONFIG)
 
 
+def helicity_components(
+    spectrum: np.ndarray,
+    frame: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    r"""Split a cartesian current spectrum into its circular (helicity) components.
+
+    ``spectrum`` is a numpy-FFT spectrum ``(N, 3)`` read on its POSITIVE-frequency
+    bins.  For a real signal ``J(t) = Re[a e^{-i w t}]`` that bin holds ``conj(a)``,
+    so the helicity components are
+
+        J_R = (J_1 + i J_2)/sqrt(2)     positive helicity (sigma+): the current
+                                        rotates 1 -> 2 about the propagation axis,
+                                        the SAME sense as a drive with ellip > 0
+        J_L = (J_1 - i J_2)/sqrt(2)     negative helicity (sigma-)
+
+    where ``(1, 2)`` is the plane TRANSVERSE to the propagation direction; the
+    third returned array is the longitudinal component along that direction.
+    (On the e^{-i w t} amplitude itself the roles of the +/- signs swap; do not
+    feed that here.)  This matches antelope's ``dJ_p = J_x + i J_y`` (RCP).
+
+    Helicity is the photon spin projected on the propagation axis, so the circular
+    basis must be built in the drive's own transverse plane.  ``frame`` is the
+    ``(3, 3)`` matrix whose COLUMNS are ``[xdir, ydir, zdir]`` in lab coordinates
+    (``Laser.rotation_matrix()``).  With ``frame=None`` the lab ``(x, y)`` plane is
+    used, which is correct only for a drive propagating along lab ``z``
+    (``thetaz = 0``); for a tilted drive -- e.g. a (112)-oriented sample -- the
+    lab-frame split mixes the longitudinal component into R/L and is meaningless.
+    """
+    values = np.asarray(spectrum, dtype=np.complex128)
+    if frame is None:
+        j1, j2, j3 = values[:, 0], values[:, 1], values[:, 2]
+    else:
+        rotation = np.asarray(frame, dtype=float)
+        if rotation.shape != (3, 3):
+            raise ValueError("frame must be a (3, 3) matrix of lab-frame column vectors.")
+        projected = values @ rotation          # J . xdir, J . ydir, J . zdir
+        j1, j2, j3 = projected[:, 0], projected[:, 1], projected[:, 2]
+    inv_sqrt2 = 1.0 / np.sqrt(2.0)
+    return (j1 + 1.0j * j2) * inv_sqrt2, (j1 - 1.0j * j2) * inv_sqrt2, j3
+
+
 class HarmonicGraphics:
     """Plot spectral observables derived from XTP currents/polarizations."""
 
@@ -452,6 +493,7 @@ class HarmonicGraphics:
         use_harmonic_order: bool = False,
         max_harmonic_order: float | None = None,
         log_scale: bool = False,
+        frame: np.ndarray | None = None,
     ) -> Path:
         omega = np.asarray(omega_axis, dtype=float)
         spectrum = np.asarray(current_spectrum, dtype=np.complex128)
@@ -468,10 +510,8 @@ class HarmonicGraphics:
             omega_max=omega_max,
         )
 
-        jx = spectrum[:, 0]
-        jy = spectrum[:, 1]
-        current_right = (jx - 1.0j * jy) / np.sqrt(2.0)
-        current_left = (jx + 1.0j * jy) / np.sqrt(2.0)
+        # Circular basis in the DRIVE's transverse plane (lab x,y when frame=None).
+        current_right, current_left, _ = helicity_components(spectrum, frame)
         right_mag = np.abs(current_right[mask])
         left_mag = np.abs(current_left[mask])
         x_values, xlabel = HarmonicGraphics._build_spectral_xaxis(
@@ -483,8 +523,8 @@ class HarmonicGraphics:
             x_values=x_values,
             xlabel=xlabel,
             series=[
-                (r"$|J_{\mathrm{R}}(\omega)|$", right_mag, "#0072B2"),
-                (r"$|J_{\mathrm{L}}(\omega)|$", left_mag, "#CC79A7"),
+                (r"$|J_{\mathrm{R}}(\omega)|$ ($\sigma^+$, ellip$>0$)", right_mag, "#0072B2"),
+                (r"$|J_{\mathrm{L}}(\omega)|$ ($\sigma^-$)", left_mag, "#CC79A7"),
             ],
             output_path=output_path,
             title="Current Spectrum",
@@ -515,6 +555,7 @@ class HarmonicGraphics:
         use_harmonic_order: bool = False,
         max_harmonic_order: float | None = None,
         log_scale: bool = False,
+        frame: np.ndarray | None = None,
     ) -> Path:
         pyplot = HarmonicGraphics._require_matplotlib()
         omega = np.asarray(omega_axis, dtype=float)
@@ -548,11 +589,10 @@ class HarmonicGraphics:
             for direction in directions
         ]
 
-        jx = spectrum[:, 0]
-        jy = spectrum[:, 1]
+        current_right, current_left, _ = helicity_components(spectrum, frame)
         circular_series = [
-            (r"$|J_{\mathrm{R}}(\omega)|$", np.abs(((jx - 1.0j * jy) / np.sqrt(2.0))[mask]), "#0072B2"),
-            (r"$|J_{\mathrm{L}}(\omega)|$", np.abs(((jx + 1.0j * jy) / np.sqrt(2.0))[mask]), "#CC79A7"),
+            (r"$|J_{\mathrm{R}}(\omega)|$ ($\sigma^+$, ellip$>0$)", np.abs(current_right[mask]), "#0072B2"),
+            (r"$|J_{\mathrm{L}}(\omega)|$ ($\sigma^-$)", np.abs(current_left[mask]), "#CC79A7"),
         ]
 
         panels: list[tuple[str, str, list[tuple[str, np.ndarray, str]], str]] = [

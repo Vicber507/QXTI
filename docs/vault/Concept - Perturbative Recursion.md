@@ -16,15 +16,29 @@ updated: 2026-07-21
   ```
   dρ⁽ˢ⁾_nm/dt = −(i·ω_nm + γ_nm)·ρ⁽ˢ⁾_nm  +  E(t)·[D_k ρ⁽ˢ⁻¹⁾]_nm
   ```
-  con ω_nm = E_m − E_n, γ_nm = γ_pop (diag) o γ_coh (off-diag).
-- En **frecuencia** (mesh/per-k) esto es forma cerrada en s·ω; en **tiempo** (CMD) es el
-  integrador exponencial trapezoidal (FFT o directo).
+  con ω_nm = E_m − E_n, γ_nm = γ_pop (diag) o γ_coh (off-diag). El `+E·D_kρ` es la carga del
+  **electrón** (q = −1): H' = +E·r̂, [r̂,ρ] = i·D_kρ ⇒ −i[H',ρ] = +E·D_kρ. Coherente con `j = −v`.
+- En **frecuencia** (mesh/per-k), convenio e^{−iωt}, la forma cerrada es
+  ```
+  ρ⁽ˢ⁾ = i · E·[D_k ρ⁽ˢ⁻¹⁾] / (s·ω + iγ − ω_nm)        (orden 1: ρ⁽¹⁾ = i·E·D_kρ⁽⁰⁾/(ω+iγ−ω_nm))
+  ```
+  ⛔ **La `i` es física** (sale de resolver la EDO). Hasta 2026-09 el mesh y `rho_order_s` no la
+  llevaban y además usaban `A_mn` con el signo cambiado; el efecto neto era `ρ⁽ˢ⁾ = −(−i)^{s−1}·ρ_fís`:
+  **orden 1 con el signo invertido** (`Re σ_xx < 0`, absorción negativa; `J(t)` de pfddm en
+  contrafase con tddm/CMD) y fases entre armónicos rotadas. `time_domain_currents` lo parcheaba
+  con `i^(s−1)` en la corriente. Todo eso está **corregido**; ya no hay parche.
+- En **tiempo** (CMD) es el integrador exponencial trapezoidal (FFT o directo). CMD siempre estuvo
+  en el convenio físico (la herramienta `compare_rho4_cmd_vs_analytic.py` medía `−i^(s−1)` de
+  desfase con el analítico y lo llamaba "convención": era el bug).
 
 ## El gradiente covariante D_k (el *lazo* más delicado)
 
 ```
-D_k ρ = ∂_k ρ − i[A, ρ]      (A = conexión de Berry)
+D_k ρ = ∂_k ρ − i[A, ρ]      (A = conexión de Berry, signo ESTÁNDAR: A_mn = i⟨m|∂_k n⟩ = i·v_mn/(E_n−E_m))
 ```
+⛔ El signo de `A` importa: `operators.berry_connection`, `mesh_response.BandData.A` y
+`rho_analytic._berry_offdiag` usan todos `i·v_mn/(E_n−E_m)`. Con el signo opuesto el orden 1
+sale con la corriente invertida.
 
 ⛔ **Se calcula de UN SOLO TIRO** con **Wilson links** (transporte paralelo): se rota el ρ del
 vecino a la base local antes de restar. Numéricamente:

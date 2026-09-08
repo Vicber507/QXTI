@@ -31,7 +31,9 @@ datos (sin error). Estandariza rutas con `with_standard_output_dirs()` y lee `.n
 
 ## Descomposiciones (dónde viven)
 
-- **RCP/LCP** (`plot_harmonics.py`): `J_R=(J_x−iJ_y)/√2`, `J_L=(J_x+iJ_y)/√2`. Estándar.
+- **RCP/LCP** (`plot_harmonics.helicity_components`): sobre los bins +ω de numpy,
+  `J_R=(J_1+iJ_2)/√2` (σ⁺, mismo giro que `ellip>0`), `J_L=(J_1−iJ_2)/√2`, en el plano transverso
+  al haz (`frame` del láser). Ver [[Concept - Inter-Intra Decomposition]].
 - **Intra/inter**: usa las claves `current_*_intraband/interband` del dataset (solo si están).
 - **Helicidad** (`plot_susceptibility_tensor.py`): rota el tensor con `e_± = (x±iy)/√2`.
 

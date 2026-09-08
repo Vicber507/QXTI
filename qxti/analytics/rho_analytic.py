@@ -199,9 +199,11 @@ def _velocity_band(H_func: Callable, kx: float, ky: float, kz: float,
 
 
 def _berry_offdiag(vel: list[ComplexArray], evals: FloatArray) -> list[ComplexArray]:
-    """Off-diagonal Berry connection A^α_mn = i·v^α_mn / ε_mn  (m≠n); diagonal=0.
+    """Off-diagonal Berry connection A^α_mn = i·v^α_mn / (ε_n − ε_m)  (m≠n); diagonal=0.
 
-    In the band basis A^α_mn = i⟨m|∂_k_α|n⟩ = i·v^α_mn / ε_mn for m≠n.
+    From ∂_k(H|n⟩ = ε_n|n⟩): ⟨m|∂_k n⟩ = v_mn/(ε_n − ε_m) for m≠n, so
+    A^α_mn = i⟨m|∂_k_α n⟩ = i·v^α_mn/(ε_n − ε_m) = −i·v^α_mn/ε_mn with ε_mn = ε_m − ε_n.
+    Same sign convention as ``physics.operators.berry_connection`` and CMD.
     """
     nb = len(evals)
     result = []
@@ -212,7 +214,7 @@ def _berry_offdiag(vel: list[ComplexArray], evals: FloatArray) -> list[ComplexAr
                 if m != n:
                     eps_mn = evals[m] - evals[n]
                     if abs(eps_mn) > 1e-20:
-                        a[m, n] = 1j * v[m, n] / eps_mn
+                        a[m, n] = -1j * v[m, n] / eps_mn
         result.append(a)
     return result
 
@@ -247,9 +249,9 @@ def _rho1_local(H_func: Callable, kx: float, ky: float, kz: float,
                 omega_mn = evals[m] - evals[n]
                 f_nm = f[n] - f[m]
                 rho1[m, n] += Ea * A_a[m, n] * f_nm / (ow1 - omega_mn)
-        # Intraband (Eq. A1a, diagonal)
+        # Intraband (Eq. A1a, diagonal): i (D_k ρ0)_nn = i (df/dε) v_nn
         for n in range(nb):
-            rho1[n, n] += Ea * (-1j * dfde[n] * v_a[n, n].real) / ow1
+            rho1[n, n] += Ea * (1j * dfde[n] * v_a[n, n].real) / ow1
 
     return rho1
 
@@ -283,7 +285,7 @@ def _rho2_local(H_func: Callable, kx: float, ky: float, kz: float,
         for m in range(nb):
             for n in range(nb):
                 omega_mn = evals[m] - evals[n]
-                rho2[m, n] += Ea * src[m, n] / (ow2 - omega_mn)
+                rho2[m, n] += 1j * Ea * src[m, n] / (ow2 - omega_mn)
 
     return rho2
 
@@ -363,7 +365,7 @@ def _rho_local_order(H_func: Callable, kx: float, ky: float, kz: float,
             continue
         for m in range(nb):
             for n in range(nb):
-                rho_s[m, n] += E[alpha] * Dk_prev[alpha][m, n] / (ow_s - (evals[m] - evals[n]))
+                rho_s[m, n] += 1j * E[alpha] * Dk_prev[alpha][m, n] / (ow_s - (evals[m] - evals[n]))
     return rho_s
 
 
@@ -435,7 +437,9 @@ def rho_order_s(H_func: Callable, kx: float, ky: float, kz: float,
 
     # ── ρ^(s)(s·ω), s ≥ 2 — Eqs. A1b/A1c generalized to any order ────────────
     # Each driven order is built from the previous one by the SAME recursion:
-    #     ρ^(s)_mn(s·ω) = Σ_α E_α · [D_k ρ^(s-1)((s-1)·ω)]_mn / (s·ω̄ − ω_mn)
+    #     ρ^(s)_mn(s·ω) = i Σ_α E_α · [D_k ρ^(s-1)((s-1)·ω)]_mn / (s·ω̄ − ω_mn)
+    # (the i is the one from solving dρ/dt = −(iω_mn+γ)ρ + E·D_kρ in frequency,
+    #  e^{−iωt} convention; order 1 carries the same i inside _rho1_local)
     #     D_k ρ = ∂_k ρ − i[A, ρ]   (covariant k-derivative)
     # The covariant derivative is obtained in ONE shot from the Wilson-link
     # (parallel-transport) finite difference — it already contains the −i[A, ρ]
@@ -459,7 +463,7 @@ def rho_order_s(H_func: Callable, kx: float, ky: float, kz: float,
                 continue
             for m in range(nb):
                 for n in range(nb):
-                    rho_s[m, n] += E[alpha] * Dk_prev[alpha][m, n] / (ow_s - (evals[m] - evals[n]))
+                    rho_s[m, n] += 1j * E[alpha] * Dk_prev[alpha][m, n] / (ow_s - (evals[m] - evals[n]))
         rhos[s] = rho_s
 
     return rhos
@@ -543,15 +547,14 @@ def sigma1_kubo(H_func: Callable,
                             v_alpha_mn = vel[alpha][m, n]  # ⟨m|v^α|n⟩
                             s_k += v_phi_nm * v_alpha_mn * f_nm / eps_mn / (ow - eps_mn)
 
-                    # Intraband (Drude): (−i/ω̄) · v^φ_nn · ∂f_n/∂k_α
+                    # Intraband (Drude): −(1/ω̄) · v^φ_nn · ∂f_n/∂k_α
                     for n in range(nb):
                         df_dk_alpha = dfde[n] * vel[alpha][n, n].real
-                        s_k += (-1j / ow) * vel[phi][n, n] * df_dk_alpha
+                        s_k += (-1.0 / ow) * vel[phi][n, n] * df_dk_alpha
 
-                    # Sign: paper uses j = -g·e·v/Ω with e>0; in a.u. e=1, giving
-                    # the factor ig/Ω in Eq. A2.  The minus sign from j=-v is
-                    # already encoded in the f_nm vs. f_mn convention in s_k.
-                    sigma[iw, phi, alpha] += -1j * spin_deg * w_k / V_BZ * s_k
+                    # σ = Σ_k w_k Σ (−v^φ)_nm ρ^(1)_mn / E_α with the physical ρ^(1)
+                    # (electron, e^{−iωt}): overall factor +i, Re σ_xx > 0 (absorption).
+                    sigma[iw, phi, alpha] += 1j * spin_deg * w_k / V_BZ * s_k
 
     if verbose:
         print()
@@ -575,10 +578,10 @@ def sigma_analytic(H_func: Callable,
                    verbose: bool = True) -> dict[int, ComplexArray]:
     """BZ-integrated σ^(s)(s·ω) for orders 1..max_order via the ρ recursion.
 
-    For order 1, prefer ``sigma1_kubo()`` which directly implements Eq. A2
-    without factor-of-i ambiguity.
+    For order 1 this delegates to ``sigma1_kubo()`` (closed Kubo form).
 
-    Returns {order: array(nw, 3)} — σ^(s)_φ driven by E_field at each ω.
+    Returns {order: array(nw, 3)} — σ^(s)_φ driven by E_field at each ω, in the
+    physical e^{−iωt} convention: J^(s)_φ = σ^(s)_φ · E^s with J = −Σ_k w Tr[v ρ^(s)].
     """
     if max_order == 1:
         # Delegate to the unambiguous Kubo formula for s=1.
@@ -633,14 +636,11 @@ def sigma_analytic(H_func: Callable,
                 rho_s = rhos.get(s)
                 if rho_s is None:
                     continue
-                # J^(s)_φ = Σ_k w_k/V_BZ · Tr[v^φ · ρ^(s)] / E_norm^s
-                # The correct prefactor comes from comparing with the Kubo formula.
-                # Factor of 1j comes from A = iv/ε in the Berry connection,
-                # which appears once per field interaction (see module docstring).
-                # For s=2 (SHG): one extra factor of 1j from D_k ρ^(1).
+                # J^(s)_φ = −Σ_k w_k/V_BZ · Tr[v^φ · ρ^(s)]  (electron: j = −v);
+                # ρ^(s) already carries its physical phase, no extra factors of i.
                 for phi in active:
                     tr = np.trace(vel[phi] @ rho_s)
-                    sigma[s][iw, phi] += (1j ** s) * spin_deg * w_k / V_BZ * tr / E_norm**s
+                    sigma[s][iw, phi] += -spin_deg * w_k / V_BZ * tr / E_norm**s
 
     if verbose:
         print()

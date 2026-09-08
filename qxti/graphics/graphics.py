@@ -372,6 +372,11 @@ def plot_harmonic_graphics_from_saved_data(
     data = _augment_legacy_harmonic_dataset(data)
     print(f"[graphics] plotting harmonic dataset '{dataset_path.name}'.")
     reference_omega = _harmonic_reference_omega(config)
+    # R/L must be built in the drive's transverse plane, not in lab (x, y).
+    helicity_frame = _laser_helicity_frame(config)
+    if helicity_frame is not None:
+        print("[graphics] drive tilted out of the lab xy plane: R/L split uses the "
+              "laser frame [xdir, ydir, zdir].")
 
     field_current_cfg = resolved_plot_config["field_current_time"]
     if bool(field_current_cfg["enabled"]):
@@ -449,6 +454,7 @@ def plot_harmonic_graphics_from_saved_data(
             use_harmonic_order=bool(circular_cfg.get("use_harmonic_order", False)),
             max_harmonic_order=None if circular_cfg.get("max_harmonic_order") is None else float(circular_cfg["max_harmonic_order"]),
             log_scale=bool(circular_cfg["log_scale"]),
+            frame=helicity_frame,
         )
 
     overview_cfg = resolved_plot_config["current_overview_spectrum"]
@@ -477,6 +483,7 @@ def plot_harmonic_graphics_from_saved_data(
             use_harmonic_order=bool(overview_cfg.get("use_harmonic_order", False)),
             max_harmonic_order=None if overview_cfg.get("max_harmonic_order") is None else float(overview_cfg["max_harmonic_order"]),
             log_scale=bool(overview_cfg["log_scale"]),
+            frame=helicity_frame,
         )
 
     return outputs
@@ -551,6 +558,8 @@ def plot_susceptibility_graphics_from_saved_data(
 ) -> dict[str, Path]:
     config = _load_standardized_config(config_path)
     output_dir = _susceptibility_plot_output_dir(config)
+    # Helicity basis lives in the drive's transverse plane (None => lab x, y).
+    helicity_frame = _laser_helicity_frame(config)
     data_dir = Path(config.xtp.susceptibility_output_dir) / "data"
     resolved_plot_config = _resolve_susceptibility_plot_config_from_xtp(config, plot_config)
     dataset_path = _resolve_susceptibility_dataset_path(
@@ -655,7 +664,7 @@ def plot_susceptibility_graphics_from_saved_data(
         )
         # Helicity (circular) basis: only well-defined for the rank-2 linear tensor.
         if order == 1 and dimension >= 2:
-            chi_hel, hel_labels = to_helicity_basis(chi_cart, dimension)
+            chi_hel, hel_labels = to_helicity_basis(chi_cart, dimension, helicity_frame)
             outputs.update(
                 {
                     f"susceptibility_order_{order}_{k}": v
@@ -695,7 +704,7 @@ def plot_susceptibility_graphics_from_saved_data(
                 }
             )
             if order == 1 and dimension >= 2:
-                sigma_hel, hel_labels = to_helicity_basis(sigma_cart, dimension)
+                sigma_hel, hel_labels = to_helicity_basis(sigma_cart, dimension, helicity_frame)
                 outputs.update(
                     {
                         f"conductivity_order_{order}_{k}": v
@@ -984,6 +993,39 @@ def _normalize_plot_name(plot_name: str) -> str:
         "modulo_de_velocidad": "velocity_magnitude",
     }
     return aliases.get(key, key)
+
+
+def _laser_helicity_frame(config: QXTIConfig) -> np.ndarray | None:
+    """Return the drive's ``[xdir, ydir, zdir]`` column matrix, or ``None`` for lab axes.
+
+    Helicity (R/L) is the photon spin along the PROPAGATION direction, so the
+    circular basis has to be built in the laser's transverse plane.  Returns
+    ``None`` when that plane is already the lab ``xy`` plane (``zdir = z``, i.e.
+    ``thetaz = 0``) so the legacy behaviour and its plots are bit-identical, and
+    also when several pulses disagree on the frame (R/L is then ill-defined and
+    falling back to lab axes at least stays reproducible).
+    """
+    from qxti.core.simulation import QXTISimulation
+
+    try:
+        lasers = QXTISimulation(config=config).build_laser_system().lasers
+    except Exception:
+        return None
+    if not lasers:
+        return None
+    frame = np.asarray(lasers[0].rotation_matrix(), dtype=float)
+    for laser in lasers[1:]:
+        if not np.allclose(np.asarray(laser.rotation_matrix(), dtype=float), frame, atol=1e-12):
+            print("[graphics] pulses do not share a polarization frame; "
+                  "R/L split falls back to the lab (x, y) plane.")
+            return None
+    # Only the PROPAGATION axis matters: helicity is the spin along zdir, and any
+    # two transverse bases differ by a phase that drops out of |J_R|, |J_L|.  So
+    # when zdir is already lab +z (any in-plane phix), lab (x, y) is a valid
+    # transverse basis and we keep the legacy path bit-for-bit.
+    if np.allclose(frame[:, 2], (0.0, 0.0, 1.0), atol=1e-12):
+        return None
+    return frame
 
 
 def _harmonic_reference_omega(config: QXTIConfig) -> float:

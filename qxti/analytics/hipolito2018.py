@@ -30,10 +30,13 @@ _AU_TO_EV = 27.211386245988
 _KB = 3.1668114e-6  # Boltzmann in a.u. (Hartree/K)
 
 
-def _fermi_dirac(E: FloatArray, mu: float, T: float) -> FloatArray:
-    if T < 1e-10:
+def _fermi_dirac(E: FloatArray, mu: float, T_au: float) -> FloatArray:
+    """Fermi-Dirac occupation; ``T_au`` is k_B·T in Hartree (a.u.), like every caller
+    here passes (a previous version re-multiplied by k_B, which silently froze the
+    occupation into a step and killed the Drude term at any finite temperature)."""
+    if T_au < 1e-15:
         return np.where(E <= mu, 1.0, 0.0).astype(float)
-    return 1.0 / (np.exp((E - mu) / (_KB * T)) + 1.0)
+    return 1.0 / (np.exp(np.clip((E - mu) / T_au, -700.0, 700.0)) + 1.0)
 
 
 def _velocity_matrix(H_func: Callable, kx: float, ky: float, kz: float,
@@ -268,9 +271,10 @@ def analytical_sigma1_fast(
             with np.errstate(divide="ignore", invalid="ignore"):
                 coupling = np.where(
                     np.abs(eps_mn) > 1e-20,
-                    v_phi_nm.transpose(0, 2, 1) * v_alpha_mn * (-f_diff) / eps_mn,
+                    v_phi_nm.transpose(0, 2, 1) * v_alpha_mn * f_diff / eps_mn,
                     0.0 + 0.0j,
-                )  # (Nk, nb, nb)  index [k,n,m] → v_nm^phi * v_mn^alpha * (-f_mn)/eps_mn
+                )  # (Nk,i,j) = v^phi_ji v^alpha_ij (f_j - f_i)/(e_i - e_j); with the
+                   # j<->i relabel below this is v^phi_nm v^alpha_mn f_nm/eps_mn (Eq. A2)
 
             # Sum over all m,n (off-diagonal):  for each ω: 1/(ω̄-eps_mn[k,m,n])
             # eps_mn indexed as [k,m,n] (m is row, n is col of eps)

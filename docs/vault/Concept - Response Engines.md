@@ -92,6 +92,19 @@ bin de 3ω). El **H1 lineal coincide 0.1–5% y converge en k** en modelos gappe
 ⇒ **Para zanjar H3:** un full-solve en gauge de LONGITUD (reusa `cov_grad`) o una referencia
 independiente muy fina. Figuras de validación en `outputs/tddm_validation/`. Ver `tools/compare_engines.py`.
 
+## Convenio físico común (verificado 2026-09)
+
+Los tres motores están ahora en el **mismo convenio**: electrón (`q=−1`), `H' = +E·r̂`, `j = −v`,
+e^{−iωt}. Se comprobó con tres pruebas independientes de convenio (script en
+`tests/test_response_conventions.py`): (1) malla orden 1 = Kubo escrito desde cero, ratio +1.000000,
+`Re σ_xx > 0`; (2) `J(t)` de pfddm y de tddm a campo débil, correlación +0.9997 y energía absorbida
+`∫J·E dt > 0` en ambos; (3) pipeline completo con luz circular, fases pfddm/tddm en H1/H2/H3 de
+0–4° (antes 180°/90°/0°) y H1 en el mismo canal de helicidad que el campo en los dos motores.
+Además `compute_hhg_spectrum` (rama mono-láser) toma ahora `E_cw` como **conj de la señal
+analítica** (amplitud e^{−iωt}); antes usaba la analítica directamente y excitaba pfddm con la
+**helicidad opuesta** a la del campo. Los `|J(ω)|` no cambian con nada de esto; sí cambian signos,
+fases, `Re/Im σ`, `J(t)` y la asignación R/L.
+
 ## El ciclo de import (cuidado)
 
 `theory_response` importa `simulation` en el **tope**; `simulation` importa `compute_hhg_spectrum`

@@ -171,13 +171,22 @@ def prepare_primary_axis_for_secondary_top(axis: Any) -> None:
 def to_helicity_basis(
     tensor: ComplexArray,
     dimension: int,
+    frame: RealArray | None = None,
 ) -> tuple[ComplexArray, tuple[str, ...]]:
     r"""Rotate a cartesian response tensor to the helicity (circular) basis.
 
     The in-plane ``(x, y)`` block is expressed in the circular basis
-    ``e_\pm = (x \pm i y)/\sqrt{2}`` (left/right rotating), while ``z`` (if
-    present) is kept. For a rank-2 response ``J_i = T_{ij} E_j`` the transformed
-    tensor is ``T' = U^\dagger T U`` with ``U`` the columns ``[e_+, e_-, (z)]``.
+    ``e_\pm = (x \pm i y)/\sqrt{2}`` (positive/negative helicity about the
+    propagation axis), while ``z`` (if present) is kept.  For a rank-2 response
+    ``J_i = T_{ij} E_j`` in the e^{-i w t} convention the transformed tensor is
+    ``T' = U^\dagger T U`` with ``U`` the columns ``[e_+, e_-, (z)]``.
+
+    QXTI stores its tensors in the numpy-FFT convention, ``T_fft = conj(T_phys)``
+    (``J(w)/E(w)`` read on the +w bins).  Then ``e_+^\dagger T_phys e_+ =
+    conj(e_-^\dagger T_fft e_-)``, i.e. the physical ``(+,+)`` element is obtained
+    with ``conj(U)``; this function does that, so the returned labels ``("+", "-")``
+    are the PHYSICAL helicities (``+`` = same sense as a drive with ellip > 0),
+    consistent with :func:`qxti.graphics.plot_harmonics.helicity_components`.
 
     This is the tensor analogue of forming the circular current ``J_\pm =
     J_x \pm i J_y``. The chiral/Hall part shows up as ``T_{++} \neq T_{--}``
@@ -190,6 +199,14 @@ def to_helicity_basis(
         Cartesian tensor of shape ``(Nomega, dim, dim)``.
     dimension:
         Spatial dimension (1, 2, or 3).
+    frame:
+        Optional ``(3, 3)`` orthonormal matrix whose COLUMNS are the drive's
+        ``[xdir, ydir, zdir]`` in lab coordinates (``Laser.rotation_matrix()``).
+        Helicity is the photon spin projected on the PROPAGATION direction, so
+        for a drive tilted out of the lab ``xy`` plane the circular basis must be
+        built from the laser's own transverse plane, not from lab ``(x, y)``.
+        ``None`` (default) keeps the legacy lab-frame behaviour, which is only
+        correct when ``zdir = z`` (``thetaz = 0``).
 
     Returns
     -------
@@ -219,6 +236,27 @@ def to_helicity_basis(
             dtype=np.complex128,
         )
         labels = ("+", "-", "z")
+    # FFT-convention tensors: conj(U) keeps the "+" label = positive helicity.
+    unitary = np.conj(unitary)
+
+    if frame is not None:
+        # Rotate into the drive frame FIRST, then to the circular basis:
+        # the columns of ``rotation`` are [xdir, ydir, zdir] in lab coordinates,
+        # so ``rotation @ unitary`` holds [e_+, e_-, zdir] directly.
+        rotation = np.asarray(frame, dtype=np.complex128)
+        if rotation.shape != (3, 3):
+            raise ValueError("frame must be a (3, 3) matrix of lab-frame column vectors.")
+        # A tensor with fewer than 3 indices cannot represent an out-of-plane
+        # rotation: slicing the frame would silently give a NON-UNITARY transform
+        # (this is exactly the truncation Antelope leaves commented out in its own
+        # rotation).  The drive plane simply is not the model plane there, so R/L
+        # is ill-defined -- fall back to the model's own axes instead of faking it.
+        planar = np.allclose(np.abs(rotation[2, 2]), 1.0, atol=1e-12)
+        if dimension < 3 and not planar:
+            print("[graphics] drive leaves the model plane in a "
+                  f"{dimension}D model: helicity basis falls back to the model axes.")
+        else:
+            unitary = rotation[:dimension, :dimension] @ unitary
 
     # T'_{ab} = sum_ij (U^dagger)_{ai} T_{ij} U_{jb}, applied for every omega.
     transformed = np.einsum(
